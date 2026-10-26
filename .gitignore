@@ -72,3 +72,6 @@ build/
 compile_commands.json
 .cache/
 *.addlyaml
+
+# IDE 配置目录（CLion/VS Code 等），只追加、不动上面既有内容
+.idea/
