@@ -46,7 +46,7 @@ git config user.name; git config user.email   # 提交前置检查
 | perf | 未锁 | 7.0.14 | ⚠️ 待验证，见第 4 节 |
 | vCPU | SLO #3 写死 16 | 16 | ✅ |
 | 内存 | 未锁 | ≈11 GB（WSL 分配上限） | ✅ 100k 长连接目标够用 |
-| Docker CLI | 必需 | **容器不可用**：WSL Integration 未开启 | ❌ 阻塞项（非 S1） |
+| Docker CLI | 必需 | **可用**：Docker 29.4.3（build 055a478）、Docker Compose v5.1.3、`docker info` 引擎侧 Server 29.4.3 / storage driver `overlayfs`，WSL Integration 已由用户开启（2026-10-26 实测） | ⚠️ 半开：**引擎可用，但拉不到镜像**——配置里的 registry mirror `docker.mirrors.ustc.edu.cn` 域名已不存在（`getent hosts` 报 no such host），而 `registry-1.docker.io` 直连 HTTPS 返回 `000`（DNS 能解析、连接不通）。阻塞的是 SLO #3 的 Nginx 基线，见第 5 节 |
 | GitHub SSH | 必需 | 认证成功（`ssh -T git@github.com` 返回 `Hi <user>!`） | ✅ |
 | git | 必需 | 2.53.0，`user.name` / `user.email` 已配置 | ✅ |
 
@@ -119,11 +119,23 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 - 这项我没有验证——S1/S2 还用不到它，但**绝不能到 S5 才发现用不了**。
 - 计划：S4 期间跑一次 `perf stat -a sleep 1` 与最小火焰图冒烟，结果补进本文件。如果不通，备选是微软官方 WSL 内核的 perf 支持路径，或退到 `async-profiler`/eBPF 之外的用户态统计手段（届时按 8.2 禁令先写 ADR）。
 
-## 5. Docker Desktop WSL Integration
+## 5. Docker Desktop WSL Integration（2026-10-26 已开启，但镜像源仍阻塞 SLO #3）
 
-Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3），但 `docker` 在 Ubuntu 发行版内报的是「could not be found in this WSL 2 distro, activate the WSL integration」。修复要在 Docker Desktop 图形界面里做：`Settings → Resources → WSL Integration → 勾选 Ubuntu`。
+Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3）。**用户已于 2026-10-26 在 Docker Desktop 里开启本发行版的 WSL Integration**，实测：`docker --version` = 29.4.3（build 055a478）、`docker compose version` = v5.1.3、`docker info` 引擎侧 Server 29.4.3 / storage driver `overlayfs`——**引擎这一侧真的可用**，本文件第 2 节原先那句「❌ 阻塞项」已按实测改成半开状态。
 
-这一步影响的是 S3 之后的组件依赖，S1（单连接转发 + 第一份 p99）不阻塞。开启后本文件第 2 节 Docker 行需回填 `docker --version` 与 `docker compose version` 实测值。
+剩下的阻塞在**拉镜像**这一步，取证如下（全部本机实测，不是推测）：
+
+| 探测 | 结果 |
+|---|---|
+| `docker pull nginx:1.25.4` | `failed to resolve reference ... docker.mirrors.ustc.edu.cn ... no such host` —— Docker 配置里指定的 registry mirror 域名已经不存在 |
+| `getent hosts registry-1.docker.io / index.docker.io / auth.docker.io` | DNS **都能解析** |
+| `curl --max-time 12 https://registry-1.docker.io/v2/` | **`000`**（连接没建成）——直连 Docker Hub 走不通 |
+| `curl https://www.baidu.com` / `https://github.com` | **200** —— 不是"这台机器没有外网" |
+| `curl https://docker.m.daocloud.io/v2/`、`https://docker.xuanyuan.me/v2/`、`https://quay.io/v2/` | **401**（registry API 活着，正常要 token）；`https://hub.rat.dev/v2/` 302 |
+
+所以形状很清楚：**网络是通的，坏的是"指定了一个已经死掉的 mirror，而直连官方源又被拦"**。这不是我能靠改配置修好的——registry-mirrors 在 Docker Desktop 那一侧（`Settings → Docker Engine` 的 JSON），属于用户的机器与共享环境，按契约 10.1 那条"环境类阻塞先停先报"的精神，我停在这里请示，给了三个候选（换 mirror / 允许经第三方镜像站 pull 后 tag 成 `nginx:1.25.4` 并把来源不可核验记进口径 / #3 留账后补）。
+
+**这条直接决定 SLO #3 能不能判定**：#3 的判定式是 `QPS_网关 / QPS_nginx ≥ 60%`，而 `nginx:1.25.4` 是契约 9.3 锁定的基线镜像 tag——中途换 tag 会让历史数据断代，所以我不动 tag，也不接受"换个别的 web server 顶一下"那种替代（那等于换一个分母）。S1 门禁第 1 条里的 **#3 在 Nginx 基线跑起来之前仍然只有自测 QPS**（经网关 21,582.93 / 直连 57,170.55，B-004），这条已按项目所有人 2026-10-26 的裁决记为「S1 不合格，等镜像源解决后补测」，见 `docs/ROADMAP.md` 的待裁决清单。
 
 ## 6. 文件系统位置（会影响数据的一条）
 
