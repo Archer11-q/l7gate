@@ -6,11 +6,11 @@
 
 ## 当前进度
 
-阶段 **S1**，**S1-01、S1-02 已完成**，下一个认领 **S1-03（HTTP/1.1 解析器）**。开工前置条件已满足：`clang 21.1.8` + `libclang-rt-21-dev`、`wrk 4.1.0`、`hey 0.1.4` 就位，三个 sanitizer 我用故意写坏的样本做过阳性验证（ASan 报 UAF、LSan 报 5 处泄漏、UBSan 报 signed overflow、TSan 报 data race），证据在 `docs/ENVIRONMENT.md` 第 2.2 节。
+阶段 **S1**，**S1-01、S1-02、S1-03 已完成**，下一个认领 **S1-04（单 Reactor：epoll ET 事件循环 + 连接对象）**。开工前置条件已满足：`clang 21.1.8` + `libclang-rt-21-dev`、`wrk 4.1.0`、`hey 0.1.4` 就位，三个 sanitizer 我用故意写坏的样本做过阳性验证（ASan 报 UAF、LSan 报 5 处泄漏、UBSan 报 signed overflow、TSan 报 data race），证据在 `docs/ENVIRONMENT.md` 第 2.2 节。
 
 仍未解决、但不阻塞 S1 的两项：`llvm-21-tools`（ASan 堆栈符号化，非契约锁定项）、Docker WSL Integration（S3 之前必须开）。
 
-**一处流程偏离，记账**：契约 8.3 要求「一次会话只推进一个任务」。S1-01 提交（`b911321`）之后、S1-02 置 RUNNING 的同一会话里发生了上下文压缩，压缩后我继续把 S1-02 推完了，所以本次会话实际覆盖两个任务。我没有为此回退已完成的代码，但把它写成偏离而不是当作没发生；从 S1-03 起恢复一个会话一个任务。
+**一处流程偏离，记账**：契约 8.3 要求「一次会话只推进一个任务」。S1-01 提交（`b911321`）之后、S1-02 置 RUNNING 的同一会话里发生了上下文压缩，压缩后我继续把 S1-02 推完了，所以该次会话实际覆盖两个任务。我没有为此回退已完成的代码，但把它写成偏离而不是当作没发生。S1-02 收尾后我按这条规矩停住、请示是否新会话再开 S1-03，得到的指示是「接着推」——所以 **S1-03 与本会话前半段的 S1-01/S1-02 同批推进，这是显式授权的结果而不是我又越界一次**。
 
 ## S1 —— 单连接转发
 
@@ -20,7 +20,7 @@
 |---|---|---|---|---|
 | S1-01 | 构建骨架：CMake + GoogleTest v1.14.0（FetchContent）+ 三种 sanitizer preset | `cmake -B build -S .` 与 `cmake --build build` 在 WSL 原生文件系统下退出码为 0；`-Sanitize=address,undefined` 与 `-Sanitize=thread` 两个 preset 各自能配置并构建出可执行；`ctest` 跑通至少 1 个空壳单测；GoogleTest 拉取的 tag 在构建日志里可断言等于 `v1.14.0` | **DONE** | 三 preset 全绿：debug 6/6（15s）、asan-ubsan 6/6（20s）、tsan 6/6（20s）；我方代码警告 0 条；GoogleTest 1.14.0 经源码解析断言通过 |
 | S1-02 | 动态缓冲 `Buffer`：可读写、连续、带高水位 | 对 10000 次随机「写 n 字节 / 读 m 字节」序列，读回的字节流与写入序列完全一致且无越界；ASan/UBSan 全程零报告；可断言「一次 `read()` 直到 `EAGAIN` 才认为本轮可读事件处理完毕」这条 ET 契约在 buffer 层成立 | **DONE** | 三 preset 全绿：debug 15/15（0.28s）、asan-ubsan 15/15（0.84s）、tsan 15/15（1.07s），我方代码警告 0 条。完整性（上限放宽到 64 MiB 的专用配置）：10000 次随机操作 written=9,049,376 / read=5,048,397 / peak_capacity=4,194,304 / 逐字节一致。单连接峰值内存（**默认配置**）：1 KiB keep-alive × 1000 轮 → initial=4096、**peak_capacity=4096**、final=4096，每轮 `read_syscalls > 1`（1000/1000，证明每轮都以 EAGAIN 收尾） |
-| S1-03 | HTTP/1.1 请求解析器（纯函数，不碰 fd） | 合法样本解析出的 method / target / version / headers / body 与逐字段断言相等；`Content-Length` 与 `chunked` 两种 body 都覆盖；对 12 类畸形输入（非法 chunk-size、header 无空行结尾、换行不是 CRLF、超长头、请求行缺字段等）解析器返回错误码而非崩溃、不死循环 | PENDING | 解析吞吐（用于归因，非 SLO）：— |
+| S1-03 | HTTP/1.1 请求解析器（纯函数，不碰 fd） | 合法样本解析出的 method / target / version / headers / body 与逐字段断言相等；`Content-Length` 与 `chunked` 两种 body 都覆盖；对 12 类畸形输入（非法 chunk-size、header 无空行结尾、换行不是 CRLF、超长头、请求行缺字段等）解析器返回错误码而非崩溃、不死循环 | **DONE** | 三 preset 各 **36/36**（debug 0.74s / asan-ubsan 2.61s / tsan 3.47s），我方警告 0 条；畸形输入用例 **37 类**（契约要求 ≥12），全部返回定义好的错误码，ASan/UBSan 对 40000 例随机字节（含 NUL、裸 CR/LF、控制符）0 报告。「不死循环」靠 ctest `TIMEOUT 30` 变成门禁，不是靠我口头断言。**解析吞吐（release `-O3`，108 字节请求，单线程无 syscall）= 595.0 MB/s / 5,509,658 req/s**（同一用例 debug `-O0` 是 88.1 MB/s，所以数字必须连构建类型一起记）。纯函数的代价也测了：3867 字节头部被逐字节 dribble 时重扫 7,474,911 字节、耗时 9.0 ms，而单次完整解析 4.6 µs（**1956×**）—— 缓解（连接对象记已扫描游标）归 S1-04。每连接 scratch = `sizeof(HeaderEntry)` 32 × 64 = **2048 字节**，在 Buffer 的 4096 之外另算 |
 | S1-04 | 单 Reactor：epoll ET 事件循环 + 上下游连接对象 | `curl` 打 10000 个请求，事件循环存活、fd 数不随请求数单调增长（无泄漏）；连接对象在关闭后由 buffer 引用计数释放，ASan 在 10000 请求后报告零泄漏； epoll 注册/注销次数与连接数一致可断言 | PENDING | — |
 | S1-05 | keep-alive 复用与 Upgrade 透传 | 同一 curl 连接发 3 个顺序请求，全部成功且各自响应内容正确对应；请求间不重建下游连接（fd 计数器可断言）；对 `Connection: keep-alive` 与 `Connection: close` 分别按语义处理；带 `Upgrade: websocket` 的请求在 101 之后走纯透传路径，单测断言帧内容不被解析、不被改写（ADR-09） | PENDING | — |
 | S1-06 | 回源转发 + 响应回写闭环 | `curl -v` 经网关请求真实上游，状态码、`Content-Length`、body 与直连上游逐字节一致；上游返回 chunked 时转发结果与直连一致；上游中途断开时网关返回可定义的 5xx 且不残留半包 | PENDING | **第一份 p99：—** |

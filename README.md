@@ -6,11 +6,12 @@
 
 ## 现在的状态
 
-**S1 前两步（构建骨架、动态缓冲）已完成，网关本体还没有。** 我不在这段含糊其辞：仓库当前能构建、能跑测试、能自述编译期环境事实，`net/Buffer` 带高水位停读语义并且测到了单连接峰值内存的口径，但还转发不了任何一个请求。下面是每个数字的实际出处，没有的一律标"未测"。
+**S1 前三步（构建骨架、动态缓冲、HTTP/1.1 解析器）已完成，网关本体还没有。** 我不在这段含糊其辞：仓库当前能构建、能跑测试、能自述编译期环境事实，`net/Buffer` 带高水位停读语义并且测到了单连接峰值内存的口径，`http/request_parser` 能对 37 类畸形输入返回定义好的错误码——但两个部件还没有被 epoll 事件循环接起来，一个请求也转发不了。下面是每个数字的实际出处，没有的一律标"未测"。
 
 | 项目 | 状态 |
 |---|---|
 | 动态缓冲 `net/Buffer` | 已实现（S1-02）：连续、带高水位、`read()` 到 `EAGAIN` 才算一轮结束；默认配置下 1 KiB keep-alive × 1000 轮实测 `peak_capacity=4096` |
+| HTTP/1.1 解析器 `http/request_parser` | 已实现（S1-03）：纯函数、不碰 fd，CL 与 chunked 两种 body，22 个错误码；`release -O3` 下 595 MB/s / 5.5M req/s（单线程、无 syscall，**归因用，不是 SLO**） |
 | HTTP/1.1 转发 | 未实现（S1-04 / S1-06） |
 | 尾延迟 p99 | **未测**（S1 门禁交付第一份） |
 | QPS vs Nginx | **未测**（且 Docker 尚未接入，基线起不来） |
@@ -45,7 +46,7 @@
 
 多线程 Reactor（one loop per thread）+ epoll ET + 配置驱动的 filter 链。现状模块与实际实现程度见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)——那份文档严格区分"已实现"和"已定但未实现"。
 
-数据流（目标形态，当前只有 `--self-check` 一条真实路径）：
+数据流（目标形态；当前 `Buffer` 与解析器各自被单测直接驱动，还没被事件循环串起来，可执行文件里唯一的真实路径仍是 `--self-check`）：
 
 ```
 client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parser
@@ -66,7 +67,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
 ```bash
 cmake --preset debug          # GCC 15.2，日常开发
 cmake --build --preset debug
-ctest --preset debug          # 当前 15/15（6 条工具链 + 9 条 buffer）
+ctest --preset debug          # 当前 36/36（6 工具链 + 9 buffer + 21 解析器）
 
 ./build/debug/l7gate --self-check
 # version=0.1.0 compiler=gcc 15.2.0 __cplusplus=202002 gtest=1.14.0 \

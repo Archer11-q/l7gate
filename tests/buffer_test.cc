@@ -1,5 +1,7 @@
 #include "net/buffer.h"
 
+#include "pipe_fixture.h"
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -18,62 +20,7 @@
 namespace l7gate::net {
 namespace {
 
-// 造一个非阻塞管道：读端交给 Buffer，写端由测试控制。
-// 用真 fd 而不是 mock，是因为 ET 契约的内容就是"读到 EAGAIN 才停"，
-// 这件事只有内核能告诉我，mock 只会告诉我"我以为它是这样"。
-class PipeFixture {
- public:
-  PipeFixture() {
-    int fds[2] = {-1, -1};
-    if (::pipe2(fds, O_NONBLOCK) == 0) {
-      rfd_ = fds[0];
-      wfd_ = fds[1];
-    }
-  }
-  ~PipeFixture() {
-    if (rfd_ >= 0) ::close(rfd_);
-    if (wfd_ >= 0) ::close(wfd_);
-  }
-  PipeFixture(const PipeFixture&) = delete;
-  PipeFixture& operator=(const PipeFixture&) = delete;
-
-  bool ok() const { return rfd_ >= 0 && wfd_ >= 0; }
-  int rfd() const { return rfd_; }
-  int wfd() const { return wfd_; }
-
-  void release_write_end() {
-    if (wfd_ >= 0) {
-      ::close(wfd_);
-      wfd_ = -1;
-    }
-  }
-
-  void write_all(std::string_view data) {
-    std::size_t off = 0;
-    int eagain_spins = 0;
-    while (off < data.size()) {
-      const ssize_t n = ::write(wfd_, data.data() + off, data.size() - off);
-      if (n > 0) {
-        off += static_cast<std::size_t>(n);
-        continue;
-      }
-      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // 管道满（Linux 默认 64 KiB），等读者消费。这不是失败。
-        // 我第一版在这里写了 ASSERT_GE(n, 0)，把正常的 EAGAIN 判成测试失败 ——
-        // 当前用例的负载都没超过管道容量所以没暴露，但超过的那天它会乱报。
-        ASSERT_LT(++eagain_spins, 1000000) << "管道始终写不进去";
-        std::this_thread::yield();
-        continue;
-      }
-      ADD_FAILURE() << "pipe write failed errno=" << errno;
-      return;
-    }
-  }
-
- private:
-  int rfd_ = -1;
-  int wfd_ = -1;
-};
+using l7gate::testing::PipeFixture;
 
 // 直接由调用方的 rng 产字节。我第一版写成 make_pattern(n, rng())，
 // 每个 chunk 都重建一次 mt19937 —— 那是 3000 万次种子初始化，纯属浪费。

@@ -2,7 +2,7 @@
 
 > 契约第 6 节第 2 步要求这里写的是**已实现的现状，不是规划**。所以我用两个明确分开的部分：第 1 节是仓库里真实存在、能构建能跑的东西；第 3 节是已定但未实现的结构意图，只到「接口形状」这一层，避免把愿望写成事实。
 >
-> 现状一句话：**仓库里还没有网关，但有了它的第一个部件。** 构建骨架、编译期事实查询、以及一个带高水位的动态缓冲 `net/Buffer`。转发路径、epoll、解析器、filter 链、路由、限流、熔断全部未实现。
+> 现状一句话：**仓库里还没有网关，但有了它的两个部件。** 构建骨架、编译期事实查询、带高水位的动态缓冲 `net/Buffer`、以及 HTTP/1.1 请求解析器 `http/request_parser`。epoll 事件循环、转发路径、filter 链、路由、限流、熔断全部未实现。
 
 ## 1. 当前真实存在的模块
 
@@ -17,13 +17,18 @@ l7gate/
 │   ├── core/
 │   │   ├── build_info.h    BuildInfo 结构 + current() + render_one_line()
 │   │   └── build_info.cc   编译期与运行期事实的采集实现
-│   └── net/
-│       ├── buffer.h        Buffer + Config + ReadResult：接口、不变量、口径都写在头文件
-│       └── buffer.cc       读满即停 / 压缩 / 扩容 / 水位停止 / 空仓归还
+│   ├── net/
+│   │   ├── buffer.h        Buffer + Config + ReadResult：接口、不变量、口径都写在头文件
+│   │   └── buffer.cc       读满即停 / 压缩 / 扩容 / 水位停止 / 空仓归还
+│   └── http/
+│       ├── request_parser.h    三态返回 + 22 个错误码 + ParsedRequest 的字段口径
+│       └── request_parser.cc   请求行 / 头部区 / CL 与 chunked 框架的校验与定位
 └── tests/
-    ├── CMakeLists.txt      gtest_discover_tests，标签按阶段打（s1），任务级筛选靠套件名
+    ├── CMakeLists.txt      gtest_discover_tests：标签按阶段打（s1），任务级筛选靠套件名，TIMEOUT 30
+    ├── pipe_fixture.h      非阻塞管道夹具，S1-02 与 S1-03 共用
     ├── build_info_test.cc  6 条工具链断言（S1_01_Toolchain）
-    └── buffer_test.cc      9 条缓冲断言（S1_02_Buffer），含 10000 次随机读写与 1 KiB keep-alive 稳态
+    ├── buffer_test.cc      9 条缓冲断言（S1_02_Buffer），含 10000 次随机读写与 1 KiB keep-alive 稳态
+    └── request_parser_test.cc  21 条解析断言（S1_03_Parser），含 37 类畸形输入与 40000 例随机字节
 ```
 
 ### 1.1 `core/build_info`
@@ -65,6 +70,24 @@ l7gate/
 
 实测数字（`TASKS.md` S1-02 行有同一份）：默认配置 1 KiB keep-alive × 1000 轮 → initial/peak/final 全部 4096，1000/1000 轮的 `read_syscalls > 1`；数据完整性用刻意放宽限制线（64 MiB）的专用配置跑 10000 次随机读写 → written=9,049,376 / read=5,048,397 / peak_capacity=4,194,304，逐字节一致。后者**不能**拿去当 SLO #2 的每连接内存——它描述的是 buffer 自己的形状上限，不是真实报文下的稳态。
 
+### 1.4 `http/request_parser`：校验 + 定位，不重写
+
+签名只有一个：`parse_request(data, len, scratch, config, out) -> {status, error}`。不发 syscall、不碰 fd、不持有跨调用状态。三态是 `kOk` / `kNeedMoreData` / `kError`，22 个错误码各有 `to_string`（`ErrorCodesHaveUniqueNames` 断言无重名无漏名，因为 S1-06 要按它们映射 400/411/413/501）。
+
+四件事值得写下来：
+
+**一、半包永远不是错误，这条被我写成了一条全称断言。** `EveryPrefixOfAValidRequestIsNeedMoreOrOk` 把四条合法请求各自截断到**每一个**长度逐个喂：结果只能是 `kOk` 或 `kNeedMoreData`。逐条列举半包形态只能覆盖我想得到的形态，而"把截断判成错误"的后果是网关拿正常慢客户端当攻击处理、回 400 断连——全称断言一次封掉这一整类。同一条思路用在畸形输入侧：37 类样本（契约要求 ≥12）必须返回**指定**错误码，且 `MalformedVerdictsAreStableAcrossReuse` 要求同一字节重复 20 次判定不变，防的是"靠 scratch 残留状态才恰好判对"。
+
+**二、我留着 raw 字节，不解码 chunked。** `declared_body_bytes` 是解码后的长度，`consumed` 是含框架的原始长度，`raw_body` 只在 CL 场景给出。这两个数分开，S1-06 才能既逐字节透传又知道真实体量。重写框架的代价是"与直连上游逐字节一致"这条验收永远证不了。
+
+**三、CL/TE 冲突与 obs-fold 一律拒绝。** CL+TE 并存、TE 多值或重复、多个不一致的 CL、多个 Host、行首 SP/HT 的旧式折行、裸 LF 与孤立 CR——这些是 CL.TE / TE.CL 走私的全部载荷形态，代理没有"猜"的余地。RFC 允许接收方忽略的 leading CRLF 我也拒绝，理由写在代码里而不是藏起来：忽略会让转出去的字节和收进来的不一致。CONNECT 与 absolute-form 给的是 `kNotImplemented` 而不是 `kTargetInvalid`，"畸形"和"合法但我还不做"必须可区分。
+
+**四、限制只留一个真相来源。** header 条数上限原来是两处各写一份：`ParserConfig::max_header_count` 和 `ParseScratch` 的容量。结果配置里那份**从来没被读过**——用例给 scratch 分 64 槽、config 写 8，第 9 条 header 照样通过，限制静默失效。现在容量就是限制本身，config 不再重复；`ParseScratchMemoryFootprintIsBounded` 里留了回归断言（同一段 10 条 header 的字节，8 槽必须拒、64 槽必须过）。这和 1.3 那条"hint 不是预留"是同一类错误：**看起来有两个旋钮的东西，通常只有一个在起作用。**
+
+实测数字（`TASKS.md` S1-03 行有同一份）：三 preset 各 36/36、我方警告 0 条；ASan/UBSan 对 40000 例随机字节（字母表里塞了 NUL、裸 CR/LF、控制符、CRLF 与十六进制字符）0 报告，且每条返回的 view 都被断言落在调用方给的那段字节之内。解析吞吐在 `release`（`-O3`）下 595.0 MB/s / 5,509,658 req/s（108 字节请求、单线程、无 syscall），同一用例 `debug -O0` 只有 88.1 MB/s——所以这个数字必须连构建类型一起记。
+
+**已知代价，测成了数字。** 纯函数意味着每补一段字节就从头重扫：3867 字节的头部被逐字节 dribble 时，3866 次调用共重扫 7,474,911 字节、耗时 9.0 ms，而单次完整解析只要 4.6 µs（1956×）。这是慢速攻击面，不是抽象的担忧。缓解手段（连接对象记已扫描游标）归 S1-04——它不能塞进解析器，否则上面那条"可重复喂入"的可测性就没了。另外「不死循环」这条验收不靠口头断言：ctest 每条用例带 `TIMEOUT 30`，真死循环会被判失败，Sanitizer 抓不到的东西由构建层抓。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 - **C++20 + `CMAKE_CXX_EXTENSIONS OFF`**：我要标准 C++20，不是 GNU 扩展下的"看起来能用"。
@@ -79,8 +102,10 @@ l7gate/
 
 只写到接口形状，实现归属看 `TASKS.md`。
 
-- **`http/request_parser`（S1-03）**：**纯函数，不碰 fd**。这条约束是刻意的：解析器的半包/粘包与畸形输入用例（12 类）必须能在不建立任何 socket 的情况下跑，否则这些用例会被事件循环的时序牵着，测不出解析本身。它消费的正是 1.3 那个 `Buffer` 的可读区。
 - **`net/reactor`（S1-04 → S2 多线程化）**：单线程 epoll ET 起步，S2 才加线程。连接对象的销毁路径从 S1 就按"可能被别的线程持有"设计，避免 S2 返工——这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的具体支出。**S1-07 的背压钩子已经在 buffer 侧就位**（`ReadResult::limit_reached` + 「返回时 `readable_bytes() <= high_water_mark`」这条不变量），还没实现的是 reactor 侧：收到 `limit_reached` 就摘掉该 fd 的 EPOLLIN、等下游写完再把读事件加回来。
+- **连接对象要替解析器背两笔债（S1-04）**，都是 1.4 里定下的口径，不在解析器内部解决：
+  1. **已扫描游标**——dribble 重扫的 O(N²) 代价（实测 1956×）靠"记住扫到哪"消掉，而记住状态的地方只能是连接对象。
+  2. **view 生命周期**——`ParsedRequest` 里的字段全是指向 Buffer 可读区的 `string_view`，Buffer 一压缩就作废。顺序必须是「解析 → 当场取用或拷走 → 再 `consume`」，不能反过来。
 - **`filter/chain`（S1-08）**：空壳先立。验收标准是「新增 filter 不修改转发主路径的任何一行代码」，所以现在还没有主路径可改——顺序与接口形状在还没有功能诱惑的时候定下来，是这个任务唯一的目的。
 
 ## 4. 已知噪声与待补项
