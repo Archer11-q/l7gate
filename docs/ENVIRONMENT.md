@@ -34,7 +34,7 @@ git config user.name; git config user.email   # 提交前置检查
 | 内核 | ≥ 5.15 | 6.18.40.1-microsoft-standard-WSL2 | ✅ |
 | GCC | ≥ 11 | g++ 15.2.0 | ✅ |
 | CMake | ≥ 3.22 | 4.2.3 | ✅ |
-| Clang | ≥ 14 | clang 21.1.8（dpkg `1:21.1.6-71`）——**已装，但 sanitizer 运行时缺文件** | ⚠️ 见第 2.1 节 |
+| Clang | ≥ 14 | clang 21.1.8（dpkg `1:21.1.6-71`）+ `libclang-rt-21-dev` `1:21.1.8-6ubuntu1`；三个 sanitizer 已用阳性样本验证 | ✅（符号化缺 `llvm-21-tools`，见 2.2） |
 | wrk | apt 最新版 | 4.1.0（`4.1.0-4build3`），epoll 模式 | ✅ |
 | hey | apt/官方 release | 0.1.4（`0.1.4+ds-2`）；**它没有 `--version`**，版本要从 dpkg 取 | ✅ |
 | hiredis | v1.2.0 | `1.2.0-6ubuntu4` | ✅ **字面命中契约** |
@@ -72,7 +72,37 @@ clang++: error: linker command failed with exit code 1
 
 作为对照，我把同一组 sanitizer 在 **g++ 15.2.0** 上各编跑一遍，**三个全部构建并运行成功**（address / undefined / thread）。这个事实只用来证明「不是 WSL2 内核或库栈的问题，就是缺一个包」。**我不拿 g++ 的结果冒充契约要求的 Clang 验证**——契约 9.1 指定 Clang 是连接对象生命周期的唯一自动化验证手段，S2 门禁的「TSan 干净」指的就是这套工具链。g++ 旁证保留，正式结论等 `libclang-rt-21-dev` 装上后重跑得出。
 
-**开工前置条件状态：仍未满足。** S1 门禁要求「ASan/UBSan 干净」、S2 门禁要求「TSan 干净」，两者在当前机器上都无法执行，所以 S1 代码仍未启动。
+**当时的结论：开工前置条件未满足。** S1 门禁要求「ASan/UBSan 干净」、S2 门禁要求「TSan 干净」，两者在当时机器上都无法执行，所以 S1 代码没有启动。后续见第 2.2 节。
+
+### 2.2 三次自检：补齐 compiler-rt 后，用阳性样本证明 sanitizer 真的在检测
+
+安装 `libclang-rt-21-dev`（实测装到 `1:21.1.8-6ubuntu1`）后，三个 sanitizer 全部链接并运行成功。但**「能编译能跑」不是验证**——一个静默失效的 sanitizer 比没有更危险，它会让「ASan 干净」这句话变成假的。所以我用**故意写坏的程序**做阳性测试，逐个确认它们真的会报：
+
+| 检测项 | 阳性样本 | 实测结果 |
+|---|---|---|
+| ASan | `delete p; *p = 42;` | ✅ `ERROR: AddressSanitizer: heap-use-after-free ... WRITE of size 4` |
+| LeakSanitizer（ASan 内置） | `for(i<5) new int(i);` 指针丢弃 | ✅ `detected memory leaks` / `SUMMARY: 20 byte(s) leaked in 5 allocation(s)` |
+| UBSan | `INT_MAX + 1` | ✅ `runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'` |
+| TSan | 两个线程各自 `g++` 十万次 | ✅ `WARNING: ThreadSanitizer: data race (pid=…)` |
+
+**两个必须记下来的踩坑（不然日后会误判 sanitizer 失灵）：**
+
+1. **`-O1` 会把「可被证明无副作用的坏写入」优化掉。** 同一个 UAF 样本，`-O1` 下 ASan 什么都不报（写入被 dead store elimination 删除，程序正常退出），`-O0` 下立刻报出 heap-use-after-free。**做 sanitizer 阳性验证必须 `-O0 -g`。** 这条也反向提醒我：将来跑 ASan 干净检查时用的构建类型，不能拿一个开了激进优化的构建来充当证据。
+2. **漏检的块如果仍被全局指针指着，属于 "still reachable"，LSan 默认不报。** 我第一次的泄漏样本用了全局链表头，结果是干净的——那不是程序没问题，是测试写错了。悬空分配（指针丢失）才会被抓到。
+
+**仍然存在的工具链缺口（不阻塞开工，但必须记账）：**
+
+ASan 报告里的堆栈**无法符号化**，输出是裸地址并伴随警告：
+
+```
+==11220==WARNING: invalid path to external symbolizer!
+==11220==WARNING: Failed to use and restart external symbolizer!
+SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 6632637d…)
+```
+
+根因是缺 `llvm-symbolizer`，由 apt 包 **`llvm-21-tools`**（候选 `1:21.1.8-6ubuntu1`）提供，实测未安装。它不在契约 9.1 的锁定表里，所以我不把它算作「版本不满足」的开工门槛；但它的缺省会让**非干净**情况下的定位从「看函数名」退化成「拿 BuildId + 地址手动 addr2line」，在 S1-02/S1-04 这类内存与生命周期任务里会实打实地拖慢我。已列为待补项。
+
+**开工前置条件状态：满足。** Clang 21.1.8（≥14 ✅）+ 三个 sanitizer 阳性验证通过 + wrk 4.1.0 + hey 0.1.4 就位，S1 代码自 `S1-01` 起启动。Docker 仍不可用，属 S3 之前的阻塞项，不影响 S1。
 
 ## 3. 唯一实质偏离：libmysqlclient
 

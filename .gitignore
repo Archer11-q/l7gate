@@ -66,3 +66,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# --- l7gate 追加（契约 5 节：.gitignore 只追加不覆盖）---
+build/
+compile_commands.json
+.cache/
+*.addlyaml

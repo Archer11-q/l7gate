@@ -1,0 +1,98 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "environment": {},
+      "description": "全部 preset 的公共底座。刻意不用 Ninja：它不在契约 9.1 锁定表里，引入构建工具同样受 8.2 禁令三约束（ADR-04 的自研边界只覆盖网络层，不给构建工具开口子）。"
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug / GCC（契约主编译器）",
+      "inherits": "base",
+      "description": "日常开发。GCC 15.2 是契约 9.1 的主编译器。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "L7GATE_SANITIZERS": ""
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release / GCC（压测唯一允许的构建）",
+      "inherits": "base",
+      "description": "BENCHMARK.md 里所有数字必须由这个 preset 产出。sanitizer 构建测出来的延迟不是网关的延迟，是检查开销的延迟。",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "L7GATE_SANITIZERS": ""
+      }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "Debug / Clang + ASan,UBSan（S1 门禁）",
+      "inherits": "base",
+      "description": "S1 门禁的 ASan/UBSan 干净用这个。Debug 而非 Release：实测发现 -O1 起会把可被证明无副作用的坏写入优化掉，sanitizer 于是什么都不报（docs/ENVIRONMENT.md 2.2）。",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "L7GATE_SANITIZERS": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug / Clang + TSan（S2 门禁）",
+      "inherits": "base",
+      "description": "连接对象跨线程传递与异步销毁的唯一自动化验证手段。address 与 thread 互斥，所以必须独立构建目录。",
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=0:second_deadlock_stack=1"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "L7GATE_SANITIZERS": "thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug", "jobs": 16 },
+    { "name": "release", "configurePreset": "release", "jobs": 16 },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan", "jobs": 16 },
+    { "name": "tsan", "configurePreset": "tsan", "jobs": 16 }
+  ],
+  "testPresets": [
+    {
+      "name": "asan-ubsan",
+      "configurePreset": "asan-ubsan",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": true }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": true }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": true }
+    }
+  ]
+}
