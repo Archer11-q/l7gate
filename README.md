@@ -82,7 +82,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
 ```bash
 cmake --preset debug          # GCC 15.2，日常开发
 cmake --build --preset debug
-ctest --preset debug          # 当前 74/74（6 工具链 + 9 buffer + 21 解析 + 3 buffer 写出侧 + 11 连接 + 10 事件循环 + 5 101 判定 + 4 连接层隧道 + 5 握手闭环）
+ctest --preset debug          # 当前 100/100（6 工具链 + 9 buffer + 21 解析 + 3 buffer 写出侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 转发闭环）
 
 ./build/debug/l7gate --self-check
 # version=0.1.0 compiler=gcc 15.2.0 __cplusplus=202002 gtest=1.14.0 \
