@@ -36,14 +36,16 @@ curl 不会替我发这些字节，所以这一段的请求是 shell 手写的�
 
 这一段第一版是错的：我原本期望 `TRACE → 501`，跑出来是 200。先写了一条单跑 CONNECT 的探针证明实现正确（CONNECT 确实 501），再按响应字节数（38）反推出我当时发的其实是 TRACE——错在测试的期望，不在网关。**"合法方法"与"网关不接的形态"是两件事**，这条现在写进 `reply_status_for_parse_error` 的注释里。
 
-## 3. Sanitizer 面（`bash scripts/verify-all-presets.sh`，本轮 2026-10-26）
+## 3. Sanitizer 面（`bash scripts/verify-all-presets.sh`，本轮 2026-10-26，S1 收尾 = S1-07 + S1-08）
 
 | 检查 | 预期 | 实测 | 结论 |
 |---|---|---|---|
-| ASan + UBSan（`-O0 -g` 强制） | 104 条全过、零报告 | `asan-ubsan` **104/104**，build exit=0，非 gtest 警告 **0 条** | ✅ |
-| LSan（随 ASan） | 零泄漏 | 104/104 内无 leak 报告 | ✅，反证见下 |
-| TSan | 零 data race | `tsan` **104/104**，含 4 条 `S1_07_Backpressure` 闭环——这一组是**跨线程**的：测试线程原子切 `set_stall_reads(bool)` 与 `wait_until` 采样，循环线程改 `armed_events`/探测队列 | ✅ |
-| debug（gcc） | 全过 | `debug` **104/104**，0 警告 | ✅ |
+| ASan + UBSan（`-O0 -g` 强制） | 112 条全过、零报告 | `asan-ubsan` **112/112**，build exit=0，非 gtest 警告 **0 条** | ✅ |
+| LSan（随 ASan） | 零泄漏 | 112/112 内无 leak 报告 | ✅，反证见下 |
+| TSan | 零 data race | `tsan` **112/112**（12.7 s），含 4 条 `S1_07_Backpressure` 闭环——这一组是**跨线程**的：测试线程原子切 `set_stall_reads(bool)` 与 `wait_until` 采样，循环线程改 `armed_events`/探测队列 | ✅，而"曾经红过一条"见反证最后一条 |
+| debug（gcc） | 全过 | `debug` **112/112**，0 警告 | ✅ |
+
+S1-07 收尾那一轮是三 preset 各 **104/104** + 0 警告，S1-08 之后重跑成 **112/112** + 0 警告；两轮的"非 gtest 警告 = 0"都是门禁自己数出来的，不是我口报的。
 
 **反证（没有这一段，上面的"干净"就只是我的一句话）**：
 

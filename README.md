@@ -6,7 +6,7 @@
 
 ## 现在的状态
 
-**S1 前六步（构建骨架、动态缓冲、HTTP/1.1 解析器、epoll ET 事件循环 + 双向转发、keep-alive 复用与 Upgrade 透传、回源转发 + 响应回写闭环）已完成，网关现在真的能转发请求、也认得响应了——它知道一条响应在哪里结束。** 我不在这段含糊其辞：`l7gate --serve --listen ... --upstream ...` 起一个单线程 epoll 边缘触发循环，把下游解析出的完整请求按**原始字节**搬到上游、把上游的响应原样搬回来，keep-alive 复用同一条回源连接，`Connection: close` 兑现成一次性配对；带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**——帧不解析、不改写（ADR-09），101 之后那 2048 字节的解析 scratch 被显式释放。S1-06 补上的是响应侧的认识：七种框架结论（CL / chunked / 无 body / 1xx / close-delimited / 头未齐 / 头坏）、chunked 的边界游标只数边界不重组 body、`ParseError → 400/413/501` 的映射表（switch 没有 default，加错误码不认账就编译不过），以及**截断的两条口径**——最终头没排给下游时网关自产 502，头已经出去了就只能以连接终止表态、绝不追加第二条响应。真 curl 打 10000 个请求跑完之后，存活连接归零、fd 回到基线、构造数等于析构数，ASan/LSan 与 TSan 都是 0 报告。缺的是主动背压的"摘事件"动作、filter 链、路由、限流、熔断——下面每一行都分开写清楚，没有的一律标"未测"。**第一个交出的 SLO 数字是未达标的：增量 p99 实测 57.540 ms，目标 ≤ 1.0 ms**，归因写在 [docs/BENCHMARK.md](docs/BENCHMARK.md) B-001。
+**S1 的八步全部完成（构建骨架、动态缓冲、HTTP/1.1 解析器、epoll ET 事件循环 + 双向转发、keep-alive 复用与 Upgrade 透传、回源转发 + 响应回写闭环、主动背压、filter 链骨架）：网关现在真的能转发请求、也认得响应了——它知道一条响应在哪里结束，也知道什么时候该停下不读。** 我不在这段含糊其辞：`l7gate --serve --listen ... --upstream ...` 起一个单线程 epoll 边缘触发循环，把下游解析出的完整请求按**原始字节**搬到上游、把上游的响应原样搬回来，keep-alive 复用同一条回源连接，`Connection: close` 兑现成一次性配对；带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**——帧不解析、不改写（ADR-09），101 之后那 2048 字节的解析 scratch 被显式释放。S1-06 补上的是响应侧的认识：七种框架结论（CL / chunked / 无 body / 1xx / close-delimited / 头未齐 / 头坏）、chunked 的边界游标只数边界不重组 body、`ParseError → 400/413/501` 的映射表（switch 没有 default，加错误码不认账就编译不过），以及**截断的两条口径**——最终头没排给下游时网关自产 502，头已经出去了就只能以连接终止表态、绝不追加第二条响应。真 curl 打 10000 个请求跑完之后，存活连接归零、fd 回到基线、构造数等于析构数，ASan/LSan 与 TSan 都是 0 报告。**S1 的八步已全部完成**：S1-07 补上了主动背压的"摘事件"动作（撞停读线摘 `EPOLLIN`、水位回落带一次探测读挂回来），S1-08 立起了 `filter/chain` 的顺序骨架（今天没有业务 filter）。还没有的是路由、负载均衡、限流、熔断、连接池、多线程——下面每一行都分开写清楚，没有的一律标"未测"。**SLO #1 至今每一份取样都未达标**：增量 p99 四份读数是 57.540 / 36.420 / 37.890 / 29.720 ms（目标 ≤ 1.0 ms），收尾按 **30–38 ms 量级**陈述、不挑最好看的那一次，归因与取数规程的约束写在 [docs/BENCHMARK.md](docs/BENCHMARK.md) B-001…B-004；S1 的门禁结论与留给 S2 的九条债在 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 | 项目 | 状态 |
 |---|---|
@@ -129,11 +129,12 @@ kill -TERM <网关 pid>      # 停止时才打印 [serve] key=value 统计，包
 | [docs/SLO.md](docs/SLO.md) | 三个数字的目标与写死的测量条件 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 环境自检实测版本、版本偏离的理由、sanitizer 阳性验证 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 已实现的现状 |
-| [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录（原始数字 + 结论 + 环境）：B-001 是第一份 p99，**未达标照记** |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录（原始数字 + 结论 + 环境）：B-001 是第一份 p99，B-004 是 S1 收尾那份，**四份都未达标照记** |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障注入的预期 vs 实测 + sanitizer 结论（每条"干净"都带反证） |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**：S1 四件套逐条对账、一键复现、实测暴露出来留给 S2 的九条债（每条指着具体数字）、以及五项**没有答复就不动**的事项 |
 | [docs/adr/](docs/adr/) | 13 条决策记录 |
 
-`docs/ROADMAP.md` 等阶段门禁那份再建——空的证据文件比没有更糟。
+原来那句"`docs/ROADMAP.md` 等阶段门禁那份再建——空的证据文件比没有更糟"已经兑现：它是在 S1 门禁**有结果可记**的那一刻建的，内容全部指向已有数字，没有一句新证据。
 
 ## 许可
 
