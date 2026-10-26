@@ -6,6 +6,7 @@ add_executable(l7gate_tests
   build_info_test.cc
   buffer_test.cc
   connection_test.cc
+  filter_chain_test.cc
   framing_test.cc
   reactor_test.cc
   request_parser_test.cc

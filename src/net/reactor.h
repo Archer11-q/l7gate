@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "filter/chain.h"
 #include "net/connection.h"
 #include "net/epoll.h"
 #include "net/fd.h"
@@ -98,6 +99,18 @@ class Reactor {
   std::uint64_t epoll_registrations() const noexcept { return epoll_.registrations(); }
   std::uint64_t epoll_unregistrations() const noexcept { return epoll_.unregistrations(); }
   std::uint64_t epoll_modifications() const noexcept { return epoll_.modifications(); }
+
+  // --- filter 链（S1-08）--------------------------------------------------
+  // 只能在 run() 之前添加。链在循环线程里被逐条读，没有任何加锁，运行中改它就是一场
+  // data race；S5 要热更新的话，唯一安全的形状是"整条链换一根指针"，不是往 vector 里 push。
+  //
+  // 转发主路径里只有**一处**链调用（`forward_pending_requests_body` 取到完整请求之后、
+  // `forward_request` 之前），所以"新增一个 filter 要改主路径几行代码"这条验收的答案是
+  // 0 行。这个 0 不是巧合，是 S1-04 起把策略留在 reactor、把状态留在 Connection 的分工
+  // 兑的现（见 net/connection.h 顶部那段"它不管什么"）。
+  void add_request_filter(std::unique_ptr<filter::RequestFilter> filter) noexcept;
+
+  std::size_t request_filter_count() const noexcept { return request_filters_.size(); }
 
   std::size_t live_connection_count() const noexcept { return connections_.size(); }
 
@@ -239,6 +252,9 @@ class Reactor {
 
   Config config_;
   ReactorStats stats_;
+  // 请求方向的 filter 链（S1-08）。按值持有而不是 unique_ptr 成员：空链必须是
+  // "没有 filter"这个常态，主路径上不该为了它多一次判空分支。
+  filter::FilterChain request_filters_;
   Epoll epoll_;
   UniqueFd listener_;
   UniqueFd wake_fd_;

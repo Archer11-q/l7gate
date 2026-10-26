@@ -405,6 +405,13 @@ class Harness {
     // 端口一律给 0 让内核选：测试之间并行跑、失败重跑都不该因为端口占用而随机失败。
     config.listen_port = 0;
     reactor_ = std::make_unique<Reactor>(config);
+    // S1-08：filter 在**循环线程启动之前**装好。reactor.h 写的是"只能在 run() 之前添加"，
+    // 测试如果直接调 reactor()->add_request_filter() 就是在 run() 之后改一条被循环线程
+    // 逐条读的链——那是我自己写下不许做的事，TSan 抓到才算它尽职。
+    for (auto& pending_filter : pending_filters_) {
+      reactor_->add_request_filter(std::move(pending_filter));
+    }
+    pending_filters_.clear();
     int error = 0;
     if (!reactor_->start_listen(&error)) {
       *why = "start_listen failed errno=" + std::to_string(error);
@@ -413,6 +420,11 @@ class Harness {
     port_ = reactor_->listen_port();
     thread_ = std::thread([this] { batches_ = reactor_->run(); });
     return true;
+  }
+
+  // 给下一步 start() 用的 filter 队列。必须在 start() **之前**调用。
+  void add_filter(std::unique_ptr<filter::RequestFilter> filter) {
+    pending_filters_.push_back(std::move(filter));
   }
 
   void stop_loop() {
@@ -449,6 +461,7 @@ class Harness {
   std::thread thread_;
   std::uint64_t batches_ = 0;
   int port_ = -1;
+  std::vector<std::unique_ptr<filter::RequestFilter>> pending_filters_;
 };
 
 Reactor::Config base_config() {
@@ -1802,6 +1815,165 @@ TEST(S1_07_Backpressure, TunnelDirectionPausesAtTheWaterLineAndDeliversEveryByte
 
   client.close();
   harness.upstream().set_stall_reads(false);
+  harness.shutdown_all();
+}
+
+// --- S1-08：filter 链骨架在真实事件循环上的两处证据 ---------------------------
+// 纯链的性质（顺序、短路、状态存活）在 filter_chain_test.cc 里，这里只补那句
+// 光看纯函数证不了的话：**「新增 filter 不修改转发主路径的任何一行代码」**。
+// 它的可执行形式不是去数源码行数，而是同一套流量在"空链"与"两条放行 filter"下
+// 必须逐段相同、且**每一项计数都相等**——syscall 计数变了就说明主路径上确实多走了路。
+namespace {
+
+class ReactorMarkerFilter : public filter::RequestFilter {
+ public:
+  ReactorMarkerFilter(std::string name, std::atomic<int>* calls, filter::Decision decision)
+      : name_(std::move(name)), calls_(calls), decision_(decision) {}
+
+  std::string_view name() const noexcept override { return name_; }
+
+  filter::Decision on_request(const filter::RequestInfo& info) override {
+    // 计数只在"递给它的确实是一条真请求的可见面"时加：方法、目标、至少一个头、
+    // 一个合法的 fd。少了这层核对，"主路径把 ParsedRequest 递给链"那一步可以是个
+    // 空壳（全空的 RequestInfo 照样跑完链）而没人发现。
+    if (!info.method.empty() && !info.target.empty() && !info.headers.empty() &&
+        info.downstream_fd >= 0 && info.request_bytes > 0) {
+      calls_->fetch_add(1, std::memory_order_relaxed);
+    }
+    return decision_;
+  }
+
+ private:
+  std::string name_;
+  std::atomic<int>* calls_;
+  filter::Decision decision_;
+};
+
+// 一次流量：同一条 keep-alive 上三条 GET，各自等自己的响应。
+struct DriveResult {
+  bool ok = false;
+  std::string transcript;  // 每条响应的状态行 + body 依次拼接
+  std::uint64_t parsed = 0;
+  std::uint64_t down_bytes = 0;
+  std::uint64_t completed = 0;
+  std::uint64_t opened = 0;
+  std::uint64_t registrations = 0;
+  std::uint64_t modifications = 0;
+  std::uint64_t hits = 0;
+};
+
+DriveResult drive_three_requests(Harness& harness, std::string* why) {
+  DriveResult result;
+  Client client;
+  if (!client.connect_to(harness.port(), why)) return result;
+  for (std::size_t i = 1; i <= 3; ++i) {
+    if (!client.write_all(fixed_request_text(i))) {
+      *why = "第 " + std::to_string(i) + " 条请求写不出去";
+      return result;
+    }
+    std::string status;
+    std::string body;
+    if (!client.read_response(&status, &body, why)) return result;
+    result.transcript += status;
+    result.transcript += '\n';
+    result.transcript += body;
+  }
+  client.close();
+  // 先停循环，再读非原子的那两个 epoll 计数器 —— stats.h 那条纪律在这一版被我自己的
+  // 用例违反了：TSan 当场抓到"循环线程正在 ++ epoll_ 的普通 uint64、主线程同时在读它"。
+  // 那不是误报，是我读法不对：那个数只在循环停下来之后才是一个数。
+  harness.stop_loop();
+  ReactorStats& stats = harness.reactor()->stats();
+  result.parsed = stats.load(stats.requests_parsed);
+  result.down_bytes = stats.load(stats.bytes_down_to_upstream);
+  result.completed = stats.load(stats.responses_completed);
+  result.opened = stats.load(stats.upstream_opened);
+  result.registrations = harness.reactor()->epoll_registrations();
+  result.modifications = harness.reactor()->epoll_modifications();
+  result.hits = stats.load(stats.high_water_hits);
+  result.ok = true;
+  return result;
+}
+
+}  // namespace
+
+TEST(S1_08_FilterReactor, PassThroughFiltersChangeNothingInTheForwardingPath) {
+  std::string why;
+
+  DriveResult bare;
+  {
+    Harness harness;
+    ASSERT_TRUE(harness.start(default_options(), &why)) << "空链那一轮起不来：" << why;
+    bare = drive_three_requests(harness, &why);
+    ASSERT_TRUE(bare.ok) << "空链那一轮流量没跑完：" << why;
+    harness.shutdown_all();
+  }
+
+  DriveResult filtered;
+  {
+    Harness harness;
+    std::atomic<int> first_calls{0};
+    std::atomic<int> second_calls{0};
+    harness.add_filter(std::make_unique<ReactorMarkerFilter>(
+        "first", &first_calls, filter::Decision::kContinue));
+    harness.add_filter(std::make_unique<ReactorMarkerFilter>(
+        "second", &second_calls, filter::Decision::kContinue));
+    ASSERT_TRUE(harness.start(default_options(), &why)) << "带 filter 那一轮起不来：" << why;
+    ASSERT_TRUE(harness.reactor()->request_filter_count() == 2u)
+        << "filter 没在 run() 之前装进去（Harness::add_filter 的时序前提塌了）";
+    filtered = drive_three_requests(harness, &why);
+    ASSERT_TRUE(filtered.ok) << "带 filter 那一轮流量没跑完：" << why;
+    EXPECT_EQ(first_calls.load(std::memory_order_relaxed), 3);
+    EXPECT_EQ(second_calls.load(std::memory_order_relaxed), 3);
+    harness.shutdown_all();
+  }
+
+  // 响应的可见内容逐段相同（状态行与 body 一条不差，顺序不错位）。
+  EXPECT_EQ(filtered.transcript, bare.transcript);
+  // 计数逐项相等。这一条才是"不改主路径"的硬证据：多一个 filter 就多一串 syscall、
+  // 就多一次解析、就多一段字节的话，主路径已经被动了。
+  EXPECT_EQ(filtered.parsed, bare.parsed) << "解析次数被链改动了";
+  EXPECT_EQ(filtered.down_bytes, bare.down_bytes) << "转发的字节数被链改动了";
+  EXPECT_EQ(filtered.completed, bare.completed) << "响应完结数被链改动了";
+  EXPECT_EQ(filtered.opened, bare.opened) << "回源连接数被链改动了";
+  EXPECT_EQ(filtered.registrations, bare.registrations) << "epoll 注册数被链改动了";
+  EXPECT_EQ(filtered.modifications, bare.modifications) << "epoll 改掩码次数被链改动了";
+  EXPECT_EQ(filtered.hits, bare.hits) << "撞水位次数被链改动了";
+  EXPECT_EQ(bare.parsed, 3u) << "对照那一轮本身就没跑 3 条，比较无从谈起";
+}
+
+TEST(S1_08_FilterReactor, StoppedRequestNeverReachesUpstream) {
+  Harness harness;
+  std::string why;
+  std::atomic<int> calls{0};
+  harness.add_filter(std::make_unique<ReactorMarkerFilter>("stopper", &calls,
+                                                          filter::Decision::kStop));
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(fixed_request_text(1)));
+
+  ReactorStats& stats = harness.reactor()->stats();
+  // 先要看到"链确实被叫过一次"，再断"一条字节都没往上游走"。反过来的顺序会让我
+  // 分不清是链拦下的，还是主路径本来就没走到（比如请求压根没解析完）。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.requests_parsed) == 1u; }, 3000))
+      << "请求根本没被解析出来，链没机会看到它";
+  ASSERT_TRUE(wait_until([&] { return calls.load(std::memory_order_relaxed) == 1; }, 3000))
+      << "链没被调用：主路径那处调用点没生效";
+
+  // 停下来的形态是"什么都没发生"：没回源、没自产表态、连接还活着。
+  // 留一点时间让"如果它其实转出去了"这件事发生，再取数——否则这条断言只是跑得快。
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(stats.load(stats.bytes_down_to_upstream), 0u) << "被拦下的请求还是把字节排进了上游";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 0u) << "被拦下的请求还是回源了";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "链停下之后网关自己编了一条响应（那不是 S1-08 的语义）";
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u);
+  EXPECT_EQ(stats.load(stats.live_connections), 1u)
+      << "拦下一条请求把连接也关掉了：客户端会把它读成上游故障，而不是"
+         "被网关拒绝——两者必须分得开（今天先分给『什么都不做』）";
+
+  client.close();
   harness.shutdown_all();
 }
 

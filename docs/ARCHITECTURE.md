@@ -270,7 +270,31 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 
 已知边界，照记不藏：**pipeline 语义不在 S1 的声明范围内，而这一版我撞到了它的形状**——一批 pipelined 请求里带 `Connection: close` 的那条，会在**第一条响应完结时**就被兑现（意图的字面意思就是"下一条响应之后收尾"），客户端因此只拿到 1 条响应而不是 400 条。这不是背压的缺陷（同一步的 `bytes_down_to_upstream == bytes_read_downstream == 3,300,800` 与 `requests_parsed=400` 都对得上），是"一条连接上同时在飞多条请求"这件事没有语义支撑；冒烟阶段二因此改用"数够条数就自己关连接"，把这条边界原样记在这里，留到真正决定支持 pipeline 的任务再处理。停读线的另一半（跨机链路上的实际尺寸）要等 S4 的 wrk 数据；`backpressure_pause_count` 与 `resume` 是滞回跳变次数、不是时长，速率类指标归 S3 的 Prometheus 面。
 
+### 1.16 `filter/chain`：S1-08 交的是顺序，不是拦截
+
+这个模块今天**一个业务 filter 都没有**（限流/熔断归 S4、路由归 S3）。它交付的是三件会被后来的改动悄悄磨掉的性质，加一句我现在还说不出的话——都写在 `src/filter/chain.h` 的类型注释里，因为那才是改动它的人第一时间会读的地方。
+
+**顺序 = 添加顺序，而且这个"等于"是被数据断言的。** `FilterChain::run()` 是一条不做任何排序的正序循环，链里没有 `priority` 字段、没有按名字插队。需要优先级的时候，那就是配置里数组的顺序；再加一套排序键只会让"谁先跑"有两个互相冲突的答案。用例 `RunOrderIsAddOrder` 故意按 **c、a、b** 添加：字典序、逆序、任何"顺手排了一下"都会在这里现形，而 `a、b、c` 那种样本连"它是不是反了"都测不出来（除非恰好少一个）。`name_at()` 是同一件事的第二份证据——它给日志用，也证明执行顺序和"链自己认为的顺序"是同一个序列。
+
+**第一个 `kStop` 之后，后面的 filter 一次都不被调用。** 这条不只是"省时间"：S4 的限流放在认证 filter 后面时，"没认证的请求不该进限流计数"就靠短路成立。`FilterStatePersistsAcrossRequests` 锁的是另一半——链持有 `unique_ptr`、不复制 filter，所以计数器跨请求存活（第 3 条才拦得下来）。这条一崩，S4 的所有实现同时崩，而它的失败方式很安静：计数器永远是 1，限流"看起来装了但没生效"。
+
+**主路径上只有一处链调用，而且这一处是有讲究的**：`forward_pending_requests_body` 里"取完 upgrade/close 意图之后、`forward_request` 排字节之前"。放在意图之后，是因为 filter 拦不动一条已被判定要隧道化的连接——那是连接自己的语义，不是策略；放在排字节之前，是因为拦下来必须**真的没回源**，不是"回了源再假装没回"。停下时的今天行为是"字节留在原地、连接不关、一条响应都不发"，复用 `kBlocked` 而不是新加第四个枚举值：**那个值的语义是"暂时转不出去，以后再来试"，而被链停下的请求永远不会轮到它**。两者现在行为一致，等 S4 给第一条会停请求的 filter 配上响应，这条出口才有自己的名字。同理 `Decision` 里**没有** `kRejected(status)`：拒掉之后回什么字节是那个 filter 的责任，今天给它一个状态码字段就是给一条没人走的分支发空头证明——和 S1-03 那次"配置写了、代码没读"是同一类错（那次的记录在 1.6）。
+
+**「新增 filter 不修改转发主路径的任何一行代码」这句验收在测试里的可执行形式**不是数源码行数，而是同一套流量在"空链"与"两条放行 filter"下逐项相等：`PassThroughFiltersChangeNothingInTheForwardingPath` 比响应内容（状态行 + body 逐段拼接），也比 `requests_parsed`/`bytes_down_to_upstream`/`responses_completed`/`upstream_opened`/`epoll_registrations`/`epoll_modifications`/`high_water_hits`。**只比响应字节不够**——多一个 filter 就多一串 syscall 的话，主路径已经被动了，而客户端看不出来。反过来说，这条断言能成立的前提是策略本来就在 reactor 而不在 Connection：S1-04 起 `net/connection.h` 顶部就写着"它不做路由、不做转发决策、不碰 epoll"，那时这句话是给 S1-08 留的地基，现在它有了第一个读者。
+
+**`RequestInfo` 里全是借用的 view，规矩写在类型注释上、也写在用例里。** `method`/`target`/`headers` 指向下游入向缓冲，`Connection::finish_request` 一消费就作废（S1-03 定的 view 生命周期、S1-04 落成"下一次读之前取用完毕"）。所以 filter 不许把 `RequestInfo` 或它里面的任何 `string_view` 存进成员——要跨请求记住东西，记连接身份（`downstream_fd`）和 filter 自己的状态。`ReactorMarkerFilter` 只在"递给它的确实是一条真请求的可见面"（方法、目标、至少一个头、`request_bytes > 0`、fd ≥ 0）时才计数，否则"主路径把 ParsedRequest 递给链"这一步可以是个空壳而没人发现。
+
+**运行期不许改链，这不是保守而是时序。** `add_request_filter` 只在 `run()` 之前有效：链在循环线程里被逐条读，没有任何加锁，运行中 push 就是一场 data race（S2 的线程模型落地后这条更贵）。测试侧因此没有直接调 `reactor()->add_request_filter()`，而是在 `Harness::start()` 里、spawn 循环线程**之前**搬进去——测试不能自己先违反它要证的那条规矩。S5 要热更新的话，安全形状是"整条链换一根指针"，不是往 vector 里塞。
+
+**隧道路径不经过链，这是 ADR-09 的直接推论而不是遗漏。** 101 之后 `forward_pending_requests_body` 开头就走 `tunneling()` 那条早退分支，链一次都不被调用——隧道里的字节不是请求，没有"这条请求放不放行"这个问题。S4 的限流因此天生管不到已经握手的 WebSocket 流量，这条要在 S4 的验收里显式处理（要么按连接计数、要么承认管不到），而不是现在偷偷在隧道泵里插一个钩子——那才是真的改主路径。同理 `Connection: close` 之后的残包走的是 reject/断链路径，也不是链的请求。
+
+已知边界，照记不藏：**`RequestInfo` 里没有"目标上游"这一格**，所以路由（S3）落地时需要返工一次接口——它得改目的地，而今天没有任何代码会读这样一个字段，`ensure_upstream` 只读配置里的 `upstream_address/port`。这条返工我写在这里而不是先造一个没人读的字段：验收句里的"接口签名允许后续放置限流/熔断/路由"，在 S1-08 能被诚实兑现的是前两者（它们都是"停下这条请求"），路由那半句要等它和它的读者一起进来。响应方向同理没有 `on_response` 钩子：S1 里没人需要它，S5 的日志/改写面才是它的归属。
+
+实测：新增 **8** 条（6 条 `S1_08_FilterChain` 纯链 + 2 条 `S1_08_FilterReactor` 真循环），总数 104→**112**，四 preset 全绿（见本任务收尾的 `verify-all-presets`），非 gtest 警告 **0 条**，`sizeof(Connection)` 不变（**520**，链挂在 reactor 上）。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
+
+
 
 
 
@@ -293,7 +317,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 - **转发语义（S1-06）**：已实现，记录在 1.14。`on_downstream_readable` 里 `round.reject` 那一行现在按 `reply_status_for_parse_error` 的映射表回自产响应；响应侧认状态码、认框架、判截断。留给 S1-07 的那条缺口（撞水位之后摘掉 EPOLLIN 压回对端）已在 1.15 闭合。
 - **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
 - **多 Reactor + 上游连接池（S2）**：连接对象的销毁路径从 S1 就按"可能被别的线程持有"设计（六步关闭 + `retiring_`），`ReactorStats` 全原子也是给 TSan 留的基线——这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的具体支出。`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方。
-- **`filter/chain`（S1-08）**：空壳先立。验收标准是「新增 filter 不修改转发主路径的任何一行代码」——S1-04 之后主路径真的存在了（`forward_pending_requests` → `forward_request` → `pump_upstream_to_downstream`），所以这条验收现在才有意义：它检验的是"我能不能在不动这三条函数的情况下插进去"。
+- **`filter/chain`（S1-08）**：已落地，记录在 1.16。当年那句验收——「新增 filter 不修改转发主路径的任何一行代码」——现在有可执行形式了：空链与两条放行 filter 的链，同一套流量的响应内容与七项计数逐项相等（`PassThroughFiltersChangeNothingInTheForwardingPath`）。留给后面的两笔返工也写在 1.16 末尾：路由要一个"目标上游"字段、响应方向要一个钩子，两者今天都没有读者，所以我不预先造字段。
 - **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。
 
 ## 4. 已知噪声与待补项

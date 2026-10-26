@@ -8,6 +8,8 @@
 
 二，**sanitizer 的"干净"必须带反证**。一个从不报警的检查器和一个干净的代码库，从输出上看完全一样。所以每次记"ASan/LSan 零报告"时，同一段要给出它**会**报警的证据。
 
+三，**被否掉的注入手段也要留数字**。为了让某条线"一定能被顶到"而给对端插一堵墙，测出来的就不再是网关的行为。这类手段的删除记录必须带着"钉与不钉落在同一个位置"的两组数，否则下一个人会把它当作"当时的环境不行"重新加回来。第 5 节末尾那条就是这种记录。
+
 ---
 
 ## 1. 上游侧故障（S1-06 的四类，实测于 `scripts/smoke-s1-06.sh` 阶段四~七，preset=debug，body=1200 B 钉死）
@@ -49,6 +51,7 @@ curl 不会替我发这些字节，所以这一段的请求是 shell 手写的�
 - LSan 的**端到端**反证在 S1-04 做过，本任务沿用同一条路径：故意留一条不释放的连接 → `detected memory leaks` + 退出码 1；删掉 → 退出码 0。
 - 本轮新加的一条同类反证：asan/tsan 首跑各报 **1 条非 gtest 警告**（`tools/bench_upstream_main.cc` 里一个只用于注释目的的 `constexpr`，clang 报 `-Wunused-const-variable`，gcc 的 debug preset 不报）。它证明"非 gtest 警告 = 0"这条门禁真的会响。删掉那个未使用常量后归零——**一个没人引用的常量是一句关于结构的谎**，删它比给它找个假用途诚实。
 - 优雅停止的反证同样本轮现形：第一版 p99 脚本在 1000 并发还在跑的时候直接 `kill -TERM`，报告里是 `fd_end=351`、`live_connections=342`、`epoll_unregistrations` 比 `registrations` 少 344。**这不是泄漏**——循环退出时那 171 对连接确实还没被收尾，网关的停止语义是"不再接受新连接 + 退出循环"，不排水在飞连接。修法是把观测条件摆正：脚本先静置 5 s 再 SIGTERM，然后**断言** `live_connections==0`、`fd_start==fd_end`、上游 `refused_*==0`（`fatal`，不是 `warn`）。静置后仍不为零才是真漏。改完之后标准口径那一轮是 `fd 9→9`、`live_connections=0`、`constructed==destructed==6008`。
+- **S1-08 这一轮 TSan 抓到的是我自己新写的用例**，值得原样记下来：`S1_08_FilterReactor.PassThroughFiltersChangeNothingInTheForwardingPath` 第一版在流量跑完之后、循环还在转的时候读 `epoll_registrations()`/`epoll_modifications()`——那是 `Epoll` 里的普通 `uint64_t`，循环线程正在自增。TSan 报 data race，ctest 里红一条。修法不是豁免、不是加 mutex，是把读法摆正：**先 `stop_loop()`（join 循环线程）再读那两个数**——这正是 `stats.h` 第 25 行那条"非原子观测只能在循环停下之后读"的纪律，而它这次抓的是写纪律的人自己。**这条抓取的副产品比用例本身更有价值**：它证明"TSan 干净"这句话在本仓库不是自我声明，也证明那条纪律不是装饰。（一个我没归掉的现象，照记：门禁那一轮 tsan 的汇总行是 `1 tests failed out of 85`，而我随后单独重跑同一 preset 是 `1 failed out of 112`——85 这个数说明那一轮 ctest 提前停了，为什么停我没有查，改完两条都跑满 112 全绿。）
 
 ## 4. S1-05 的 Upgrade 透传验证结果（门禁四件套第 2 条点名的一项）
 

@@ -206,6 +206,10 @@ void Reactor::wake_up() {
   }
 }
 
+void Reactor::add_request_filter(std::unique_ptr<filter::RequestFilter> filter) noexcept {
+  request_filters_.add(std::move(filter));
+}
+
 std::uint32_t Reactor::armed_events(int fd) const noexcept {
   auto it = connections_.find(fd);
   if (it == connections_.end()) return 0;
@@ -612,6 +616,27 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
       // 就作废）——这也正是"判定"与"取用"分开写的原因：字节照原样转，意图另存。
       const bool upgrade = is_upgrade_request(*pending);
       const bool close_after = is_close_request(*pending);
+      // S1-08 的链调用点，主路径上只有这一处。放在"取完意图之后、排字节之前"是有讲究的：
+      // 意图已经定下来了（filter 拦不住一条已经被判定要隧道化的连接，那是它自己的语义），
+      // 而一个字节都还没进上游的出向缓冲（拦下来就真的没回源，不是"回了源再假装没回"）。
+      // RequestInfo 里的 view 是借来的，链跑完就作废——所以这里把它做成栈上临时对象，
+      // 且在 finish_request 之前：filter 想留下任何字段，只能自己复制出去。
+      const filter::RequestInfo info{
+          .method = pending->method,
+          .target = pending->target,
+          .headers = pending->headers,
+          .request_bytes = pending->consumed,
+          .downstream_fd = downstream->fd(),
+      };
+      if (request_filters_.run(info) == filter::Decision::kStop) {
+        // 停下不等于表态。今天没有任何业务 filter 会返回 kStop，所以这条出口的实际含义
+        // 只有"不转发、字节留在原地、连接不关"；谁替客户端回那条 429/503，是第一个会停
+        // 请求的 filter（S4 限流）的责任，那时这条出口才有自己的名字。
+        // 复用 kBlocked 而不是新加第四个枚举值：那个值的语义是"暂时转不出去，以后会再来试"，
+        // 而被链停下的请求**永远**不会轮到它 —— 两者现在行为一致（字节不动、连接活着），
+        // 等 S4 给它配了响应再说，那时区别才有内容。
+        return ForwardOutcome::kBlocked;
+      }
       if (!forward_request(downstream, pending->consumed, upgrade, close_after)) {
         return ForwardOutcome::kBlocked;  // 上游没连上或出向满了，字节一条都没消费
       }
