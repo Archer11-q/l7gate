@@ -110,6 +110,35 @@ bool wait_until(Pred pred, int timeout_ms) {
   return pred();
 }
 
+// 等一个原子计数**进入平台期**（连续两次采样之间不再变化，即静止满 2×60ms），
+// 返回静止时的那个累计值；*reached 告诉你到底停住了没有。
+//
+// 为什么不写成"sleep 200ms 然后比两次"：内核侧还有在途字节要先被吸收完，平台期
+// 才可能到达。固定 sleep 要么落在吸收期里（假红：字节明明停止了却还在涨），
+// 要么赌一个没人保证的时长。S1-07 请求方向那条第一次跑就是这么红的 ——
+// 2 MB 里有 1.86 MB 被接收缓冲吃掉，网关压根没机会持续停在停读线上。
+//
+// 这仍然不是"拿计数当同步手段"：调用点都先有一个内核级观测（写线程还卡在 write()
+// 上、客户端一个字节都还没读），等的是"停住这件事有没有持续下去"。
+std::uint64_t wait_for_plateau(std::atomic<std::uint64_t>& counter, int timeout_ms,
+                               bool* reached) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::uint64_t previous = counter.load(std::memory_order_relaxed);
+  int flat_samples = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const std::uint64_t current = counter.load(std::memory_order_relaxed);
+    flat_samples = (current == previous) ? flat_samples + 1 : 0;
+    if (flat_samples >= 2) {
+      *reached = true;
+      return current;
+    }
+    previous = current;
+  }
+  *reached = false;
+  return previous;
+}
+
 std::string request_text(std::size_t i) {
   return "GET /r" + std::to_string(i) + " HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
 }
@@ -252,7 +281,11 @@ class Client {
   bool read_exact(std::string* out, std::size_t n, std::string* why) {
     char buf[4096];
     while (out->size() < n) {
-      const std::size_t want = n - out->size();
+      // 长度必须夹在 sizeof(buf) 以内。我第一版直接传 `n - out->size()`，S1-07 的
+      // 1 MiB 响应于是让内核往一片 4 KiB 的栈上拷最多 1 MiB 字节——先以 segfault 的
+      // 形态出现，再以 `read errno=14`（EFAULT）出现，两次都看着像"网关没把字节送完"。
+      // 之前所有调用者的响应都不足 4 KiB，所以这个错一直藏在 helper 里没露头。
+      const std::size_t want = std::min(n - out->size(), sizeof(buf));
       const ssize_t got = ::read(fd_, buf, want);
       if (got > 0) {
         out->append(buf, static_cast<std::size_t>(got));
@@ -1400,5 +1433,378 @@ TEST(S1_06_Reactor, ClosePairCompletesAtTheFramingBoundary) {
   client.close();
 }
 
+// --- S1-07：背压雏形（撞停读线 → 摘 EPOLLIN → 平台期 → 回落 → 探测恢复） ------
+// 验收句逐条对应：
+//   「停止后能观测到网关不再消费下游可读事件（epoll 侧可断言）」
+//     → 循环跑着的时候断的是 pause 计数 + **入向读取字节数的平台期**（原子观测面），
+//       停循环之后断的是 `armed_events()` 回执里那个没有 EPOLLIN 的掩码（非原子观测）。
+//       两个时刻分别断，不是因为我想多看一眼，是因为后者的合法读法只有那一个时刻。
+//   「且内存不继续增长」
+//     → 平台期内存增长的可断言代理就是"字节没有进网关"：入向读取累计数不动。
+//       RSS 只打印不判断（sanitizer 下它是噪声，见文件头那条宏）。
+//   「水位回落后自动恢复读取」
+//     → resume 计数 + **恢复之后不需要客户端再写一个新请求就能继续消费**（探测读在
+//       起作用），最后一条响应逐字节齐 —— 自动恢复如果只挂在"下一次事件"上，
+//       这条就会红在超时上，而那正是边沿触发的睡死形态。
+//
+// 四个方向各一条：请求方向（上游不消费）、响应方向（客户端不消费）、隧道方向，
+// 再加一条"正常流量不许因此多打 epoll_ctl"的回归——背压省的是 syscall，
+// 如果它自己在 keep-alive 稳态里制造 syscall，那就是把 B-001 的病因换了个名字。
+
+namespace {
+
+// 测试用的停读线：32 KiB。它卡在两个实测出来的约束中间，不是"越小越狠"。
+//   上限：转发的最小单位是"整条请求 / 整个响应头"（`Connection::queue_bytes` 的整块
+//     判断），所以单条请求必须明显小于这条线，否则它永远装不进出向缓冲。
+//     这里的测试请求是 8.3 KiB（见 kPostBodyBytes），留得下也转得出。
+//   下限：线必须**远小于内核在这段路径上能吸收的量**。第一次跑用的是 64 KiB，
+//     结果响应方向跑满 6 秒 `pause=0`、`high_water_hits=2`，请求方向的平台期
+//     出现在 1.86 MB 处 —— 字节全被"对端发送缓冲 + 网关接收缓冲"那两段吃掉了，
+//     应用的线一次都没成为第一道。32 KiB 才让线先于内核撞。
+// 这条实测关系本身就是结论，不只是取证的麻烦：TCP 自己的流控替网关挡掉了大部分
+// 压力，应用侧停读线只在"对端塞进来的量超过内核这段路径能吸收的量"时才有活干。
+// 默认那条 256 KiB 因此是**真实链路**（跨机、带宽延迟积大）上的量级，
+// 不是回环上的；这条差异要记进 ARCHITECTURE 1.15，不能靠调小默认值掩盖。
+constexpr std::size_t kWaterMark = 32u * 1024u;
+constexpr std::size_t kPostBodyBytes = 8192u;
+
+// 一条**完整**的 POST 请求（头 + 声明长度的 body）。请求方向要用它，理由见上：
+// 半条请求会停在停读线上永远转不出去，那测的是边界不是恢复。
+std::string post_request_text(std::size_t i, std::size_t body_bytes) {
+  return "POST /b" + std::to_string(i) + " HTTP/1.1\r\nHost: gateway.test\r\n"
+         "Content-Length: " + std::to_string(body_bytes) + "\r\n\r\n" +
+         std::string(body_bytes, 'x');
+}
+
+// 把缓冲尺寸钉到内核允许的下限（Linux 会把它翻倍记账，所以写 4096 实际拿到 8192）。
+// 只在**测试自己的 socket** 上做：要的是"这一侧吸收不了多少字节"，让水位成为
+// 先撞到的那一道，而不是内核缓冲池。网关侧的接收缓冲由网关自己拥有，不归测试调。
+bool shrink_socket_buffer(int fd, int optname, std::string* why) {
+  const int bytes = 4096;
+  if (::setsockopt(fd, SOL_SOCKET, optname, &bytes, sizeof(bytes)) != 0) {
+    *why = "setsockopt(" + std::to_string(optname) + ") failed errno=" + std::to_string(errno);
+    return false;
+  }
+  return true;
+}
+
+// 写线程的收尾。写成 RAII 而不是"记得 join"：ASSERT_* 展开成 return，而 return 出去时
+// 线程还卡在对端窗口上，一个可 join 的 std::thread 析构就直接 terminate——
+// 隧道那条第一次跑就是这样崩的，现场连一行断言信息都没留下。
+// 顺序也定死：先放开上游（让写线程有机会写完），再 join。反过来就是拿一个
+// 永远不会到来的条件去等一个永远不会返回的线程。
+struct StallReleasingJoiner {
+  TestUpstream& upstream;
+  std::thread& writer;
+  ~StallReleasingJoiner() {
+    upstream.set_stall_reads(false);
+    if (writer.joinable()) writer.join();
+  }
+};
+
+}  // namespace
+
+TEST(S1_07_Backpressure, RequestDirectionStopsReadingAndRecoversWithoutLoss) {
+  Harness harness;
+  std::string why;
+  Harness::Options options = default_options();
+  options.config.connection.inbound.high_water_mark = kWaterMark;
+  options.config.connection.outbound.high_water_mark = kWaterMark;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  // 上游从用例开始就不消费任何字节。它照旧 accept、照旧持有连接——"连接还在但没人
+  // 读"才是背压的真实形态；如果这里改成"上游关掉连接"，测的就是 S1-06 的截断而不是 S1-07。
+  harness.upstream().set_stall_reads(true);
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(shrink_socket_buffer(client.fd(), SO_SNDBUF, &why)) << why;
+
+  // 写 384 条完整 POST（≈3.17 MiB）。这个线程会**阻塞在 write() 上**，而阻塞本身就是
+  // 内核给的证据：网关不读了，窗口关死了。断言因此可以站在另一侧做。
+  // 384 是量出来的，不是随手翻倍的：256 条（2.11 MiB）在 asan-ubsan 下平台期恰好落在
+  // 2,113,684 = **整个载荷**上——那不是停读线挡住了字节，是写侧把货全部倒进了内核路径
+  // （回环上"网关→上游"这段实测吸收 ≈1.9 MB），断言于是为一个不成立的理由通过。
+  // 载荷必须明显超过那段吸收量，平台期才只能由"网关不再 read"产生；debug 同一条
+  // 是 1,906,999（真墙），asan 是 2,113,684（假墙）——两条都要成立就得把载荷抬上去。
+  // Client 的写路径只碰 fd_，读路径只碰 carry_，所以这里"另一线程写、主线程读同一个
+  // fd"不共享可变状态——不是"应该没事"，是这两个字段确实不相交。
+  constexpr std::size_t kRequestCount = 384;
+  std::atomic<bool> writer_blocked{true};
+  std::atomic<bool> write_failed{false};
+  std::thread writer([&] {
+    for (std::size_t i = 1; i <= kRequestCount; ++i) {
+      if (!client.write_all(post_request_text(i, kPostBodyBytes))) {
+        write_failed.store(true, std::memory_order_relaxed);
+        break;
+      }
+    }
+    writer_blocked.store(false, std::memory_order_relaxed);
+  });
+  const StallReleasingJoiner joiner{harness.upstream(), writer};
+
+  ReactorStats& stats = harness.reactor()->stats();
+  // 先有内核级观测（写线程还卡在 write 上），再等 pause 落地 —— stats.h 那条纪律的形状。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.backpressure_pause_count) >= 1u; }, 6000))
+      << "3.2 MiB 已经压到网关入向，却没有一次 EPOLLIN 摘除：停读动作没生效";
+  EXPECT_TRUE(writer_blocked.load(std::memory_order_relaxed))
+      << "pause 计数到了，客户端却没被卡住——那这轮顶到的可能是内核缓冲而不是网关的停读线";
+  EXPECT_GE(stats.load(stats.high_water_hits), 1u) << "S1-02 的撞线口径必须仍是这条链的第一环";
+
+  // 平台期：入向读取累计数进入静止。这是"内存不继续增长"在网关这一侧唯一不靠
+  // 猜的代理量——字节没进网关，就没有任何一块缓冲会为它长大。
+  bool plateau_reached = false;
+  const std::uint64_t plateau_bytes =
+      wait_for_plateau(stats.bytes_read_downstream, 4000, &plateau_reached);
+  const std::uint64_t rss_at_plateau = current_rss_kib();
+  EXPECT_TRUE(plateau_reached)
+      << "摘掉 EPOLLIN 之后入向读取仍在增长：停读只是没读到，实际还在消费下游";
+  EXPECT_GE(plateau_bytes, kWaterMark) << "平台期观测点采得太早，还没到水位就先断上了";
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  const std::uint64_t rss_after_plateau = current_rss_kib();
+  // RSS 只打印不判断：sanitizer 下它是噪声，把它写成断言得到的是一条随机红的用例。
+  std::printf("[S1-07 请求方向] 平台期入向读取累计=%llu 字节（停住=%d）；RSS %llu→%llu KiB\n",
+              static_cast<unsigned long long>(plateau_bytes), plateau_reached ? 1 : 0,
+              static_cast<unsigned long long>(rss_at_plateau),
+              static_cast<unsigned long long>(rss_after_plateau));
+
+  // 水位回落的驱动：上游开始消费。网关这边**不做任何新动作**，也没有客户端的新请求，
+  // 恢复只能来自"腾出空间 → 重算掩码 → 挂回 EPOLLIN → 主动探测读"这条链。
+  harness.upstream().set_stall_reads(false);
+
+  // 逐条取回全部响应。任何一条没回来，这条都红在超时上（5s 读超时）而不是红在计数上——
+  // 这正是"边沿触发睡死"应有的表现方式。
+  for (std::size_t i = 1; i <= kRequestCount; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why))
+        << "第 " << i << " 条响应没回来：恢复读取没有真的恢复消费：" << why;
+    ASSERT_TRUE(status == "HTTP/1.1 200 OK") << "第 " << i << " 条状态码不对：" << status;
+    ASSERT_TRUE(body == expected_body(i)) << "第 " << i << " 条 body 串号或截断";
+  }
+  writer.join();
+  EXPECT_FALSE(write_failed.load(std::memory_order_relaxed)) << "写线程遇到真错误，用例前提塌了";
+
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kRequestCount))
+      << "字节零丢失：每条请求都被解析并转发过";
+  EXPECT_EQ(harness.upstream().requests_served(), static_cast<std::uint64_t>(kRequestCount));
+  const std::uint64_t pause_count = stats.load(stats.backpressure_pause_count);
+  const std::uint64_t resume_count = stats.load(stats.backpressure_resume_count);
+  EXPECT_GE(resume_count, 1u) << "恢复没有发生，前面那次 pause 是永久睡死的前一刻";
+  EXPECT_LE(pause_count, resume_count + 1u)
+      << "pause/resume 应当成对（至多差一次收尾中的暂停）；差得多说明水位线在横跳";
+  std::printf("[S1-07 请求方向] pause=%llu resume=%llu 高水位撞线=%llu 入向读取累计=%llu\n",
+              static_cast<unsigned long long>(pause_count),
+              static_cast<unsigned long long>(resume_count),
+              static_cast<unsigned long long>(stats.load(stats.high_water_hits)),
+              static_cast<unsigned long long>(stats.load(stats.bytes_read_downstream)));
+
+  // 收尾之后才读非原子的注册表观测：此刻掩码里已经没有 EPOLLIN 了（摘掉是收尾的一部分），
+  // 所以"停读过"这件事的证据是上面那两个原子计数，这里只断"最后没有连接挂在半停状态"。
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->connections_with_read_disarmed(), 0u)
+      << "循环已停，还有 kOpen 连接处于停读态：这条连接的恢复条件永远等不到了";
+  client.close();
+  harness.upstream().set_stall_reads(false);
+  harness.shutdown_all();
+}
+
+TEST(S1_07_Backpressure, ResponseDirectionSurvivesASlowClientByteForByte) {
+  Harness harness;
+  std::string why;
+  Harness::Options options = default_options();
+  options.config.connection.inbound.high_water_mark = kWaterMark;
+  options.config.connection.outbound.high_water_mark = kWaterMark;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  // 一条 1 MiB 的固定体响应。尺寸是量出来的，不是猜的：这条路径上的吸收能力是
+  // 「网关出向水位 32 KiB + 网关自己的发送缓冲 + 客户端接收缓冲」，而响应还得先从
+  // 上游走到网关（上游发送缓冲 + 网关接收缓冲）。256 KiB 实测**一次都撞不到停读线**
+  // （全部被这几段缓冲吃掉），1 MiB 实测能撞（pause≥1，撞线 2 次）。
+  //
+  // 这里刻意**不夹客户端的接收窗口**。第一版夹过（SO_RCVBUF 4 KiB），夹完之后线确实
+  // 撞得更狠，但补齐那 1 MiB 变成 25 秒：小窗口把发送侧推进了 zero-window 探测的节奏，
+  // 每 32 KiB 一档、每档等一次 TCP 的 persist 计时器（RTO 下限 200 ms）——
+  // 测到的是内核的计时器，不是网关的补齐能力。放开夹口之后同一批断言 240 ms 跑完。
+  // 同一条理由后来把夹具侧上游的钉窗也一并删掉了：实测撞线位置没变，而放开是无效的
+  // （window_clamp 不回涨），见 test_upstream.h 里那段删除记录。
+  const std::string body(1024u * 1024u, 'k');
+  harness.upstream().set_fixed_response_body(body);
+  const std::string expected = expected_cl_response(body);
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(fixed_request_text(1)));
+
+  ReactorStats& stats = harness.reactor()->stats();
+  // 内核级观测先行：客户端**还没有 read 过任何一个字节**，所以此刻它收到的是 0 字节，
+  // 而网关已经尽力往这条没人读的连接上压了。等 pause 落地只是等同一批处理里的收尾。
+  const bool paused =
+      wait_until([&] { return stats.load(stats.backpressure_pause_count) >= 1u; }, 6000);
+  std::printf("[S1-07 响应方向] pause=%llu resume=%llu 撞线=%llu 上游入向=%llu 已排下游=%llu\n",
+              static_cast<unsigned long long>(stats.load(stats.backpressure_pause_count)),
+              static_cast<unsigned long long>(stats.load(stats.backpressure_resume_count)),
+              static_cast<unsigned long long>(stats.load(stats.high_water_hits)),
+              static_cast<unsigned long long>(stats.load(stats.bytes_read_upstream)),
+              static_cast<unsigned long long>(stats.load(stats.bytes_up_to_downstream)));
+  ASSERT_TRUE(paused) << "慢客户端 + 1 MiB 响应没让网关停止读上游：响应方向的背压缺失";
+  bool plateau_reached = false;
+  const std::uint64_t plateau_bytes = wait_for_plateau(stats.bytes_read_upstream, 4000,
+                                                       &plateau_reached);
+  EXPECT_TRUE(plateau_reached) << "上游入向仍在增长：网关在客户端没读的时候继续搬响应";
+  std::printf("[S1-07 响应方向] 平台期上游入向读取累计=%llu 字节（响应全长 %zu）\n",
+              static_cast<unsigned long long>(plateau_bytes), expected.size());
+
+  // 这条平台期的**证据强度不如请求方向那条**，写清楚：1 MiB 的响应最后是被网关
+  // 全部读走的（回环上"网关→客户端"这段内核路径能吸收的量够大），所以读累计停住
+  // 有一部分是因为上游已经全部交完。响应方向真正算数的是上面那对 pause/resume——
+  // 摘过 EPOLLIN 就是摘过。平台期在这里只担保一件事：源已经穷了之后网关不再空转读。
+  // 内存那一条要分成两笔记：网关**自己的堆**（Buffer）由停读线担保，
+  // 而内核的 socket 缓冲归 TCP 管、由发送窗口自己收口——这条区分记在 ARCHITECTURE 1.15。
+
+  // 客户端开始消费 —— 水位回落的唯一驱动。之后没有任何新的请求，所以后续的搬运
+  // 全靠"腾出空间 → 重算掩码 → 挂回 EPOLLIN → 探测读"这条链把剩下的字节接完。
+  std::string got;
+  ASSERT_TRUE(client.read_exact(&got, expected.size(), &why))
+      << "慢客户端开始读之后响应没有补齐：" << why;
+  EXPECT_EQ(got, expected) << "背压期间的响应字节必须逐字节一致（不丢、不重、不改序）";
+
+  EXPECT_GE(stats.load(stats.backpressure_resume_count), 1u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 1u) << "补齐的那条响应必须落下完结点";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "背压不是错误，不许自产响应";
+  EXPECT_EQ(stats.load(stats.upstream_truncated_in_body), 0u) << "慢不是截断";
+
+  client.close();
+  harness.shutdown_all();
+}
+
+TEST(S1_07_Backpressure, KeepAliveWorkloadWithoutPressureAddsNoEpollCtl) {
+  // 这条是**反证**：背压省的是 syscall，它自己不许在稳态里花 syscall。
+  // 滞回带 + `apply_events` 的相等即返回，是 BENCHMARK 给 p99 归因的那笔
+  // 「每请求 5.0 次 epoll_ctl」的唯一削减来源；如果稳态流量上这个数不降，
+  // 说明去重只在测试里成立。断言取"每请求不超过 4 次"：
+  // 一条 keep-alive 请求的最短路径是 上游挂EPOLLOUT / 上游摘EPOLLOUT /
+  // 下游挂EPOLLOUT / 下游摘EPOLLOUT = 4 次，第 5 次只能是重复提交或抖动。
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  constexpr std::size_t kRequests = 1000;
+  for (std::size_t i = 1; i <= kRequests; ++i) {
+    ASSERT_TRUE(client.write_all(request_text(i)));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条：" << why;
+    ASSERT_TRUE(body == expected_body(i)) << "第 " << i << " 条 body 不对";
+  }
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.backpressure_pause_count), 0u) << "64 字节的请求不该撞停读线";
+  EXPECT_EQ(stats.load(stats.backpressure_resume_count), 0u);
+  EXPECT_EQ(stats.load(stats.high_water_hits), 0u) << "撞线口径（S1-02）必须仍是 0";
+
+  harness.stop_loop();
+  const std::uint64_t mods = harness.reactor()->epoll_modifications();
+  const double per_request = static_cast<double>(mods) / static_cast<double>(kRequests);
+  std::printf("[S1-07 稳态] %zu 条 keep-alive 请求：epoll_modifications=%llu（%.2f 次/请求）"
+              " registrations=%llu\n",
+              kRequests, static_cast<unsigned long long>(mods), per_request,
+              static_cast<unsigned long long>(harness.reactor()->epoll_registrations()));
+  EXPECT_LE(mods, kRequests * 4 + 8) << "每请求超过 4 次 epoll_ctl：去重没起作用";
+  client.close();
+  harness.shutdown_all();
+}
+
+TEST(S1_07_Backpressure, TunnelDirectionPausesAtTheWaterLineAndDeliversEveryByte) {
+  Harness harness;
+  std::string why;
+  Harness::Options options = default_options();
+  options.config.connection.inbound.high_water_mark = kWaterMark;
+  options.config.connection.outbound.high_water_mark = kWaterMark;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  // 先把握手走完（上游得先读到 Upgrade 请求才回 101），再让它停止消费。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(upgrade_request_text()));
+  std::string head;
+  ASSERT_TRUE(client.read_head(&head, &why)) << "101 没有回来：" << why;
+  ASSERT_TRUE(head.find("HTTP/1.1 101") == 0u) << head;
+
+  ReactorStats& stats = harness.reactor()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upgrades_101) == 1u; }, 3000));
+  harness.upstream().set_stall_reads(true);
+
+  // 隧道里的"流量"是一坨不透明字节：这里用约 2.7 MiB 非 HTTP 形态的载荷
+  // （0x00/0x0D/0x0A 混在里面）。如果这段被当请求解析，requests_parsed 会当场跳起来——
+  // 所以它同时是 ADR-09 的一次复查。尺寸下限由内核路径决定：上游停读后这条路径实测
+  // 吸收到 1,898,661 B（debug）/ 1,897,637 B（asan）就停住——那堵墙是网关自己的
+  // SO_SNDBUF，不是应用的停读线，所以载荷必须明显超过它，平台期才只能由"网关不再 read"
+  // 产生（同一个道理把请求方向那条的 kRequestCount 从 256 抬到 384）。
+  std::string blob;
+  blob.reserve(2048u * 1024u);
+  for (std::size_t i = 0; i < 2048u * 1024u; i += 13) {
+    blob.append("\x00\x0D\x0A\x21\x81\xFE", 6);
+    blob.append(4, static_cast<char>('a' + static_cast<int>(i % 26)));
+    blob.append("\r\n\r\n", 4);
+    blob.append(3, static_cast<char>('0' + static_cast<int>(i % 10)));
+  }
+  // 这里同样**不夹**客户端的发送缓冲。夹过一版（SO_SNDBUF 4 KiB），停读线撞得更狠，
+  // 但恢复期变成每 32 KiB 等一次 TCP 的 persist 计时器：asan-ubsan 下这条用例跑到
+  // 34 秒，超过 ctest 的 TIMEOUT 30。理由与响应方向那条一样——夹口测的是内核计时器，
+  // 不夹才测得到网关自己。
+  std::atomic<bool> writer_finished{false};
+  std::thread writer([&] {
+    (void)client.write_all(blob);
+    writer_finished.store(true, std::memory_order_relaxed);
+  });
+  const StallReleasingJoiner joiner{harness.upstream(), writer};
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.backpressure_pause_count) >= 1u; }, 6000))
+      << "隧道下游入向顶到 MiB 量级仍未摘读：透传路径绕过了背压判定";
+  // 写线程此刻有没有被卡住，这条**只打印不判断**（变量叫 writer_finished 而不是
+  // writer_blocked 就是为了不让名字替我下结论）：不夹发送缓冲之后，回环的内核路径
+  // 可能先替网关把整段载荷咽下去，"客户端被卡住"就不再是停读线生效的必要证据——
+  // 这条真正的证据是上面的 pause 计数加下面的平台期。
+  // 请求方向那条反过来保留断言：那里客户端自己的 SO_SNDBUF 被夹到下限，写侧卡住是
+  // 网关摘读的内核级旁证。同一个观测在两条用例里取不同强度，是因为两条的压强来源不同：
+  // 一条墙由测试主动摆（客户端发送缓冲），一条墙本来就在路上（网关→上游的内核路径）。
+  std::printf("[S1-07 隧道方向] 摘读落地时写线程已写完=%d\n",
+              writer_finished.load(std::memory_order_relaxed) ? 1 : 0);
+  bool plateau_reached = false;
+  const std::uint64_t plateau_bytes =
+      wait_for_plateau(stats.bytes_read_downstream, 4000, &plateau_reached);
+  EXPECT_TRUE(plateau_reached) << "隧道方向的停读只是没生效：字节还在进网关";
+  std::printf("[S1-07 隧道方向] 平台期入向读取累计=%llu 字节（载荷 %zu 字节，停住=%d）\n",
+              static_cast<unsigned long long>(plateau_bytes), blob.size(),
+              plateau_reached ? 1 : 0);
+
+  // 恢复：上游开始消费 → 隧道把下游入向的字节搬走 → 水位回落 → 挂回 EPOLLIN + 探测读。
+  harness.upstream().set_stall_reads(false);
+  // 回显量 = 载荷量（测试上游"不解析帧"地原样退回）。客户端一边读一边等写线程把
+  // 剩下的字节灌完，这条顺序和真实隧道里双向同时跑流量的形态一致。
+  std::string got;
+  ASSERT_TRUE(client.read_exact(&got, blob.size(), &why))
+      << "恢复之后隧道没有把全部字节搬到：" << why;
+  writer.join();
+  EXPECT_EQ(got, blob) << "透传在背压期间改写了字节序";
+
+  EXPECT_GE(stats.load(stats.backpressure_resume_count), 1u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u) << "帧字节一次都不许进解析器";
+  EXPECT_EQ(stats.load(stats.bytes_tunnel_down), static_cast<std::uint64_t>(blob.size()))
+      << "隧道账上必须记满整段载荷（不重、不漏）";
+  // 上游→下游这一本的口径**含 101 响应头**（stats.h 上写死了），所以基数是
+  // "载荷 + 握手头"而不是载荷。握手头我用读回来的那份现算，不写常量：写死 141
+  // 的话，将来夹具换一行头就变成一条需要考古才能修红的用例。
+  EXPECT_EQ(stats.load(stats.bytes_tunnel_up),
+            static_cast<std::uint64_t>(blob.size() + head.size()));
+
+  client.close();
+  harness.upstream().set_stall_reads(false);
+  harness.shutdown_all();
+}
+
 }  // namespace
 }  // namespace l7gate::net
+

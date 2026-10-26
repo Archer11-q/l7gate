@@ -69,8 +69,30 @@ struct ReactorStats {
   std::atomic<std::uint64_t> header_scan_bytes{0};
   std::atomic<std::uint64_t> parse_calls{0};
 
-  // --- S1-07 的钩子：水位撞了几次（本任务只统计，不摘事件） -------------
+  // --- S1-02/S1-07：停读线（高水位）的观测面 -----------------------------
+  // 口径从 S1-02 起就没动过，也不许动：`limit_reached` 这个**事件**发生几次就计几次
+  // （一轮 `read_until_blocked` 最多一次，因为它撞线就 break）。S1-07 加的是"撞线之后
+  // 摘掉 EPOLLIN"这个动作，不是新的计数理由——所以这条现在仍然只回答"我停了几次自己"，
+  // 下面那两条才回答"我停没停对端"。改了这条口径，S1-02 那张反证表就作废了。
   std::atomic<std::uint64_t> high_water_hits{0};
+  // S1-07 的背压动作：EPOLLIN 的一次 1→0 / 0→1 跳变各计一次，且只在**真的成功交给
+  // epoll_ctl** 时计（去重靠 Connection::armed_events() 那份回执）。
+  // 口径写死三条，免得日后被读成别的意思：
+  //   pause  —— 只计"因入向可读区到达停读线"而摘掉 EPOLLIN 的那次跳变；
+  //             kClosing/kClosed 那种"收尾连接不再读"不是背压，不进这里。
+  //   resume —— 只计把 EPOLLIN 挂回去的跳变，每一次都配一次主动探测读（边沿触发下
+  //             挂回之后内核不会再报已经躺在接收缓冲里的那些字节，少一次探测就是
+  //             永久睡死）。所以 resume 与探测读的次数**逐条相等**，这是可断言的。
+  // 两者都是"停读线的滞回跳变"，不是水位线本身：滞回带取 [0, hwm/2] 恢复、
+  // [hwm, ∞) 暂停，中间的区间保持原状（理由见 ARCHITECTURE 1.15）。
+  std::atomic<std::uint64_t> backpressure_pause_count{0};
+  std::atomic<std::uint64_t> backpressure_resume_count{0};
+  // 两个方向各自累计**从 fd 读进缓冲**的字节数。它们存在的唯一理由是"平台期"这件事
+  // 需要一个可断言的量：停读生效时这条连接不再有新字节进入网关，于是它停止增长；
+  // 恢复后没有新的客户端写也能继续增长（那正是探测读在起作用）。
+  // 注意它们是累计值不是速率，也不参与任何策略判定（同上那条禁令）。
+  std::atomic<std::uint64_t> bytes_read_downstream{0};
+  std::atomic<std::uint64_t> bytes_read_upstream{0};
 
   // --- S1-05：Upgrade 透传与 Connection: close 的观测面 ------------------
   // 101 透传路径的进入次数。"每条隧道恰好一次"就是它的全部语义：帧的收发

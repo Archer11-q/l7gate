@@ -101,14 +101,55 @@ class Reactor {
 
   std::size_t live_connection_count() const noexcept { return connections_.size(); }
 
+  // --- S1-07 的「epoll 侧可断言」------------------------------------------
+  // 验收句要的是"能观测到网关不再消费下游可读事件"，那话的主语是**注册表里的兴趣
+  // 掩码**，不是任何计数器。这两个 getter 给的就是那份掩码的回执（来自
+  // Connection::armed_events()，只在 epoll_ctl 成功时写），所以它们和
+  // epoll_registrations() 同一类：非原子、只在循环线程停下之后读。
+  // 不在注册表里的 fd 返回 0。
+  std::uint32_t armed_events(int fd) const noexcept;
+  // 当前"kOpen 且 EPOLLIN 已被摘掉"的连接数。背压触发时它 > 0，恢复之后回 0。
+  std::size_t connections_with_read_disarmed() const noexcept;
+
  private:
   void handle_events(const std::vector<Epoll::Event>& events);
   void accept_all();
   void wake_up();
 
   // 注册一个连接对象的 fd。events 由调用方给（EPOLLIN / EPOLLOUT 的组合）。
+  // 成功时把这份掩码记在连接上（`Connection::set_armed_events`）——它是 S1-07
+  // 去重与跳变计数的唯一依据，所以**只在 epoll_ctl 成功的那条分支里写**。
   bool register_connection(Connection& conn, std::uint32_t events) noexcept;
   bool modify_events(Connection& conn, std::uint32_t events) noexcept;
+
+  // --- 背压（S1-07）：谁现在该被读，以及"没人来读"时谁来补一次读 ----------
+  // 这里刻意分成两条互不相干的轨道，合在一条上迟早会漏掉另一种形状：
+  //   **内存轨道 = 电平**：要不要摘 EPOLLIN 只看这条连接自己的入向可读区相对停读线
+  //     的位置（带滞回）。对端出向有多满**不是**判据，理由见 ARCHITECTURE 1.15——
+  //     每个方向的可读区都有硬上限，"内存不继续增长"已经由停读线本身担保。
+  //   **ET 轨道 = 事件**：这一轮的读有没有停在停读线上（`Connection::take_read_stopped_at_line`）。
+  //     停在**线上**就是没读到 EAGAIN，内核里可能还有字节；这时候只要掩码里仍挂着
+  //     EPOLLIN（泵把缓冲腾空了 → 水位回落 → 没摘），就必须自己补一次读，因为边沿触发
+  //     只为新跳变负责，而"对端写完就等回音"恰恰不会再有跳变。这条轨道不摘任何订阅，
+  //     只多花一次 read syscall——它是 S1-02 那条 ET 契约在水位存在之后的收尾。
+  bool wants_epollin(const Connection& conn) const noexcept;
+  // 唯一的事件掩码策略函数：读兴趣（wants_epollin）+ 写兴趣（有货待发或正在 connect）。
+  // 它是"应该订阅什么"，armed_events 是"实际订阅着什么"，两者的差就是该不该打 epoll_ctl。
+  std::uint32_t desired_events(const Connection& conn) const noexcept;
+  // 把 desired 交给 epoll：相等就不打 syscall（这是每请求 `epoll_ctl` 次数的支出闸门）。
+  // EPOLLIN 0→1 时计 resume 并补一次读；1→0 且原因是停读线时计 pause。
+  // 两条分支之外还管 ET 轨道：掩码不变或只动 EPOLLOUT 时，欠着的那一次读同样在这里入队。
+  void apply_events(const std::shared_ptr<Connection>& conn);
+  // 欠读的连接进队列并立刻排空。恢复（挂回 EPOLLIN）和停在停读线上（掩码没变）
+  // 都走这一个入口，就是为了"补读"这件事只有一个触发点。
+  void schedule_probe(const std::shared_ptr<Connection>& conn);
+  // 恢复之后必须**主动读一次**：边沿触发只在电平跳变时报事件，挂回 EPOLLIN 的那一刻
+  // 客户端的字节可能早就躺在内核接收缓冲里了，从此不再有跳变，这条连接就永久睡死。
+  // 探测用嵌套保护排成队列（probing_），不在事件处理里递归下栈。
+  void drain_probes();
+  void probe_read(const std::shared_ptr<Connection>& conn);
+  // 出向腾出空间之后重试被压住的那条搬运（刷空/刷出一部分都要试，见 flush_outbound）。
+  void retry_peer_after_room(const std::shared_ptr<Connection>& conn);
 
   void on_downstream_readable(const std::shared_ptr<Connection>& conn, std::uint32_t events);
   void on_upstream_event(const std::shared_ptr<Connection>& conn, std::uint32_t events);
@@ -129,6 +170,10 @@ class Reactor {
   // 它取代了 S1-04/05 的 pump_upstream_to_downstream（整块透传，无框架判定）。
   // 隧道路径不经过这里（ADR-09）。
   void pump_response(const std::shared_ptr<Connection>& upstream);
+  // 泵本体。和"重算这条连接的读兴趣"分开写：S1-07 之后每个消费上游入向字节的出口
+  // 都要过一次 apply_events，而本体里有七八个 return 点——在每个点上补一句
+  // 就是第七份"迟早漏一处"的抄本，所以收在外壳里做一次。
+  void pump_response_body(const std::shared_ptr<Connection>& upstream);
 
   // reject → 4xx（S1-06）：把 gateway_error_reply(status) 排进下游出向，然后
   // **不对称**关闭配对——上游 kDiscardOutbound（它接到的可能是半条请求，没有
@@ -144,6 +189,11 @@ class Reactor {
   // 隧道里的字节永远不该被任何 HTTP 语义过一遍（ADR-09）。
   void pump_tunnel(const std::shared_ptr<Connection>& src,
                    const std::shared_ptr<Connection>& dst);
+  // 本体 + 外壳的同一形状（见 pump_response_body 那条注释）：外壳负责在搬完之后
+  // 重算 src 的读兴趣——搬成功要算（可能回落了），搬不动也要算（这一轮的读
+  // 可能刚好把可读区顶到停读线）。
+  void pump_tunnel_body(const std::shared_ptr<Connection>& src,
+                        const std::shared_ptr<Connection>& dst);
 
   // 上游可读之后调用：若下游配对连接带着 upgrade 意图、且入向开头是一个完整的
   // 101 响应头，则把这**恰好 len 字节**的响应头原样排进下游（它是握手的一部分，
@@ -159,6 +209,9 @@ class Reactor {
     kFailed,    // 这一轮里判定要关闭（解析错误或 EOF 前的残包），连接已被本函数关掉
   };
   ForwardOutcome forward_pending_requests(const std::shared_ptr<Connection>& downstream);
+  // 本体（真正找请求、排字节、消费的那圈循环）。和"重算这条连接的读兴趣"分开写，
+  // 理由同 pump_response_body：本体有七个 return 点，逐个补一句等于第七份抄本。
+  ForwardOutcome forward_pending_requests_body(const std::shared_ptr<Connection>& downstream);
 
   // 确保这条下游连接已经有配对的上游；没有就发起异步 connect 并配对。
   // 返回 nullptr 表示暂时还没有（正在 connect）或已达 fd 预算上限。
@@ -193,6 +246,14 @@ class Reactor {
 
   std::unordered_map<int, std::shared_ptr<Connection>> connections_;
   std::vector<std::shared_ptr<Connection>> retiring_;
+
+  // 待探测读的连接（S1-07 的恢复路径）。持 shared_ptr 和 retiring_ 同一个理由：
+  // 排队期间这条连接可能正好被关掉，出队时必须靠注册表反查认人，不能信手里的裸指针。
+  // probing_ 是嵌套保护：探测读本身会搬运、搬运会消费字节、消费会再次触发恢复判定，
+  // 每次都直接递归下去的话栈深就由"缓冲腾出多少空间"决定——那是个我控制不了的量。
+  // 排空循环把它压成一条队列，栈深恒为 1。
+  std::vector<std::shared_ptr<Connection>> pending_probes_;
+  bool probing_ = false;
 
   // 出向缓冲刷完之前，这条 fd 一直带着 EPOLLOUT。放在 map 外面单独记没有意义，
   // 状态就在连接对象自己身上（state + outbound 是否为空），这里不重复。

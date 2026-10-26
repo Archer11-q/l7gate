@@ -33,8 +33,15 @@ Tag g_wake_tag;
 void* listener_tag() noexcept { return &g_listener_tag; }
 void* wake_tag() noexcept { return &g_wake_tag; }
 
-constexpr std::uint32_t kReadEvents = EPOLLIN;
-constexpr std::uint32_t kReadWriteEvents = EPOLLIN | EPOLLOUT;
+// S1-04 时这里是两个常量（`kReadEvents` / `kReadWriteEvents`），六个使用点只在
+// "读"与"读+写"之间切换，所以"既不读也不写"那个注册集在整个仓库里不存在。
+// S1-07 把它变成必须的：撞停读线就是要摘掉 EPOLLIN。连接侧的掩码从此由
+// `Reactor::desired_events()` 一处算出来（读兴趣 + 写兴趣），不再由调用方挑常量——
+// 挑常量的版本等于让"哪里该停读"在六个使用点里各决定一次。
+// 常驻的那两个 fd（监听、自唤醒）不在这条策略里：它们永远只读，写死 EPOLLIN。
+// 顺带一笔：EPOLLIN 与 EPOLLOUT 都摘掉（events=0）是 epoll 允许的注册状态，
+// 而 EPOLLERR/EPOLLHUP 无论如何都会上报，所以"完全没兴趣"不等于"这条连接聋了"。
+constexpr std::uint32_t kPersistentReadEvents = EPOLLIN;
 
 // S1-05 的请求侧意图判定。口径逐条写死，避免"看起来支持、实际看心情"：
 //   upgrade    —— `Connection` 值里含逗号分隔的 `upgrade` 记号（不区分大小写、
@@ -131,13 +138,13 @@ bool Reactor::start_listen(int* error) noexcept {
   listen_port_ = port;
   listener_ = std::move(listener.fd);
 
-  if (!epoll_.add(listener_.get(), kReadEvents, listener_tag(), error)) {
+  if (!epoll_.add(listener_.get(), kPersistentReadEvents, listener_tag(), error)) {
     listener_.close_now();
     listen_port_ = -1;
     return false;
   }
 
-  if (!epoll_.add(wake_fd_.get(), kReadEvents, wake_tag(), error)) {
+  if (!epoll_.add(wake_fd_.get(), kPersistentReadEvents, wake_tag(), error)) {
     int ignore = 0;
     (void)epoll_.remove(listener_.get(), &ignore);
     listener_.close_now();
@@ -197,6 +204,25 @@ void Reactor::wake_up() {
     const ssize_t rc = ::read(wake_fd_.get(), &counter, sizeof(counter));
     if (rc <= 0) break;  // EAGAIN 或真错误都到此为止：本轮不需要更多
   }
+}
+
+std::uint32_t Reactor::armed_events(int fd) const noexcept {
+  auto it = connections_.find(fd);
+  if (it == connections_.end()) return 0;
+  return it->second->armed_events();
+}
+
+std::size_t Reactor::connections_with_read_disarmed() const noexcept {
+  // "网关不再消费下游可读事件"这句话在代码里的直接对应物就是这个数：
+  // 注册表里有多少条连接的 interest list 上已经没有 EPOLLIN。
+  // 它不是计数器（不需要循环在跑的时候也准），所以按非原子观测的规矩来：
+  // 只在循环线程停下之后读（stats.h 第 25 行那条纪律）。
+  std::size_t disarmed = 0;
+  for (const auto& [fd, conn] : connections_) {
+    if (conn->state() != Connection::State::kOpen) continue;  // 收尾中的连接本来就不该读
+    if ((conn->armed_events() & EPOLLIN) == 0) ++disarmed;
+  }
+  return disarmed;
 }
 
 void Reactor::handle_events(const std::vector<Epoll::Event>& events) {
@@ -277,7 +303,7 @@ void Reactor::accept_all() {
     stats_.downstream_accepted.fetch_add(1, std::memory_order_relaxed);
     int error = 0;
     (void)set_tcp_nodelay(conn->fd(), &error);
-    if (!register_connection(*conn, kReadEvents)) {
+    if (!register_connection(*conn, desired_events(*conn))) {
       close_connection(conn);
       return;
     }
@@ -287,12 +313,156 @@ void Reactor::accept_all() {
 
 bool Reactor::register_connection(Connection& conn, std::uint32_t events) noexcept {
   int error = 0;
-  return epoll_.add(conn.fd(), events, &conn, &error);
+  if (!epoll_.add(conn.fd(), events, &conn, &error)) return false;
+  // 只在成功分支写：这份回执的意义就是"内核里现在确实是这个掩码"，
+  // 失败也写就等于给后面的去重喂了一个假账本。
+  conn.set_armed_events(events);
+  return true;
 }
 
 bool Reactor::modify_events(Connection& conn, std::uint32_t events) noexcept {
   int error = 0;
-  return epoll_.modify(conn.fd(), events, &conn, &error);
+  if (!epoll_.modify(conn.fd(), events, &conn, &error)) return false;
+  conn.set_armed_events(events);
+  return true;
+}
+
+// --- 背压的判定与动作（S1-07）--------------------------------------------
+//
+// 判据只有一条，而且刻意只有一条：**这条连接自己的入向可读区相对停读线在哪**。
+// "对端的出向缓冲有多满"不是判据——不是没想到，是它会把同一件事记两次账：
+// 上下游任何一侧的水位都是硬上限（Buffer 的不变量），所以"内存不继续增长"这条
+// 在只按可读区判时就已经成立；把对端状态再叠进来只会让恢复条件多一个来源，
+// 而多一个来源就多一处"迟早对不上"的地方。口径与滞回的理由记在 ARCHITECTURE 1.15。
+//
+// 这条判据只管**摘不摘订阅**，不管**要不要再读一次**，后者是边沿触发的旧账：
+// 一轮读停在停读线上就是不等于停在 EAGAIN 上，内核里剩下的字节不会再有跳变来
+// 交代。所以 apply_events 除了算掩码，还负责把"欠着一次读"的连接排进探测队列。
+// 两条分开写才不会互相遮蔽：只看水位会睡死（响应方向第一次跑红的就是它），
+// 只看跳变会在水位线上多打 epoll_ctl。
+bool Reactor::wants_epollin(const Connection& conn) const noexcept {
+  // 收尾中的连接不再接新活（原来靠 on_downstream_readable 开头的状态判断兜住，
+  // 现在直接从订阅面上摘掉：不订阅就不会被叫醒，也就没有"醒了才发现不该干活"的分支）。
+  if (conn.state() == State::kClosing || conn.state() == State::kClosed) return false;
+
+  const std::size_t hwm = conn.inbound().high_water_mark();
+  const std::size_t readable = conn.inbound().readable_bytes();
+  const bool read_armed = (conn.armed_events() & EPOLLIN) != 0;
+  // 滞回：到线才停，回落到半线以下才恢复。写成同一个条件的版本（`readable < hwm`
+  // 就恢复）在水位线上反复横跳——每搬掉一条刚够 1 KiB 的请求就挂/摘一次 EPOLLIN，
+  // 两次 epoll_ctl。背压本该是省下 syscall 的那条路，不该自己变成一场风暴。
+  if (read_armed) return readable < hwm;
+  return readable <= hwm / 2;
+}
+
+std::uint32_t Reactor::desired_events(const Connection& conn) const noexcept {
+  std::uint32_t events = 0;
+  if (wants_epollin(conn)) events |= EPOLLIN;
+  // kConnecting 的上游必须带 EPOLLOUT：那是 connect 结果的唯一通知方式。
+  // 出向有货也带（包括 kClosing —— 那里恰恰是最容易漏挂的一处，S1-04 记过）。
+  if (conn.state() == State::kConnecting || conn.outbound_pending() > 0) events |= EPOLLOUT;
+  return events;
+}
+
+void Reactor::apply_events(const std::shared_ptr<Connection>& conn) {
+  if (conn->fd() == kInvalidFd) return;  // 第 4 步之后编号已经可以被复用，别再碰
+  if (conn->state() == State::kClosed) return;
+
+  const std::uint32_t want = desired_events(*conn);
+  const std::uint32_t have = conn->armed_events();
+  // 标记在这里一次性消费（take_）：它问的是"上一次重算之后这条连接有没有欠一次读"，
+  // 而这次重算就是它的答复。留着不用等于把一次欠账记成永久欠账。
+  const bool stopped_at_line = conn->take_read_stopped_at_line();
+
+  if (want == have) {
+    // 去重：这一个 return 就是每请求 epoll_ctl 的支出闸门。但"掩码不用改"不等于
+    // "这条连接不用再读"——停在停读线上的那一轮**没有读到 EAGAIN**，内核接收缓冲
+    // 里可能还压着字节，而边沿触发只为新跳变负责。对端如果已经把所有字节交出去
+    // （写完就等回音），那就再没有跳变了：字节躺在内核里，连接挂在 EPOLLIN 上，
+    // 谁都不动。响应方向第一次跑就是停在这个形状上（读到 96 KiB 之后彻底安静）。
+    if (stopped_at_line && (want & EPOLLIN) != 0) schedule_probe(conn);
+    return;
+  }
+
+  const bool had_read = (have & EPOLLIN) != 0;
+  const bool wants_read = (want & EPOLLIN) != 0;
+  // 计 pause 的条件比"EPOLLIN 从有到无"窄：kClosing 那条跳变也是摘掉 EPOLLIN，
+  // 但那是收尾不是背压。混进来的话这个数就不再等于"停读线触发了几次"，
+  // 而验收要的正是后者。
+  const bool by_water_line =
+      conn->state() == State::kOpen &&
+      conn->inbound().readable_bytes() >= conn->inbound().high_water_mark();
+
+  if (!modify_events(*conn, want)) return;  // epoll_ctl 失败：回执不变，下轮重算再试
+
+  if (had_read && !wants_read) {
+    if (by_water_line) {
+      stats_.backpressure_pause_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
+  }
+  if (!had_read && wants_read) {
+    stats_.backpressure_resume_count.fetch_add(1, std::memory_order_relaxed);
+    // 挂回 EPOLLIN 只是把"以后的跳变"要回来了；已经躺在内核接收缓冲里的那批字节
+    // 不会再产生跳变。所以恢复的语义必须包含一次主动读，否则这条连接永久睡死。
+    schedule_probe(conn);
+    return;
+  }
+  // 只动 EPOLLOUT 的跳变（读的一侧从头挂到尾）：这一轮若停在过线上，同样欠一次读。
+  if (stopped_at_line && wants_read) schedule_probe(conn);
+}
+
+void Reactor::schedule_probe(const std::shared_ptr<Connection>& conn) {
+  pending_probes_.push_back(conn);
+  drain_probes();
+}
+
+void Reactor::probe_read(const std::shared_ptr<Connection>& conn) {
+  // 复用事件处理的那两条路径，而不是另写一条"探测版"：读干净 + 路由字节 +
+  // 撞线再摘，语义和真事件一模一样。revents 给 0 / 只给 EPOLLIN，意思就是
+  // "这次没有任何电平信号，是我主动去看的"——EOF 因此只能由 read() 返回 0 得出。
+  if (conn->role() == Role::kDownstream) {
+    on_downstream_readable(conn, 0);
+  } else {
+    on_upstream_event(conn, EPOLLIN);
+  }
+}
+
+void Reactor::drain_probes() {
+  if (probing_) return;  // 已经在排空：嵌套的恢复只入队，由下面这个循环接手
+  probing_ = true;
+  while (!pending_probes_.empty()) {
+    const std::shared_ptr<Connection> conn = pending_probes_.back();
+    pending_probes_.pop_back();
+    // 认人方式和批内反查同一条：fd 可能已经关掉了（探测队列里躺着的就是上一条
+    // 事件里被级联关闭的连接），也可能编号已经被新连接复用。
+    auto it = connections_.find(conn->fd());
+    if (it == connections_.end() || it->second.get() != conn.get()) continue;
+    probe_read(conn);
+  }
+  probing_ = false;
+}
+
+void Reactor::retry_peer_after_room(const std::shared_ptr<Connection>& conn) {
+  auto it = connections_.find(conn->peer_fd());
+  if (it == connections_.end()) return;
+  const std::shared_ptr<Connection> peer = it->second;
+  if (conn->role() == Role::kDownstream) {
+    if (peer->tunneling()) {
+      pump_tunnel(peer, conn);  // 对端（上游）在隧道里：重试帧字节的搬运
+    } else {
+      pump_response(peer);
+    }
+  } else {
+    // 我刚腾出空间的那个 fd 是**上游**，所以压着不动的是对端（下游）那条还没转出去的
+    // 请求。走 forward_pending_requests 而不是只试一次：出向缓冲刚空出来，
+    // 排队的请求可能有好几条，只放一条过去就等于把同一个 bug 换成另一个触发条件。
+    if (peer->tunneling()) {
+      pump_tunnel(peer, conn);  // 下游在隧道里：重试帧字节往上游的搬运
+    } else {
+      (void)forward_pending_requests(peer);
+    }
+  }
 }
 
 std::shared_ptr<Connection> Reactor::ensure_upstream(
@@ -329,7 +499,10 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
 
   // 未完成握手时必须带 EPOLLOUT：可写事件是 connect 结果的唯一通知方式。
   // 但可写不等于连上了，所以处理它之前先问 SO_ERROR（见 on_upstream_event）。
-  if (!register_connection(*upstream, kReadWriteEvents)) {
+  // 掩码交给 desired_events 算而不是写死那两个常量：kConnecting 由状态机保证带上
+  // EPOLLOUT；回环上 connect 立刻完成的那条分支此刻出向还是空的，于是只订阅读——
+  // 请求是下一步才排进来的，届时 arm_write 会补上 EPOLLOUT。
+  if (!register_connection(*upstream, desired_events(*upstream))) {
     downstream->set_peer_fd(kInvalidFd);
     close_connection(upstream);
     return nullptr;
@@ -357,7 +530,9 @@ void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
     const bool eof = read.peer_closed || (revents & EPOLLHUP) != 0;
     auto it = connections_.find(conn->peer_fd());
     if (it != connections_.end()) {
-      pump_tunnel(conn, it->second);
+      pump_tunnel(conn, it->second);  // 搬成功时在末尾重算 src 的兴趣（S1-07）
+    } else {
+      apply_events(conn);  // 没配对可搬：这一轮的读仍然可能把可读区顶到停读线
     }
     if (eof) close_connection(conn);
     return;
@@ -398,7 +573,18 @@ void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
   }
 }
 
+// 外壳只干一件事：这一轮无论走到哪个出口，下游入向的**可读区高度**都可能已经变了
+// （转走了一条请求，或者一条都没转走），而 S1-07 的停读/恢复只看这个量。
+// 写成外壳而不是在每个 return 前补一句，理由和 pump_response 那条一样：
+// 本体有七个出口，"每个出口都记得补"是我迟早会漏的那种纪律，不是已经有的纪律。
 Reactor::ForwardOutcome Reactor::forward_pending_requests(
+    const std::shared_ptr<Connection>& downstream) {
+  const ForwardOutcome outcome = forward_pending_requests_body(downstream);
+  apply_events(downstream);
+  return outcome;
+}
+
+Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
     const std::shared_ptr<Connection>& downstream) {
   if (downstream->state() != State::kOpen) {
     // 正在收尾的连接不再往外转：新建的上游连接没人用，转出去的请求也没地方回响应。
@@ -515,7 +701,15 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
   return true;
 }
 
+// 外壳干的同一件事：泵每消费掉一段上游入向的字节，都可能让可读区回落到恢复线以下。
+// S1-07 之前这里"下次可读事件再说"是成立的（反正一直订阅着 EPOLLIN），
+// 现在不成立——摘掉之后没有事件会来，恢复只能在这里判。
 void Reactor::pump_response(const std::shared_ptr<Connection>& upstream) {
+  pump_response_body(upstream);
+  apply_events(upstream);
+}
+
+void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
   if (upstream->tunneling()) {
     // 隧道路径在调用方（on_upstream_event / flush_outbound 的对称重试）已经分走，
     // 这里只保留一道断言式的守卫：状态串了宁可原地停住，也不把帧当响应搬（ADR-09）。
@@ -729,6 +923,15 @@ void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream
 
 void Reactor::pump_tunnel(const std::shared_ptr<Connection>& src,
                           const std::shared_ptr<Connection>& dst) {
+  pump_tunnel_body(src, dst);
+  // 第三条同一形状的壳：搬成功要重算（可读区回落，可能要恢复），搬不动也要重算
+  // （这一轮的读可能刚好把可读区顶到停读线，漏掉就是"该摘没摘"）。
+  // 写在本体的每个 return 前面是五个抄本，写在壳里是一次。
+  apply_events(src);
+}
+
+void Reactor::pump_tunnel_body(const std::shared_ptr<Connection>& src,
+                               const std::shared_ptr<Connection>& dst) {
   auto it = connections_.find(src->peer_fd());
   if (it == connections_.end()) return;  // 对端已关（或编号已被复用）：无去处
   const std::size_t available = src->inbound().readable_bytes();
@@ -791,9 +994,9 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
       return;
     }
     conn->set_state(State::kOpen);
-    if (conn->outbound_pending() == 0) {
-      modify_events(*conn, kReadEvents);  // 没东西要写就别再挂 EPOLLOUT
-    }
+    // 原来这里写的是"没货待发就 modify 成 kReadEvents"。换成 apply_events 之后
+    // 同一件事多担保了一层：出向还有货就继续挂 EPOLLOUT，一条都不漏。
+    apply_events(conn);
   }
 
   if (conn->state() == State::kClosing) {
@@ -814,8 +1017,10 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
       }
       const bool eof = read.peer_closed || (revents & EPOLLHUP) != 0;
       auto it = connections_.find(conn->peer_fd());
-      if (it != connections_.end()) {
-        pump_tunnel(conn, it->second);
+      if (it == connections_.end()) {
+        apply_events(conn);  // 没配对可搬：这一轮的读仍然可能顶到停读线
+      } else {
+        pump_tunnel(conn, it->second);  // 末尾会重算 src 的兴趣
       }
       if (eof) close_connection(conn);
       return;
@@ -828,6 +1033,9 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
     if (maybe_enter_tunnel(conn)) {
       // 握手完成：101 已排进下游出向缓冲，帧字节留在上游缓冲里，
       // 由后续可读事件/可写重试按隧道路径搬运。本条事件到此为止。
+      // 但"到此为止"不能带着一次没算过的兴趣判定：上面那次 read_raw 之前，
+      // 头 + 帧字节可能已经把可读区顶到了停读线。
+      apply_events(conn);
       return;
     }
     pump_response(conn);
@@ -883,7 +1091,17 @@ void Reactor::flush_outbound(const std::shared_ptr<Connection>& conn) {
     return;
   }
 
-  if (!round.drained) return;  // 满了没刷完：EPOLLOUT 挂着，下一轮继续
+  if (!round.drained) {
+    // 出向没刷空。原来这里直接 return——那是 S1-07 之前唯一的一处"背压已经解开、
+    // 但没人去搬"的死角：内核发送缓冲被腾出一大块时确实会再报一次可写，可腾出的
+    // 是**小块**时（对端慢读、窗口一点点打开）这一轮写掉了几 KB 却没写空，
+    // 于是被压住的那一侧一直等到下一次可写事件才被想起来，而它等的正是我摘掉的
+    // 那个事件。写了字节就立刻重试一次搬运；一个字节都没写出去才真的等下一轮。
+    if (round.write.bytes_written == 0) return;
+    apply_events(conn);
+    retry_peer_after_room(conn);
+    return;
+  }
 
   if (conn->state() == State::kClosing) {
     // 之前因为"货没发完"被挡下的关闭，现在货发完了，把它走完。
@@ -897,28 +1115,12 @@ void Reactor::flush_outbound(const std::shared_ptr<Connection>& conn) {
   // 刷空了就把 EPOLLOUT 摘掉。这一步不是优化：EPOLLOUT 在发送缓冲有空位时
   // 永远为真，挂着不摘就等于让事件循环对着一个"随时可写"的 fd 自旋，
   // SLO #2 的「空闲 CPU < 5%」第一条就是被它破坏的。
-  modify_events(*conn, kReadEvents);
+  // 原来是写死 `modify_events(*conn, kReadEvents)`；换成 apply_events 之后同一处
+  // 还多担了一件事：这条连接如果正撞在停读线上，摘 EPOLLOUT 时不会顺手把 EPOLLIN 加回来。
+  apply_events(conn);
 
   // 我这边腾出空间了，把对端压着发不出去的数据接过来继续走。
-  auto it = connections_.find(conn->peer_fd());
-  if (it == connections_.end()) return;
-  const std::shared_ptr<Connection> peer = it->second;
-  if (conn->role() == Role::kDownstream) {
-    if (peer->tunneling()) {
-      pump_tunnel(peer, conn);  // 对端（上游）在隧道里：重试帧字节的搬运
-    } else {
-      pump_response(peer);
-    }
-  } else {
-    // 我刚腾出空间的那个 fd 是**上游**，所以压着不动的是对端（下游）那条还没转出去的
-    // 请求。走 forward_pending_requests 而不是只试一次：出向缓冲刚空出来，
-    // 排队的请求可能有好几条，只放一条过去就等于把同一个 bug 换成另一个触发条件。
-    if (peer->tunneling()) {
-      pump_tunnel(peer, conn);  // 下游在隧道里：重试帧字节往上游的搬运
-    } else {
-      (void)forward_pending_requests(peer);
-    }
-  }
+  retry_peer_after_room(conn);
 }
 
 void Reactor::arm_write(const std::shared_ptr<Connection>& conn) noexcept {
@@ -928,7 +1130,11 @@ void Reactor::arm_write(const std::shared_ptr<Connection>& conn) noexcept {
   // 让这条连接既发不完也关不掉。这个判断只写一次，三个调用点共用。
   if (conn->state() == State::kClosed) return;
   if (conn->outbound_pending() == 0) return;
-  modify_events(*conn, kReadWriteEvents);
+  // 原来这里无条件 `modify_events(*conn, kReadWriteEvents)`，两个问题各属一个任务：
+  //   一、无条件 = 每个请求至少多打一发 epoll_ctl（B-001 里 5.0 次/请求那笔支出的一部分）；
+  //   二、总是带 EPOLLIN = 把刚因为撞停读线摘掉的读兴趣又打开，背压当场失效。
+  // apply_events 一次解决两条：掩码由 desired_events 现算，相等就不 syscall。
+  apply_events(conn);
 }
 
 void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy why) noexcept {
@@ -945,6 +1151,11 @@ void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy
 
   int error = 0;
   (void)epoll_.remove(fd, &error);  // 第 1 步
+  // 注销成功了就把回执清零。写在这里而不是等 ~Connection：这条 fd 编号从第 4 步
+  // 起就可能被新连接复用，旧对象手里那份"我还订阅着什么"的账本留着没有任何读者，
+  // 只有一个读者是错的（connections_with_read_disarmed() 遍历的是注册表，
+  // 已经出表的对象不在里面，所以清零只为"关掉之后读数不骗人"这一条）。
+  conn->set_armed_events(0);
 
   std::shared_ptr<Connection> peer_to_close;
   auto it = connections_.find(fd);

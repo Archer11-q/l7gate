@@ -38,10 +38,10 @@ curl 不会替我发这些字节，所以这一段的请求是 shell 手写的�
 
 | 检查 | 预期 | 实测 | 结论 |
 |---|---|---|---|
-| ASan + UBSan（`-O0 -g` 强制） | 100 条全过、零报告 | `asan-ubsan` **100/100**，build exit=0，非 gtest 警告 **0 条** | ✅ |
-| LSan（随 ASan） | 零泄漏 | 100/100 内无 leak 报告 | ✅，反证见下 |
-| TSan | 零 data race | `tsan` **100/100**，含 7 条 `S1_06_Reactor` 闭环与 5 条握手闭环用例 | ✅ |
-| debug（gcc） | 全过 | `debug` **100/100**，0 警告 | ✅ |
+| ASan + UBSan（`-O0 -g` 强制） | 104 条全过、零报告 | `asan-ubsan` **104/104**，build exit=0，非 gtest 警告 **0 条** | ✅ |
+| LSan（随 ASan） | 零泄漏 | 104/104 内无 leak 报告 | ✅，反证见下 |
+| TSan | 零 data race | `tsan` **104/104**，含 4 条 `S1_07_Backpressure` 闭环——这一组是**跨线程**的：测试线程原子切 `set_stall_reads(bool)` 与 `wait_until` 采样，循环线程改 `armed_events`/探测队列 | ✅ |
+| debug（gcc） | 全过 | `debug` **104/104**，0 警告 | ✅ |
 
 **反证（没有这一段，上面的"干净"就只是我的一句话）**：
 
@@ -60,13 +60,36 @@ curl 不会替我发这些字节，所以这一段的请求是 shell 手写的�
 | `release_scratch()` 的调用点 | 全仓**唯一**一处，且在 101 头排进下游出向缓冲之后 | ✅ 结构上不存在"请求结束就释放"的自动路径（接口没有那条路径，不是靠约定） |
 | TSan 下的握手闭环 | 零 data race | ✅ tsan preset 内 5 条握手用例全过 |
 
-## 5. 还没注入的故障（记在这里，别当成"已验证"）
+## 5. S1-07 的背压与慢读面（实测于 ctest `S1_07_Backpressure` 四条 + `scripts/smoke-s1-07.sh` 四阶段）
+
+| # | 注入 | 预期 | 实测 | 结论 |
+|---|---|---|---|---|
+| B-1 | 上游 accept 后**一个字节都不读**（照旧持有连接），下游连打 384 条完整 POST | 网关摘掉这条下游 fd 的 EPOLLIN；入向读取累计进入平台期；上游开始消费之后**不需要客户端再写新请求**就自动恢复，384 条响应逐条对号 | `RequestDirectionStopsReadingAndRecoversWithoutLoss`：pause/resume 各 ≥1，平台期 **2,922,610 B**（debug）/ **2,930,867 B**（asan），载荷 3,170,580 B，384 条响应的 body 序号逐条核对通过 | ✅ 「水位回落自动恢复」在请求方向成立，且恢复靠的是探测读而不是下一次事件 |
+| B-2 | 1 MiB 响应 + 客户端**一个字节都不读** | 响应方向也要停读，而且不丢 | `ResponseDirectionSurvivesASlowClientByteForByte`：pause/resume ≥1、撞线 4..22 视时序而定，客户端逐字节取回 **1,048,644 B** | ✅ 方向对称：压强来自客户端时同一条链生效 |
+| B-3 | 隧道里压 2,742,440 B 非 HTTP 形态字节（0x00/0x0D/0x0A 混在其中）+ 上游停读 | 摘读、平台期、恢复后**一个字节不少**，且帧字节一次都不进解析器 | `TunnelDirectionPausesAtTheWaterLineAndDeliversEveryByte`：平台期 **1,898,661 B**(debug) / **1,897,637 B**(asan)，`bytes_tunnel_down == 载荷`、`bytes_tunnel_up == 载荷 + 101 头`、`requests_parsed` 全程 = 1 | ✅ 关闭 1.13 留的隧道缺口；同时是 ADR-09 的一次复查 |
+| B-4 | 真进程：`/dev/tcp` 在一条 keep-alive 上连打 **400 条** POST（3,300,800 B）打在 `--stall-reads-ms 8000` 的上游上 | stall 期间网关停读、写侧卡在 `write()`；stall 结束后 400 条响应全部到达 | 冒烟阶段二：`pause=1..5 resume=1..5 撞线=47..192`、`requests_parsed=400`、`responses_completed=400`、`bytes_read_downstream == bytes_down_to_upstream == 3,300,800`、`upstream_opened=1`、状态行 400/400 | ✅ 关闭原第 6 节第一条（慢读之后的恢复） |
+| B-5 | `--high-water-mark 4096` + 一条 100 KiB 的 POST（**停读线低于一条请求**） | 这条请求既不该被丢，也不该被报错：它停在停读线上 | 冒烟阶段三：curl 退出码 28（超时）且**零字节**，网关 `requests_parsed=0`、`upstream_opened=0`、`gateway_replies_sent=0`、`pause=1`、`resume=0`、`bytes_read_downstream=4096`、**`read_disarmed_connections=1`** | ✅ 这是 1.15 那条边界的实测形态。`read_disarmed_connections=1` 是「网关不再消费下游可读事件」在全仓唯一被**直接读出来**的证据 |
+| B-6 | 上游 accept 后回**半条响应头**就关（`/dies-mid-head`，17 字节、无 CRLFCRLF） | 头之前断 → 自产 502；半条头不外漏；且必须有直连对照 | 冒烟阶段四：直连确实拿到没说完的头（17 B 中没有 CRLFCRLF）；经网关 `HTTP/1.1 502` + `Content-Length: 12` 实到 12 B + `Connection: close`，文件里没有任何 200 的痕迹；`upstream_truncated_before_head=1`、`in_body=0`、`gateway_replies_sent=1`、`responses_completed=0` | ✅ 关闭原第 6 节第二条。与 F-2 的**不对称方向相反**是设计：那里直连与经网关必须一致（头已发出），这里必须不一致（半条头没有"已经发出的响应"可供改写） |
+
+四条 B-* 的每阶段都独立重启上下游，并各自跑生命周期四重检查（`live_connections==0`、`constructed==destructed`、`fd_start==fd_end`、**`read_disarmed_connections==0`**）。最后一条是 S1-07 新加的：背压改动的是订阅掩码，最容易留下的就是"连接带着摘掉的 EPOLLIN 被关掉"。B-5 是唯一一处**期望它不为 0** 的阶段（注入的就是一条永不完结的连接，见 1.15），那里断的是另外三件事：退出码 0、`fd_end=8`、RSS 不随请求字节涨。
+
+**本任务最有信息量的一次阴性结果：被删掉的"钉住上游接收窗口"实验。** 测试上游的 stall 原本带第二个动作——stall 期间把每条连接显式设 `SO_RCVBUF=4096`（内核翻倍记账 → 通告窗口 8 KiB），目的是让应用的停读线成为第一道墙。三组证据说明它既没换来更早的撞线、又毁掉了用例要证的东西：
+
+1. 钉与不钉，平台期落在同一个位置：隧道方向 1,802,405 B（钉）vs 1,898,661 / 1,897,637 B（不钉）。第一道墙是**网关自己的 `SO_SNDBUF`**（这台机器上自动调到 ≈1.9 MiB），不是上游的接收窗口。
+2. `release_receive_window()`（放开时设 `SO_RCVBUF=4 MiB`）**没有实现它注释里承诺的事**：`ss -tin` 取证显示夹具侧 `rcv_wnd:8192` 在放开之后 40 s 内一次没回涨（Linux 的 `window_clamp` 不因重设大值而放开），网关侧 `rwnd_limited` 从 4,852 ms 涨到 39,904 ms 且恒为 100.0%，`notsent` 每 5 s 恰好减 196,608 B = 24 × 8192，即一档一个 RTO（`rto:204`）。恢复吞吐被 TCP 的零窗口探测计时器钉死，用例红的是内核计时器而不是网关的恢复链路。
+3. 于是隧道那条在 asan-ubsan 下跑到 **48,058 ms**，超过 ctest 的 `TIMEOUT 30`。**按纪律改的是测试，不是超时**：整段钉窗机器（`clamp_receive_window`/`release_receive_window`/`window_clamped`/`stall_clamps_window_`）删除，两组装在同一个位置的数字写在 `tests/test_upstream.h` 的删除记录里。
+
+同一个理由还产出了一次**用例自我修正**：256 条 POST（2,113,684 B）在 asan 下平台期恰好等于整个载荷——那是写侧把货倒进了内核路径，不是网关摘读，断言会为一个不成立的理由通过。加载荷抬到 384 条（3,170,580 B）之后两个 preset 都停在 2.93 MB 附近，平台期才只能由"网关不再 read"产生。
+
+**新发现、本任务不修的边界（照记）**：一批 pipelined 请求里带 `Connection: close` 的那条，会在**第一条响应完结时**就被兑现——意图的字面意思就是"下一条响应之后收尾"，而"下一条"在 400 条同时在飞的批次里就是第一批里的那一条。实测形态：冒烟阶段二第一版只拿到 1 条响应 + EOF，而 `bytes_down_to_upstream == bytes_read_downstream == 3,300,800`、`requests_parsed=400` 全部对得上，所以这不是丢字节，是"一条连接上同时在飞多条请求"这件事没有语义支撑。S1 声明的是 keep-alive **复用**（一条连接顺序处理请求），不是 pipeline；改法是数够条数后由测试自己关连接，那条边界留在下面第 6 节。
+
+## 6. 还没注入的故障（记在这里，别当成"已验证"）
 
 | 缺口 | 为什么现在没有 | 归属 |
 |---|---|---|
-| 上游比下游慢（慢读）撞高水位后的**恢复** | 背压动作（摘 EPOLLIN）本身就是 S1-07 的交付物；现在能证"撞水位不涨"，不能证"水位回落恢复读" | S1-07 |
-| 上游 accept 后**半条响应头**就关（头切在中间） | 与 F-1/F-4 同一条 before_head 路径，但**分片到达**的时序只在 ctest 里有（reactor 用例），没有走真 curl | S1-07 冒烟顺带补 |
-| `SIGTERM` 时在飞连接的**排水** | 现在的停止语义不排水（见第 3 节反证最后一条）。真正的优雅停机（停止接受 → 等在飞走完 → 超时兜底）不在 S1 范围 | S2 之后，与连接池同期 |
+| `SIGTERM` 时在飞连接的**排水** | 现在的停止语义不排水（见第 3 节反证最后一条，以及 S1-07 冒烟阶段三那条**故意留着不排**的连接）。真正的优雅停机（停止接受 → 等在飞走完 → 超时兜底）不在 S1 范围 | S2 之后，与连接池同期 |
 | 上游进程被 `kill -9`（连 backlog 里的半连接一起消失） | 冒烟脚本目前用 `kill -TERM` 收尾上游；SIGKILL 下的 accept 失败路径只有 ctest 覆盖 | S3（健康检查/摘除的注入面） |
+| 一批 pipelined 请求里的 `Connection: close` 应在**最后一条**响应之后兑现 | S1 不声明 pipeline 语义（见第 5 节最后一段）。要做的是"未完结请求计数 + 每条响应的配对归属"，那属于请求-响应配对模型本身 | 决定支持 pipeline 的任务（S1 范围外，需要 ADR） |
+| 跨机链路上停读线的实际尺寸 | 本任务的所有数字都是同机回环的：回环上内核路径吸收 ≈1.9 MiB，应用的线基本没活干；真实链路（带宽延迟积大）才是 256 KiB 默认量的主场 | S4 的 wrk 跨机组 |
 | 配置 reload 时上游连接抖动 | 配置热重载在 S5 | S5 |
-| 100k 空闲长连接下的 fd/内存 | `ulimit -n` 现在 10240，先决条件没到位 | S2/S3 + 先解决 rlimit |
+| 100k 空闲长连接下的 fd/内存 | `ulimit -n` 现在 10240，先决条件没到位；S1-07 新加的那 8 B/连接与本轮 5.81 KiB/连接读数同样没有 100k 规模的验证 | S2/S3 + 先解决 rlimit |

@@ -78,6 +78,37 @@ class Connection {
   int peer_fd() const noexcept { return peer_fd_; }
   void set_peer_fd(int fd) noexcept { peer_fd_ = fd; }
 
+  // --- epoll 兴趣掩码的镜像（S1-07）---------------------------------------
+  // 这里存的是**上一次成功交给 epoll_ctl 的那个 events 值**，不是"我认为应该是什么"。
+  // 唯一写它的人是 Reactor 的 register_connection / modify_events（都只在成功分支里写），
+  // 所以它和 Epoll 的注册计数器同源：策略仍然只有 reactor 一份，这个字段只是它的回执。
+  //
+  // 为什么必须留着这份回执：S1-07 的停读/恢复都是**跳变**事件（EPOLLIN 1→0、0→1），
+  // 没有"上一次交出去的是什么"就判断不了这是跳变还是重复提交，也就没法去重。
+  // 不去重的版本每次搬运都会多打一发 epoll_ctl——而每请求 5.0 次 `epoll_ctl` 正是
+  // BENCHMARK B-001 给 p99 归过因的那笔支出。
+  //
+  // 值本身是 epoll 的位（EPOLLIN/EPOLLOUT）。类型用 uint32_t 而不是把 <sys/epoll.h>
+  // 拉进连接层：Connection 不碰 epoll，它只是记住别人交给它的那个数字（ADR-02 的分工）。
+  // 只能在循环线程停下之后读（和 live_connection_count() 同一类观测）。
+  std::uint32_t armed_events() const noexcept { return armed_events_; }
+  void set_armed_events(std::uint32_t events) noexcept { armed_events_ = events; }
+
+  // --- S1-07 的另一半：这一轮的读停在哪儿 --------------------------------
+  // `Buffer::ReadResult::limit_reached` 说的是"这一轮**没有**读到 EAGAIN"。边沿触发
+  // 只承诺为新跳变叫醒一次，不承诺"只要内核里还压着货就再叫醒一次"，所以停在停读线
+  // 上的那一轮必须有人接手剩下的字节，而接手的方式只有两种：摘掉 EPOLLIN（水位真在
+  // 线上时，恢复路径自带探测读），或者自己再读一次（泵把缓冲腾空了 → 水位回落 →
+  // EPOLLIN 照旧挂着 → 没有任何跳变会再来）。
+  // 这个标记就是把第二种情形留给 reactor 的口头交代：每次重算掩码时消费一次。
+  // 名字里带 take_ 是因为它会清掉自己——读两次得到的是两个不同的答案，第二个恒为 false，
+  // 而"把一次没读到 EAGAIN 的记忆用掉两次"正是一条永远探测不完的连接该长成的样子。
+  bool take_read_stopped_at_line() noexcept {
+    const bool value = read_stopped_at_line_;
+    read_stopped_at_line_ = false;
+    return value;
+  }
+
   // 关掉 fd，但**不**析构对象。reactor 的延后析构需要这两步分开：
   // 顺序是 `Reactor::close_connection` 那六步里的第 1–4 步（摘 epoll → 解除对端
   // 引用 → 出注册表 → 本函数 close fd），第 5 步（析构）排在事件批处理结束时。
@@ -239,6 +270,13 @@ class Connection {
   // 而 S1-03 刚因"配置写了、代码没读"翻过一次车。合法性只由 parse_request 说。
   bool advance_header_scan() noexcept;
 
+  // 一轮读的观测记账：撞停读线计 `high_water_hits`，按角色累计读入字节。
+  // `high_water_hits` 的口径自 S1-02 起就是"limit_reached 这个**事件**发生了几次"，
+  // S1-07 加上摘事件的动作之后也没有改它一次（改口径等于作废 S1-02 那张反证表）。
+  // 抽成一个函数是因为它原本在 on_readable 和 read_raw 里各抄了一遍——
+  // 同一个口径有两个抄本，就是迟早漂移的地方。
+  void note_read(const Buffer::ReadResult& read) noexcept;
+
   UniqueFd fd_;
   Role role_;
   State state_ = State::kOpen;
@@ -264,6 +302,11 @@ class Connection {
   bool close_after_forward_ = false;
   bool close_after_response_ = false;
   bool tunneling_ = false;
+  // 上一次成功交给 epoll_ctl 的事件掩码（S1-07）。只有 Reactor 写它，见上面 getter 的注释。
+  std::uint32_t armed_events_ = 0;
+  // 上一次读是否停在停读线上（S1-07）。和 armed_events_ 同一类：只有循环线程碰它，
+  // 放在这片 bool 里是因为它们后面还有对齐空位——多一个布尔值不该多付 8 字节。
+  bool read_stopped_at_line_ = false;
   // 响应跟踪（S1-06）：纯数据，判定与推进全在 reactor 的上游路径（见上面注释）。
   ResponseTracking resp_;
   // 已解析出一个完整请求、但调用方还没 finish_request。挡住重复解析，

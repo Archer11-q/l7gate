@@ -36,6 +36,24 @@ Connection::~Connection() {
 
 void Connection::close_fd() noexcept { fd_.close_now(); }
 
+void Connection::note_read(const Buffer::ReadResult& read) noexcept {
+  if (read.limit_reached) {
+    stats_->high_water_hits.fetch_add(1, std::memory_order_relaxed);
+  }
+  // 停在停读线上（而不是停在 EAGAIN 上）这件事要留给 reactor 的下一次掩码重算——
+  // 只有它知道这条连接最后是不是还挂着 EPOLLIN。理由见 take_read_stopped_at_line()。
+  read_stopped_at_line_ = read.limit_reached;
+  // 读入字节按角色分开记：S1-07 的"停读期间字节不再增长"这条断言要的是
+  // **某一个方向**的累计读入量在水位触发后进入平台期，合在一个数里就分不出来。
+  // 这两个数不是策略输入——任何逻辑都不许读它们来决定下一步（stats.h 那条禁令）。
+  if (read.bytes_read > 0) {
+    std::atomic<std::uint64_t>& counter = (role_ == Role::kDownstream)
+                                              ? stats_->bytes_read_downstream
+                                              : stats_->bytes_read_upstream;
+    counter.fetch_add(static_cast<std::uint64_t>(read.bytes_read), std::memory_order_relaxed);
+  }
+}
+
 Buffer* Connection::outbound_or_create() noexcept {
   if (!outbound_) {
     outbound_ = std::make_unique<Buffer>(config_.outbound);
@@ -102,9 +120,7 @@ Connection::ReadRound Connection::on_readable() {
   }
   ReadRound round;
   round.read = inbound_.read_until_blocked(fd_.get());
-  if (round.read.limit_reached) {
-    stats_->high_water_hits.fetch_add(1, std::memory_order_relaxed);
-  }
+  note_read(round.read);
 
   if (role_ == Role::kUpstream) {
     // 上游方向不解析请求。响应解析（状态行、框架）是 S1-06 的范围，
@@ -242,9 +258,7 @@ void Connection::release_scratch() noexcept {
 
 Buffer::ReadResult Connection::read_raw() noexcept {
   Buffer::ReadResult read = inbound_.read_until_blocked(fd_.get());
-  if (read.limit_reached) {
-    stats_->high_water_hits.fetch_add(1, std::memory_order_relaxed);
-  }
+  note_read(read);
   return read;
 }
 

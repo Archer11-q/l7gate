@@ -27,6 +27,7 @@ void usage(std::FILE* out) {
       "用法: l7gate --self-check\n"
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>\n"
       "               [--serve-requests N] [--max-connections N]\n"
+      "               [--high-water-mark BYTES]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -35,6 +36,10 @@ void usage(std::FILE* out) {
       "（S1-06），畸形请求只关连接不回 400。\n"
       "N 为正整数。--serve-requests 是「解析满 N 条就停循环」，它可能在最后一条响应\n"
       "送达之前就 break —— 要「把 N 条全部送完再停」就用信号，冒烟脚本就是这么做的。\n"
+      "--high-water-mark 把**两个方向**的停读线钉到 BYTES（4096..1048576，默认 256 KiB）。\n"
+      "它是 S1-07 的取证旋钮，不是调优入口：转发的最小单位是「整条请求 / 整个响应头」，\n"
+      "线压得比一条请求还小，那条请求就永远转不出去——它会停在停读线上等人来处理，\n"
+      "不是被丢弃，也不是被报错。S1 的「整块才转」边界见 ARCHITECTURE 1.15。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：事件循环停下、统计打印出来、连接按六步关闭。\n"
       "统计每行一个 [serve] key=value，给脚本读，不是给人看的漂亮表格。\n");
 }
@@ -151,6 +156,15 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
       static_cast<long long>(stats.load(stats.outbound_buffers_created)));
   put("scratches_created", static_cast<long long>(stats.load(stats.scratches_created)));
   put("high_water_hits", static_cast<long long>(stats.load(stats.high_water_hits)));
+  // S1-07 的背压动作与"平台期"证据链：pause/resume 是滞回跳变，两个字节数分别对应
+  // 两个方向的入向读取。验收句里「内存不继续增长」在进程侧只能靠 RSS 粗看，
+  // 真正可断言的是这两个累计数在停读期间**不再增长**。
+  put("backpressure_pause_count",
+      static_cast<long long>(stats.load(stats.backpressure_pause_count)));
+  put("backpressure_resume_count",
+      static_cast<long long>(stats.load(stats.backpressure_resume_count)));
+  put("bytes_read_downstream", static_cast<long long>(stats.load(stats.bytes_read_downstream)));
+  put("bytes_read_upstream", static_cast<long long>(stats.load(stats.bytes_read_upstream)));
   // S1-05 的三条观测线：握手次数（应恰好等于隧道数）、两个方向的透传字节、
   // close 意图被兑现的次数。
   put("upgrades_101", static_cast<long long>(stats.load(stats.upgrades_101)));
@@ -167,6 +181,11 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
   put("epoll_registrations", static_cast<long long>(reactor.epoll_registrations()));
   put("epoll_unregistrations", static_cast<long long>(reactor.epoll_unregistrations()));
   put("epoll_modifications", static_cast<long long>(reactor.epoll_modifications()));
+  // 「网关不再消费下游可读事件」这条验收在进程侧的直读证据：循环已经停下，
+  // 剩下的每一个存活连接如果还带着没挂 EPOLLIN 的掩码，就是被背压按住的那一个。
+  // 非原子观测，所以只在这个时刻读。
+  put("read_disarmed_connections",
+      static_cast<long long>(reactor.connections_with_read_disarmed()));
   // fd 这里含本进程自己打开的 stdout 之类，所以看的是**增量**，不是绝对值；
   // 而且这个数在 Reactor 析构之前读，监听 fd/epoll/eventfd 三个常驻项两边都在。
   put("fd_start", static_cast<long long>(fd_start));
@@ -214,6 +233,20 @@ int serve(int argc, char** argv) {
       }
       config.max_connections = static_cast<std::size_t>(n);
       ++i;
+    } else if (flag == "--high-water-mark" && value != nullptr) {
+      // S1-07 的停读线，两个方向一起设。它是**验收与冒烟的取证旋钮**，不是调优入口：
+      // 默认的 256 KiB 在脚本里要靠几百 KB 的真实流量才顶得动，取证时不稳定；
+      // 把它调小，"撞线 → 摘读 → 平台期 → 回落 → 探测恢复"这条链才能被确定性地打出。
+      // 下限 4 KiB 不是随手取的：转发的单位是"整条请求 / 整个响应头"，
+      // 低于这个尺寸的大头部请求会永远装不进出向缓冲，那是配置错误不是背压。
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 4096 || n > (1 << 20)) {
+        std::fprintf(stderr, "参数错误: --high-water-mark 要的是 4096..1048576，收到 %s\n", value);
+        return 2;
+      }
+      config.connection.inbound.high_water_mark = static_cast<std::size_t>(n);
+      config.connection.outbound.high_water_mark = static_cast<std::size_t>(n);
+      ++i;
     } else {
       std::fprintf(stderr, "参数错误: 无法识别的选项 %s\n", std::string(flag).c_str());
       usage(stderr);
@@ -246,10 +279,11 @@ int serve(int argc, char** argv) {
   const std::int64_t fd_start = count_open_fds();
   const std::int64_t rss_start = current_rss_kib();
   std::printf("[serve] 监听 %s:%d（backlog=%d max_connections=%zu upstream=%s:%u "
-              "stop_after_requests=%zu wait_timeout_ms=%d）\n",
+              "stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu）\n",
               config.listen_address.c_str(), reactor.listen_port(), config.listen_backlog,
               config.max_connections, config.upstream_address.c_str(), config.upstream_port,
-              stop_after_requests, config.wait_timeout_ms);
+              stop_after_requests, config.wait_timeout_ms,
+              config.connection.inbound.high_water_mark);
   std::fflush(stdout);
 
   const auto started = std::chrono::steady_clock::now();

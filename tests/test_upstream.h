@@ -9,7 +9,6 @@
 #include <cstring>
 #include <limits>
 #include <poll.h>
-#include <sched.h>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -37,6 +36,9 @@ namespace l7gate::testing {
 //
 // 单线程 + poll，所以 `set_delay_before_response_ms` 会同时拖住它的所有客户端。
 // 对"上游比下游慢"这个场景（S1-07）来说，这恰好是要的行为。
+// S1-07 另加一个更极端的旋钮 `set_stall_reads`（见它自己那段注释）：慢读是速率问题，
+// **不消费**才是容量问题，而网关的背压只对后者表态——延迟拉到 60 秒也顶不出水位，
+// 因为网关照样把字节读进来了，只是暂时没地方放。
 class TestUpstream {
  public:
   static constexpr std::size_t kMaxClients = 32;
@@ -65,6 +67,9 @@ class TestUpstream {
     listener_ = std::move(listener.fd);
     port_ = static_cast<std::uint16_t>(bound_port);
     stop_.store(false, std::memory_order_relaxed);
+    // stall 的截止点在 spawn 之前算好：worker_ 的创建给出 happens-before，
+    // 所以这个非原子字段在线程里读是干净的（它只在 start 之前被旋钮改动）。
+    stalled_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(stall_reads_ms_);
     worker_ = std::thread([this] { loop(); });
     return true;
   }
@@ -96,6 +101,45 @@ class TestUpstream {
   // 请求路径带 /dies，或全局开关打开时对**所有**请求生效。它是"坏上游"的
   // 可控版本：截断的位置由测试定，断的行为由内核定。
   void set_die_after_response_bytes(std::size_t n) noexcept { die_after_bytes_ = n; }
+
+  // --- S1-07 的慢读上游 ---------------------------------------------------
+  // `stall_reads` 为真时，这个夹具**一个客户端 fd 都不再读**：不 read_into、不按存活
+  // 摘除、不服务，但**照旧 accept 并持有连接**。这就是"上游突然不消费了"的可控版本，
+  // 也是它的诚实版本——真实的慢读上游就是这样：连接还在，只是没人把字节拿走。
+  // 存活判断必须一起停掉：stall 期间客户端的字节堆在内核里，poll 会一直报 POLLIN，
+  // 谁要是这时候还去判 `alive`，摘除路径就把"慢"读成了"死"，网关看到的
+  // 就成了级联关闭而不是背压，那条用例证的就不是它要证的事。
+  //
+  // 两个旋钮分成两种控制方式是有原因的：
+  //   set_stall_reads(bool)   —— 原子，测试线程可以在循环跑着的时候精确切换，
+  //                              所以"停 → 平台期 → 恢复"三段能用同一个连接对象跑完；
+  //   set_stall_reads_first_ms —— 只在 start 之前设，给冒烟脚本用（脚本没有第二个线程
+  //                              去改标志，能做的只有"按启动时间掐一段 stall"）。
+  void set_stall_reads(bool on) noexcept { stall_reads_.store(on, std::memory_order_relaxed); }
+  void set_stall_reads_first_ms(int ms) noexcept { stall_reads_ms_ = ms; }
+
+  // 这一档 stall 原本还有**第二个动作**：`clamp_receive_window` / `release_receive_window`
+  // 在 stall 期间把每条连接的 SO_RCVBUF 显式设成 4096（内核翻倍记账 → 通告窗口 8 KiB），
+  // 理由是"不钉的话载荷会被内核一路吸收，网关的入向缓冲顶不到停读线"。整段删了，
+  // 依据是钉与不钉的**平台期字节数落在同一个位置**（隧道方向载荷 2,742,440 B）：
+  //   钉   ：平台期 1,802,405 B —— asan-ubsan 下 48,058 ms **红**（超 ctest 的 TIMEOUT 30）
+  //   不钉 ：平台期 1,898,661 B（debug 334 ms）/ 1,897,637 B（asan 438 ms）—— 两条都绿
+  // 也就是说第一道墙从来不是"上游的接收窗口"，而是**网关自己的 SO_SNDBUF**（这台机器
+  // 上自动调到 ≈1.9 MiB）：上游不读 → 网关发不动 → 入向读到的字节停在这个量级，
+  // 而停读线（测试里 32 KiB）在此之前早就撞过了——pause 计数在两种配置下都 >0。
+  // 钉窗口没换来更早的撞线，只把同一根红线换成一根更细的绳子。
+  //
+  // 更致命的是 `release` 那句注释不成立。显式把 SO_RCVBUF 设小之后，Linux 的
+  // window_clamp **不会**因为再设一个大值而回涨：取证时夹具侧 `rcv_wnd:8192` 在"放开"
+  // 之后 40 s 内一次没动，网关侧 `rwnd_limited` 从 4,852 ms 涨到 39,904 ms 且恒为 100.0%，
+  // `notsent` 每 5 s 恰好减 196,608 B = 24 × 8192，即一档一个 RTO（`rto:204`）。
+  // 恢复吞吐被 TCP 的零窗口探测计时器钉死，用例红的是内核计时器而不是网关的恢复链路
+  // ——那就不再证它要证的事。留一个"只在 stall 期间存在"的开关也没用：无效的是放开这一步，
+  // 不是 stall 这一步。
+  //
+  // 所以这一档只剩一个动作：不读。它是"上游突然不消费"的诚实版本——真实的慢读上游
+  // 本来也不会替你把内核窗口调小；压强不够该改的是**载荷尺寸**（见 reactor_test.cc
+  // 里 kRequestCount 旁边那段），不是给对端插一堵内核墙。
 
  private:
   struct Client {
@@ -135,8 +179,9 @@ class TestUpstream {
         break;  // 监听侧坏了，继续循环没有意义
       }
 
+      const bool stalled = reading_is_stalled();
       // 逆序遍历，erase 才不会让后面元素的下标错位。
-      for (std::size_t i = client_count; i > 0; --i) {
+      for (std::size_t i = client_count; stalled == false && i > 0; --i) {
         const short revents = pfds[i].revents;
         if (revents == 0) continue;
         Client& client = clients[i - 1];
@@ -166,6 +211,12 @@ class TestUpstream {
       }
     }
     for (auto& client : clients) client.fd.close_now();
+  }
+
+  bool reading_is_stalled() const {
+    if (stall_reads_.load(std::memory_order_relaxed)) return true;
+    if (stall_reads_ms_ <= 0) return false;
+    return std::chrono::steady_clock::now() < stalled_until_;
   }
 
   void accept_more(std::vector<Client>& clients) {
@@ -244,6 +295,18 @@ class TestUpstream {
         const std::size_t head_end = payload.find("\r\n\r\n") + 4;
         const std::size_t cut = head_end + (payload.size() - head_end) / 2;
         echo_all(client, payload.substr(0, cut));
+        client.pending.erase(0, block_end + body_len);
+        client.hang_up = true;
+        return;
+      }
+      if (target.rfind("/dies-mid-head", 0) == 0) {
+        // 头**切在中间**就关：交出响应头的前一半（不含终止空行），然后断。
+        // 它和 /dies 的区别是网关此刻手里已经攥着半条头；和 /endless-head 的区别是
+        // 这半条头很小，远不到响应头预算——所以"判死"不能靠尺寸，只能靠 EOF。
+        // 两边都属于"最终头之前"，落在同一个计数上（口径是 S1-06 定的，这里不改）。
+        const std::string payload = build_response(want_close);
+        const std::size_t head_end = payload.find("\r\n\r\n");
+        echo_all(client, payload.substr(0, head_end / 2));
         client.pending.erase(0, block_end + body_len);
         client.hang_up = true;
         return;
@@ -389,53 +452,50 @@ class TestUpstream {
     return line.substr(sp1 + 1, sp2 - sp1 - 1);
   }
 
-  // 隧道回显：和 respond 同一套"有上限自旋"的写法——一个不再读的对端不能把这个
-  // 线程永远卡住，否则测试的表现从"断言不通过"退化成"TIMEOUT 挂 30 秒"。
-  void echo_all(Client& client, const std::string& data) {
+  // 写给一个可能正在停读的对端。`echo_all`（隧道回显）和 `respond`（HTTP 响应）原本
+  // 各抄了一遍这段循环，口径同一个、地方两个——迟早漂移的就是这种东西，所以合成一处。
+  //
+  // 耐心按**墙钟**记，不再按自旋次数。原来写的是 `kMaxSpins=100000 × usleep(100)`，
+  // 名义上十秒，实际几秒没人知道（usleep 的时长由计时粒度决定），而 S1-07 之后这个夹具
+  // 要对着一条会停读几百毫秒到几秒的网关连接写，冒烟脚本更需要一个能写进注释、
+  // 能和 `--stall-reads-ms` 一起推理的数。10 秒是原来那个名义预算，行为不变，只是终于
+  // 知道自己是多少。
+  //
+  // 预算是**每次停顿**的：每前进一点就重新计时（`waiting=false`）。所以会放弃的形状
+  // 只有"对端还活着却始终不读"，而那正是该放弃的一种——静默截断让用例红在"字节不齐"上，
+  // 好过让这个线程卡死、把失败表现退化成 ctest 的 TIMEOUT 30 秒，还连带拖住同一线程上
+  // 其它客户端。对端真的断开不受影响：EPIPE 走 break，一次都不等。
+  void write_all_with_patience(int fd, std::string_view data) {
+    constexpr auto kStallPatience = std::chrono::milliseconds(10000);
     std::size_t off = 0;
-    int spins = 0;
-    constexpr int kMaxSpins = 100000;
-    while (off < data.size() && spins < kMaxSpins) {
-      const ssize_t n = ::send(client.fd.get(), data.data() + off, data.size() - off,
-                               MSG_NOSIGNAL);
-      if (n <= 0) {
-        const int e = errno;
-        if (e == EINTR) continue;
-        if (e == EAGAIN || e == EWOULDBLOCK) {
-          ++spins;
-          ::sched_yield();
-          continue;
-        }
-        break;  // EPIPE 之类：对端已经不读了
+    bool waiting = false;
+    std::chrono::steady_clock::time_point deadline{};  // 只在 waiting 为真时有意义
+    while (off < data.size()) {
+      const ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+      if (n > 0) {
+        off += static_cast<std::size_t>(n);
+        waiting = false;
+        continue;
       }
-      off += static_cast<std::size_t>(n);
-      spins = 0;
+      const int e = errno;
+      if (e == EINTR) continue;
+      if (e != EAGAIN && e != EWOULDBLOCK) break;  // EPIPE 之类：对端已经不读了
+      const auto now = std::chrono::steady_clock::now();
+      if (!waiting) {
+        waiting = true;
+        deadline = now + kStallPatience;
+      }
+      if (now >= deadline) break;
+      ::usleep(100);
     }
   }
 
+  void echo_all(Client& client, const std::string& data) {
+    write_all_with_patience(client.fd.get(), data);
+  }
+
   void respond(Client& client, const std::string& payload, std::size_t consumed) {
-    const std::size_t total = payload.size();
-    std::size_t off = 0;
-    // 有上限的重试。没有上限的话，一个不读响应的客户端会让这个线程永远卡在
-    // 自旋里，测试的失败表现就从"断言不通过"变成"TIMEOUT 挂 30 秒"——
-    // 后者更难查，而且会连带拖住同一个上游线程上的其它客户端。
-    int spins = 0;
-    constexpr int kMaxSpins = 100000;
-    while (off < total && spins < kMaxSpins) {
-      const ssize_t n = ::send(client.fd.get(), payload.data() + off, total - off, MSG_NOSIGNAL);
-      if (n <= 0) {
-        const int e = errno;
-        if (e == EINTR) continue;
-        if (e == EAGAIN || e == EWOULDBLOCK) {
-          ++spins;
-          ::sched_yield();
-          continue;
-        }
-        break;  // EPIPE 之类：对端已经不读了
-      }
-      off += static_cast<std::size_t>(n);
-      spins = 0;
-    }
+    write_all_with_patience(client.fd.get(), payload);
     client.pending.erase(0, consumed);
     client.served_any = true;
   }
@@ -450,6 +510,9 @@ class TestUpstream {
   bool close_after_response_ = false;
   std::string fixed_body_;
   std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
+  std::atomic<bool> stall_reads_{false};
+  int stall_reads_ms_ = 0;
+  std::chrono::steady_clock::time_point stalled_until_{};
 };
 
 }  // namespace l7gate::testing
