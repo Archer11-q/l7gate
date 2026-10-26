@@ -81,6 +81,19 @@ struct ReactorStats {
   // 请求侧 `Connection: close` 被兑现的次数（配对连接置为一次性）。
   std::atomic<std::uint64_t> close_headers_honored{0};
 
+  // --- S1-06：响应语义面的观测 -------------------------------------------
+  // 网关自产并排进下游出向的错误响应条数（4xx 对畸形请求 / 502 对坏上游）。
+  // "回 400 而不是只关连接"这条验收要有可断言的来源，而不能靠 curl 的退出码猜。
+  std::atomic<std::uint64_t> gateway_replies_sent{0};
+  // 上游在**最终响应头之前**断开/坏头 → 网关回 502 的次数。与下一条互斥可断言：
+  // 头已经出去之后只能以 EOF 表态，那记在下面那条，不会重复计入这一条。
+  std::atomic<std::uint64_t> upstream_truncated_before_head{0};
+  // 最终头已透传、body 未走完就断/框架坏 → 以 EOF 告知截断的次数。
+  std::atomic<std::uint64_t> upstream_truncated_in_body{0};
+  // 按框架判定"完结"的响应条数（kComplete 边界的到达次数）。close 语义的
+  // "响应边界"兑现点计数，也是 keep-alive 配对接力的放行信号。
+  std::atomic<std::uint64_t> responses_completed{0};
+
   // 出向 Buffer 的实际分配情况，卡点四那笔账的数据来源：
   // 惰性分配到底省下了多少，只有把"创建了几个"和"每个多大"分开记才算得出来。
   std::atomic<std::uint64_t> outbound_buffers_created{0};

@@ -10,6 +10,7 @@
 #include <system_error>
 #include <utility>
 
+#include "http/response_framing.h"
 #include "net/socket.h"
 
 namespace l7gate::net {
@@ -369,9 +370,10 @@ void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
     return;
   }
   if (round.reject) {
-    // S1-04 只关连接，不回 4xx —— 把 ParseError 映射成状态码是 S1-06 的活。
-    // 现在先把口子留在这里：这一行就是那条映射将来插入的位置。
-    close_connection(conn);
+    // S1-06 的映射点：ParseError → 可定义的 4xx/5xx，回完再关。
+    // kNone 不可能是 reject（reject 只在 error != kNone 时置位），status 给 0
+    // 只是把"理论上没有分类的错误"留给 fail_pair 的兜底路径处理。
+    fail_pair_with_reply(conn, http::reply_status_for_parse_error(round.error));
     return;
   }
 
@@ -436,8 +438,34 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests(
     // 这里重新走 on_readable 是安全的：游标是相对可读区起点的，压缩/扩容都不动它，
     // 而 view 作废的情况由 Connection 自己负责重解析（见 request_views_valid）。
     const Connection::ReadRound round = downstream->on_readable();
-    if (round.read.errno_value != 0 || round.reject) {
-      close_connection(downstream);  // 管线里后一条畸形：整条连接结束，S1-06 在这里回 4xx
+    if (round.read.errno_value != 0) {
+      close_connection(downstream);
+      return ForwardOutcome::kFailed;
+    }
+    if (round.reject) {
+      // 管线里后一条畸形。这里分两种语义，取决于配对上游有没有"在途"的请求：
+      //  在途（上游出向还没刷完 / 上游已开始回响应）——第 i 条请求已转出去，
+      //  客户端期望的第 i 条响应还在路上。此刻替"第 i+1 条"回 4xx 会把响应序列
+      //  错一位（客户端会把它当成对第 i 条的答复），而且按 S1-05 定死的口径
+      //  "不承诺 close 之后的请求"，4xx 的归属本身就说不清。诚实的做法是
+      //  断链级联：客户端以连接终止感知，绝不错位表态。
+      //  不在途——这条畸形就是第一个、也是唯一一个被网关"看见"的请求，响应
+      //  序列没有错位问题，走正常的 reject→4xx 映射。
+      const int ufd = downstream->peer_fd();
+      std::shared_ptr<Connection> upstream;
+      if (ufd != kInvalidFd) {
+        auto uit = connections_.find(ufd);
+        if (uit != connections_.end()) upstream = uit->second;
+      }
+      const bool in_flight =
+          upstream != nullptr &&
+          (upstream->outbound_pending() > 0 ||
+           upstream->response_tracking().phase != Connection::ResponsePhase::kHead);
+      if (in_flight) {
+        close_connection(downstream);
+      } else {
+        fail_pair_with_reply(downstream, http::reply_status_for_parse_error(round.error));
+      }
       return ForwardOutcome::kFailed;
     }
     if (!round.request_ready) {
@@ -487,29 +515,216 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
   return true;
 }
 
-void Reactor::pump_upstream_to_downstream(const std::shared_ptr<Connection>& upstream) {
+void Reactor::pump_response(const std::shared_ptr<Connection>& upstream) {
   if (upstream->tunneling()) {
-    // 隧道路径在调用方（on_upstream_event / pump_tunnel 的对称重试）已经分走，
-    // 这里只保留一道断言式的守卫：状态串了宁可原地停住，也不把帧当响应搬。
+    // 隧道路径在调用方（on_upstream_event / flush_outbound 的对称重试）已经分走，
+    // 这里只保留一道断言式的守卫：状态串了宁可原地停住，也不把帧当响应搬（ADR-09）。
     return;
   }
   auto it = connections_.find(upstream->peer_fd());
   if (it == connections_.end()) return;  // 对端已关（或编号已被复用）：无去处
   const std::shared_ptr<Connection> downstream = it->second;
 
-  const std::size_t available = upstream->inbound().readable_bytes();
-  if (available == 0) return;
+  using Phase = Connection::ResponsePhase;
+  using Framing = http::ResponseFraming;
 
-  if (!downstream->queue_bytes(upstream->inbound().readable_data(), available)) {
-    return;  // 下游出向水位满：数据留在上游缓冲，等下游刷完再重试
+  for (;;) {
+    Connection::ResponseTracking& r = upstream->response_tracking();
+    const std::size_t available = upstream->inbound().readable_bytes();
+
+    if (r.phase == Phase::kHead) {
+      if (available == 0) return;
+      const std::size_t head_len = upstream->detect_response_head();
+      if (head_len == std::string_view::npos) {
+        // 头未齐。唯一要当场判死的是"未齐且已经不可能是齐了"：可读区已经超出
+        // 响应头预算还找不到终止串——那不是慢上游，是坏上游（响应头没有配置上的
+        // 上限就等于给上游开了一个免费的内存放大口，方向反过来的 413）。
+        if (available > config_.connection.parser.max_headers_bytes) {
+          // 超长且仍未见终止串：不是慢，是坏。fail_pair 的入参是下游——
+          // 表态要发的那一方；上游由它顺着 peer_fd 反查后按丢弃关闭。
+          // 计数口径见 stats.h：这一支和"上游在头之前 EOF"是同一类表态。
+          stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+          fail_pair_with_reply(downstream, 0);
+          return;
+        }
+        return;  // 半包不是错误，也不是截断：等下一轮可读
+      }
+      const http::ResponseHeadInfo info =
+          http::analyze_response_head(upstream->inbound().readable_data(), head_len);
+      if (info.framing == Framing::kHeadInvalid) {
+        // 头齐了但框架声明不可接受（坏状态行 / CL+TE / 不一致的多 CL / 非法 TE）。
+        // 此刻**最终头还没排给下游**（无效头从不整块排），网关还有自产 502 的
+        // 资格；把这段畸形字节转出去才是失职——客户端会看到一个下游没见过的
+        // 上游在说话。
+        // 计数与"头之前 EOF"同一口径：网关还没把最终头交出去，表态资格还在。
+        stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+        fail_pair_with_reply(downstream, 0);
+        return;
+      }
+      // 头必须**整块**排：半个响应头排出去就是把语法不完整的字节喂给客户端，
+      // 而且头是框架结论的唯一来源——拆散发等于让"判定"和"发出"看到不同的字节。
+      if (!downstream->queue_bytes(upstream->inbound().readable_data(), head_len)) {
+        return;  // 下游出向水位满：头留在原地，刷完由 flush_outbound 重试
+      }
+      upstream->inbound().consume(head_len);
+      stats_.bytes_up_to_downstream.fetch_add(static_cast<std::uint64_t>(head_len),
+                                              std::memory_order_relaxed);
+      arm_write(downstream);
+
+      if (info.framing == Framing::kProvisional) {
+        // 1xx（含"没配对成功的 101"——上游对无 upgrade 的请求回 101 是畸形流量，
+        // 按 1xx 处理就是等它的最终响应）：本条无 body，后面跟的是**另一个头**。
+        // 不置 final_head_forwarded（1xx 不剥夺 502 资格）、不完结。
+        continue;
+      }
+      r.final_head_forwarded = true;  // 从这一行起，网关对这条响应只能以 EOF 表态
+      switch (info.framing) {
+        case Framing::kNoBody:
+          r.framing = info.framing;
+          r.phase = Phase::kComplete;
+          break;
+        case Framing::kContentLength:
+          r.framing = info.framing;
+          r.declared_body_bytes = info.declared_body_bytes;
+          r.body_remaining = info.declared_body_bytes;
+          r.phase = (info.declared_body_bytes == 0) ? Phase::kComplete : Phase::kBody;
+          break;
+        case Framing::kChunked:
+          r.framing = info.framing;
+          r.chunked = {};
+          r.phase = Phase::kBody;
+          break;
+        case Framing::kCloseDelimited:
+          r.framing = info.framing;
+          r.phase = Phase::kBody;  // 完结点是 EOF，不是字节数（见 on_upstream_event）
+          break;
+        default:
+          break;  // kHeadIncomplete/kHeadInvalid 在上面已经分走
+      }
+      if (r.phase == Phase::kComplete) continue;  // body 一条字节都没有：直接进完结处理
+      continue;  // 头后字节（第一块 body / 下一段帧）本轮就在缓冲里，接着泵
+    }
+
+    if (r.phase == Phase::kBody) {
+      if (available == 0) return;
+      std::size_t forward = 0;
+      bool reached_complete = false;
+      bool broken_framing = false;
+
+      if (r.framing == Framing::kChunked) {
+        // 先推进游标再排字节：advance 会停在边界（最后一条 chunk 的终止空行之后），
+        // 边界之后的字节属于下一条响应，本不该过框架判定，也不该在这一轮排出去。
+        const std::size_t pos =
+            http::chunked_advance(r.chunked, upstream->inbound().readable_data(), available);
+        if (r.chunked.phase == http::ChunkedProgress::Phase::kInvalid) {
+          // 框架坏了：advance 之前的字节已经透传，之后没有"边界"可言。
+          // 最终头早发出去了，网关只能以 EOF 表态——级联关闭，客户端看到断流。
+          broken_framing = true;
+          forward = pos;
+        } else {
+          forward = pos;
+          reached_complete = (r.chunked.phase == http::ChunkedProgress::Phase::kComplete);
+        }
+      } else if (r.framing == Framing::kContentLength) {
+        forward = std::min(available, r.body_remaining);
+        reached_complete = (forward == r.body_remaining);
+      } else {
+        forward = available;  // kCloseDelimited：全透传，EOF 才是完结
+      }
+
+      if (forward == 0) {
+        if (broken_framing) {
+          stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+          close_connection(upstream);  // 级联下游：EOF 语义就是截断的表态
+          return;
+        }
+        return;
+      }
+
+      // body 可以拆散排：框架边界由游标管着，任意切分都不改变客户端看到的字节序。
+      // "截断的权力在框架知识，不在这条泵"——拆排不拆判定。
+      const std::size_t queued =
+          downstream->queue_bytes_partial(upstream->inbound().readable_data(), forward);
+      if (queued == 0) return;  // 出向满：数据留在上游缓冲，等下游腾出空间
+      upstream->inbound().consume(queued);
+      stats_.bytes_up_to_downstream.fetch_add(static_cast<std::uint64_t>(queued),
+                                              std::memory_order_relaxed);
+      arm_write(downstream);
+      if (r.framing == Framing::kContentLength) r.body_remaining -= queued;
+
+      if (broken_framing) {
+        stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+        close_connection(upstream);
+        return;
+      }
+      if (reached_complete && queued == forward) {
+        r.phase = Phase::kComplete;
+        continue;
+      }
+      if (queued < forward) return;  // 排了一部分（撞水位）：游标状态留在原地，下轮续
+      continue;
+    }
+
+    // kComplete：这条响应对下游已经（或即将，由 flush 负责）完整交付。
+    stats_.responses_completed.fetch_add(1, std::memory_order_relaxed);
+    if (upstream->close_after_response()) {
+      // S1-05 留的口子在这里兑现：一次性配对的响应**完结**了（不是猜边界，
+      // 是框架判定给出的完结点），现在关上游是安全的——它出向没有货，入向的
+      // 残字节属于"这条连接不再复用"之后的世界。级联把下游也带向收尾，
+      // 下游出向里的响应字节由 kFlushThenClose 保证发完。
+      close_connection(upstream);
+      return;
+    }
+    // 重置必须**无条件**做在这里。我第一版写成"缓冲空就先 return，下次再来再重置"，
+    // 那等于把 kComplete 留在连接上过夜：下一条响应到达时会先撞上这个尾巴，
+    // responses_completed 凭空多 1，然后才从头判——一个"看起来对称"的漏记。
+    upstream->reset_response_tracking();
+    if (upstream->inbound().readable_bytes() == 0) return;  // 等下一条响应的字节
   }
-  upstream->inbound().consume(available);
-  stats_.bytes_up_to_downstream.fetch_add(static_cast<std::uint64_t>(available),
-                                          std::memory_order_relaxed);
+}
 
-  // 刚排进字节的这一侧要挂上 EPOLLOUT，否则数据只会在缓冲里等着 ——
-  // 而挂事件这个动作在 kClosing 状态下也不能跳，所以判断统一收在 arm_write 里。
-  arm_write(downstream);
+void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
+                                   std::uint16_t status) {
+  // 对端已经不在了：没有谁接收这条表态。不排队、**不计数**——
+  // gateway_replies_sent 的口径是"进了下游出向缓冲"，写在这个口径上的计数
+  // 才是验收能引用的数。入向字节随下面这条 close 一起消失，没有谁欠它响应：
+  // 配对已经断了，对端早就是 EOF 表态的世界。
+  if (downstream == nullptr) return;
+
+  // status==0 的调用点是"没有更细分类可用"的简写（坏/超长的上游头）。
+  if (status == 0) status = 502;
+  const std::string_view reply = http::gateway_error_reply(status);
+  if (reply.empty()) return;  // 不该发生；发生了也不发一条空响应出去
+
+  // 先解链再分别关。不这么做的话 close_connection 的级联会把**同一个 why**
+  // 传染给对端：下游出向里刚排进去的 4xx/5xx 会被 kDiscardOutbound 顺手丢掉，
+  // 客户端收到的表态从"一条完整错误响应"变成"连接断了"——那正是本函数要
+  // 避免的事。解链后两侧各自按自己的意图关闭，互不传染。
+  const int peer_fd = downstream->peer_fd();
+  std::shared_ptr<Connection> upstream;
+  if (peer_fd != kInvalidFd) {
+    auto it = connections_.find(peer_fd);
+    if (it != connections_.end()) {
+      upstream = it->second;
+    }
+  }
+  downstream->set_peer_fd(kInvalidFd);
+  if (upstream) upstream->set_peer_fd(kInvalidFd);
+
+  // 排队在解链之前还是之后都一样——queue 不看对端，看的是这块 buffer；
+  // 但必须在下游还没被关掉之前：kClosed 之后 fd 已回收，发出去也没人收。
+  if (!downstream->queue_bytes(reply.data(), reply.size())) {
+    // 下游出向连一条几十字节的小响应都装不下——那不是水位，是这条连接已经
+    // 病到没救（或它本来就在 kClosing 收尾、缓冲被大响应占满）。此刻发不出
+    // 表态，就不能计"已发出"：gateway_replies_sent 只记真的进了出向缓冲的。
+    if (upstream) close_connection(upstream, CloseWhy::kDiscardOutbound);
+    close_connection(downstream, CloseWhy::kDiscardOutbound);
+    return;
+  }
+  stats_.gateway_replies_sent.fetch_add(1, std::memory_order_relaxed);
+
+  if (upstream) close_connection(upstream, CloseWhy::kDiscardOutbound);
+  close_connection(downstream, CloseWhy::kFlushThenClose);
 }
 
 void Reactor::pump_tunnel(const std::shared_ptr<Connection>& src,
@@ -615,11 +830,39 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
       // 由后续可读事件/可写重试按隧道路径搬运。本条事件到此为止。
       return;
     }
-    pump_upstream_to_downstream(conn);
+    pump_response(conn);
     if (round.read.peer_closed) {
-      // 上游结束。S1-04 的策略是"跟着关下游"：本任务没有连接池（池是 S2 的），
-      // 也不做响应截断判定（那是 S1-06 的 5xx）。S2 建池之后这条要改成
-      // "只关上游、下游继续复用"，到时候改的就在这一个地方。
+      // 上游 EOF。S1-06 的截断分类在这一个地方落定，口径只有两条：
+      // **最终头还没排给下游** → 网关还有自产表态的资格 → 502 + 不对称关闭；
+      // **头已经出去** → 再回 5xx 就是给同一条请求发两条响应，只能以连接
+      // 终止表态（客户端拿框架知识自己判定截断——这正是这套框架泵存在的理由）。
+      if (!conn->tunneling()) {
+        Connection::ResponseTracking& r = conn->response_tracking();
+        const bool complete_by_eof =
+            r.phase == Connection::ResponsePhase::kComplete ||
+            (r.phase == Connection::ResponsePhase::kBody &&
+             r.framing == http::ResponseFraming::kCloseDelimited);
+        if (!r.final_head_forwarded && !complete_by_eof) {
+          // 含"一个字节都没回"和"只回了 1xx"两种：都还没有最终头，502 合法。
+          stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+          auto pit = connections_.find(conn->peer_fd());
+          if (pit == connections_.end()) {
+            // 下游已经不在了：没人需要这条表态，直接把上游按丢弃关掉。
+            close_connection(conn, CloseWhy::kDiscardOutbound);
+            return;
+          }
+          fail_pair_with_reply(pit->second, 502);
+          return;
+        }
+        if (r.phase == Connection::ResponsePhase::kBody &&
+            r.framing != http::ResponseFraming::kCloseDelimited) {
+          // CL/chunked 的 body 没走完就断了：框架意义上的截断，客户端会看到
+          // 断流；网关不追加任何字节（头已经发出，追加就是伪造）。
+          stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      // 其余（完结、close-delimited 的 EOF=完结、隧道）跟着关：S2 建池之前
+      // 配对连接对就是"一条响应序列"的生命周期，EOF 级联是唯一的收尾路径。
       close_connection(conn);
       return;
     }
@@ -664,7 +907,7 @@ void Reactor::flush_outbound(const std::shared_ptr<Connection>& conn) {
     if (peer->tunneling()) {
       pump_tunnel(peer, conn);  // 对端（上游）在隧道里：重试帧字节的搬运
     } else {
-      pump_upstream_to_downstream(peer);
+      pump_response(peer);
     }
   } else {
     // 我刚腾出空间的那个 fd 是**上游**，所以压着不动的是对端（下游）那条还没转出去的

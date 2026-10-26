@@ -248,7 +248,7 @@ Buffer::ReadResult Connection::read_raw() noexcept {
   return read;
 }
 
-std::size_t Connection::detect_response_head_101() noexcept {
+std::size_t Connection::detect_response_head() noexcept {
   const std::uint8_t* d = inbound_.readable_data();
   const std::size_t n = inbound_.readable_bytes();
   std::size_t from = head_scan_pos_;
@@ -258,14 +258,38 @@ std::size_t Connection::detect_response_head_101() noexcept {
     head_scan_pos_ = (n > 3) ? n : 0;
     return std::string_view::npos;
   }
-  // 101 是三条字节的定长前缀比较，合法响应头不可能大到让"重复判定"成为成本，
-  // 所以这里不留"已判定非 101"的缓存位：一个需要记得失效的缓存位，
-  // 就是 ARCHITECTURE 1.4 第四条说的那种"看起来有两个旋钮"的东西。
+  // "定长前缀比较不值得缓存"这条对通用检测同样成立：找到终止串就报头长，
+  // 判不判得动是调用方（analyze_response_head）的事。
   head_scan_pos_ = 0;
-  if (!http::looks_like_101_response_head(d, term + 4)) {
+  return term + 4;
+}
+
+std::size_t Connection::detect_response_head_101() noexcept {
+  const std::size_t head_len = detect_response_head();
+  if (head_len == std::string_view::npos) return std::string_view::npos;
+  if (!http::looks_like_101_response_head(inbound_.readable_data(), head_len)) {
     return std::string_view::npos;  // 完整响应头但不是 101：隧道语义不成立
   }
-  return term + 4;
+  return head_len;
+}
+
+std::size_t Connection::queue_bytes_partial(const void* data, std::size_t len) noexcept {
+  if (len == 0) return 0;
+  Buffer* out = outbound_or_create();
+  const std::size_t pending = out->readable_bytes();
+  if (pending >= out->high_water_mark()) return 0;
+  const std::size_t take = std::min(len, out->high_water_mark() - pending);
+  const auto* src = static_cast<const std::uint8_t*>(data);
+  std::size_t off = 0;
+  while (off < take) {
+    const auto [ptr, space] = out->writable_region(take - off);
+    if (space == 0) break;  // 容量路线撞死（max_capacity）：已排的部分照算，调用方按字节数记账
+    const std::size_t n = std::min(space, take - off);
+    std::memcpy(ptr, src + off, n);
+    out->commit_written(n);
+    off += n;
+  }
+  return off;
 }
 
 }  // namespace l7gate::net

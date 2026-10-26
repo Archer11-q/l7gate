@@ -157,6 +157,13 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
   put("bytes_tunnel_down", static_cast<long long>(stats.load(stats.bytes_tunnel_down)));
   put("bytes_tunnel_up", static_cast<long long>(stats.load(stats.bytes_tunnel_up)));
   put("close_headers_honored", static_cast<long long>(stats.load(stats.close_headers_honored)));
+  // S1-06 的四条观测线：自产错误响应、截断的两个互斥类别、框架判定的完结数。
+  put("gateway_replies_sent", static_cast<long long>(stats.load(stats.gateway_replies_sent)));
+  put("upstream_truncated_before_head",
+      static_cast<long long>(stats.load(stats.upstream_truncated_before_head)));
+  put("upstream_truncated_in_body",
+      static_cast<long long>(stats.load(stats.upstream_truncated_in_body)));
+  put("responses_completed", static_cast<long long>(stats.load(stats.responses_completed)));
   put("epoll_registrations", static_cast<long long>(reactor.epoll_registrations()));
   put("epoll_unregistrations", static_cast<long long>(reactor.epoll_unregistrations()));
   put("epoll_modifications", static_cast<long long>(reactor.epoll_modifications()));

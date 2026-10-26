@@ -12,7 +12,11 @@ l7gate/
 ├── CMakePresets.json       四个构建形态（debug / release / asan-ubsan / tsan）
 ├── scripts/
 │   ├── verify-all-presets.sh  三 preset 全量构建 + ctest + 警告计数，任务收尾用
-│   └── smoke-s1-04.sh      真 curl 冒烟：单请求逐字节可见 + 10000 请求后 fd/连接归零
+│   ├── smoke-s1-04.sh      真 curl 冒烟：单请求逐字节可见 + 10000 请求后 fd/连接归零
+│   ├── smoke-s1-06.sh      八阶段真 curl：逐字节一致 / chunked / 两种截断 / 坏框架 / 永不齐头 / 4xx+501
+│   └── bench/
+│       ├── s1-p99.sh       SLO #1 取数（口径写死，canonic 自检；非标准口径不进 BENCHMARK）
+│       └── env-snapshot.sh 每次压测前的环境落盘（绑核/分配器/版本号/文件系统）
 ├── src/
 │   ├── main.cc             入口：--self-check / --serve / --help
 │   ├── core/
@@ -33,7 +37,12 @@ l7gate/
 │       ├── request_parser.h    三态返回 + 22 个错误码 + ParsedRequest 的字段口径
 │       ├── request_parser.cc   请求行 / 头部区 / CL 与 chunked 框架的校验与定位
 │       ├── response_head.h     两个纯函数：找响应头终止串 / 判定完整 101 头（S1-05 的全部响应知识面）
-│       └── response_head.cc    定长前缀比较 + "终止串恰好收尾"；不校验其余内容——透传不裁决
+│       ├── response_head.cc    定长前缀比较 + "终止串恰好收尾"；不校验其余内容——透传不裁决
+│       ├── response_framing.h  七种响应框架 + chunked 边界游标 + reject→状态码映射 + 自产响应字节
+│       └── response_framing.cc 校验 + 定位，不解码框架：chunked 的 body 一字节不重组（S1-06）
+├── tools/
+│   └── bench_upstream_main.cc  SLO #1 的压测上游（单线程 epoll ET、1000+ 并发、固定体）
+│                             **不进 ctest**：它是被构建的工具，不是被断言的代码
 └── tests/
     ├── CMakeLists.txt      gtest_discover_tests：标签按阶段打（s1），任务级筛选靠套件名，TIMEOUT 30
     ├── pipe_fixture.h      非阻塞管道夹具，S1-02/03/05 共用（S1-05 起 PipePair 从 connection_test 上移在此）
@@ -44,10 +53,14 @@ l7gate/
     ├── request_parser_test.cc  21 条解析断言（S1_03_Parser），含 37 类畸形输入与 40000 例随机字节
     ├── connection_test.cc  11 条（S1_04_Connection）+ 3 条写入侧（S1_04_BufferWrite）+ 4 条隧道语义（S1_05_Connection）
     ├── reactor_test.cc     10 条（S1_04_Reactor），含真 curl 之外的 10000 请求生命周期用例 + 5 条握手闭环（S1_05_Reactor）
+    │                        + 7 条响应语义闭环（S1_06_Reactor）：逐字节一致 / chunked 不吃下一条 /
+    │                          两种截断各自落在互斥计数上 / 头超预算判死 / 4xx+501 端到端 / close 在框架边界兑现
+    ├── framing_test.cc     19 条（S1_06_Framing）响应框架纯函数断言：七种结论、chunked 游标的切分不变量与
+    │                        坏框架在"断掉那一字节"停住、映射表拥有每个错误码、自产响应的 CL 与字节数自洽
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 = 74**。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数）。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环）。
 
 ### 1.1 `core/build_info`
 
@@ -184,7 +197,7 @@ TSan 那个数超过预算不是无害的信息，它告诉我一件事：**如�
 
 ### 1.11 关于「每连接内存」目前能说到哪一步
 
-S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲连接摊出来的每连接增量在 debug 下是 4.47–5.72 KiB（含测试夹具自身），`sizeof(Connection)=400`，出向 Buffer 与 scratch 都没建（`outbound_buffers_created`/`scratches_created` 在纯空闲场景为 0）。不能说的：100k 连接下的每连接内存——那是 S2 之后的实测项，`TASKS.md` 那一行仍然写"未测"，我不打算用 128 条的数外推 1000 倍。
+S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲连接摊出来的每连接增量在 debug 下是 4.47–5.72 KiB（含测试夹具自身），`sizeof(Connection)=400`，出向 Buffer 与 scratch 都没建（`outbound_buffers_created`/`scratches_created` 在纯空闲场景为 0）。不能说的：100k 连接下的每连接内存——那是 S2 之后的实测项，`TASKS.md` 那一行仍然写"未测"，我不打算用 128 条的数外推 1000 倍。**S1-06 之后这条口径的基数变了**：`ResponseTracking` + `ChunkedProgress` 把 `sizeof(Connection)` 抬到 **512**（+112 B，+28%），128 条空闲连接本轮实测 5.31 KiB/连接（仍在同一区间内，因为 4 KiB 入向 buffer 才是大头）。这正是把口径写成"哪个数怎么算"而不是"一个数"的理由——加字段的人不必回来重写这段，但读的人能看出自己读在哪一年的口径上。
 
 ### 1.12 「零泄漏」这句话是有反证的
 
@@ -210,6 +223,31 @@ S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲�
 
 已知边界，照记不藏：`--serve` 冒烟脚本不覆盖 upgrade 路径（curl 造 101 闭环要额外的 `--upload` 花活，收益低于 reactor 用例）；隧道的撞水位后恢复仍与 S1-07 的背压动作是同一个缺口；`bytes_tunnel_up/down` 是累计字节不是速率，S3 的指标面再说。
 
+### 1.14 `http/response_framing` 与截断表态：S1-06 交付的是"知道一条响应在哪里结束"
+
+S1-04 就有了字节通路（下游来一条、回源一条、原路回写），S1-05 补上了"这条连接不再讲 HTTP"的隧道分支。这个任务补的是中间那块：**网关对响应本身的认识**。有了它，"上游中途断开时返回可定义的 5xx"和"chunked 透传与直连逐字节一致"这两条验收才成为可断言的命题——没有框架知识的网关只能等 EOF，而 EOF 既可能是"body 送完了"也可能是"送断了一半"，这两种情况该给下游的东西**相反**。
+
+**判定面还是纯函数，理由和 1.4 一模一样。** `analyze_response_head()` 认七种结论：`kHeadIncomplete`（头没齐，**唯一的无结论状态**，半包不是错误也不做任何早期判定）、`kHeadInvalid`（头齐了但声明不可接受：坏状态行、CL 与 TE 并存、多个不一致 CL、非法 TE）、`kProvisional`（1xx，本条无 body 且后面还跟另一个头）、`kNoBody`（204/304，头结束即完结）、`kContentLength`、`kChunked`、`kCloseDelimited`（无 CL 无 TE：**EOF 本身就是完结**，不是截断）。`chunked_advance()` 是个常数内存的边界游标（`kSizeLine/kData/kDataCrlf/kTrailers/kComplete/kInvalid`），它数"框架边界走到哪"，一字节 body 都不重组——和请求侧同一条纪律，因为"与直连逐字节一致"这条验收在任何"网关重写了框架"的实现上永远证不了。
+
+**状态存在 `Connection::ResponseTracking` 里，推进只发生在 reactor 的上游路径。** 对象存状态、策略归 reactor，和隧道三态同一个分工。里面最关键的一格不是框架而是 `final_head_forwarded`：**最终响应头有没有已经排进下游出向缓冲**。它是截断表态的分水岭，而 1xx 不算"头已发出"这个表态能力（502 跟在 1xx 之后依然合法）。
+
+**截断的两条口径，只在这一个地方落定**（`on_upstream_event` 的 EOF 分支）：
+
+- **最终头还没排给下游** → 网关还有自产表态的资格 → `upstream_truncated_before_head` +1、给下游回一条 502、然后**不对称地**收尾。含"一个字节的头都没回"和"只回了 1xx"两种，也含"头超出预算被判死"（`available > max_headers_bytes` 且头未齐）与"头齐了但框架坏"（`kHeadInvalid`）——这四种在下游看来是同一件事：它一条响应都没收到。
+- **头已经出去** → 再回 5xx 就是给同一条请求发两条响应 → 只能以**连接终止**表态，`upstream_truncated_in_body` +1，网关一个字节都不追加。客户端拿自己的框架知识判定截断，这正是这套框架泵存在的理由。
+
+那条不对称收尾的实现细节值得单独记一句：`fail_pair_with_reply` 先两侧 `set_peer_fd(kInvalidFd)` 解链、再分别关。不解链的话，关下游时"级联同一种 `CloseWhy`"会把刚排进上游配对体里的 502 当残留字节丢掉——`kDiscardOutbound` 的传染性在这里是会吞掉自产响应的。排字节失败（下游缓冲装不下）**不**计 `gateway_replies_sent`：那个计数说的是"下游收到了"，不是"我决定发"。
+
+**完结点由框架给出，不是由 EOF 给出。** `responses_completed` 在 `pump_response` 把一条响应按它的框架判到 `kComplete` 时 +1，然后立刻 `reset_response_tracking()`——这条重置同时是 pipelining / keep-alive 下一条响应的起点，也是 S1-05 留的那个口子（「几条字节算一条响应完结」的精确边界）兑现的地方：`mark_close_after_response()` 的意图现在有了可以对照的"完结"。`responses_completed` 与 `requests_parsed` 的差额因此是**可解释的**：进程被杀时在飞的那几条，不是漏账。
+
+**reject 映射表在 `reply_status_for_parse_error`，switch 没有 default。** 22+1 个 `ParseError` 逐个点名归到 400/411/413/501，加新错误码时这张表编译不过——逼下一次改动来认账，比"未映射默认 400"这种兜底诚实。表里 411 目前**没有**触发路径：本解析器把"无 CL 无 TE"判成无 body 而不是要求长度，那是 HTTP/1.1 的合法解读，我不为凑数字硬造一条触发路径。方法本身不在白名单里（TRACE 照样转发），501 只由"网关不接的形态"触发（CONNECT 绝对形式）。`gateway_error_reply()` 的每条字节都是"状态行 + CL + `Connection: close` + body"的完整响应，CL 与字面字节数一一对死，由测试逐条核对。
+
+**测试侧的分工**：语义断言在 ctest（`framing_test.cc` 的纯函数 + reactor 闭环），字节面证据在 `scripts/smoke-s1-06.sh` 的八阶段真 curl（逐字节比对、两种截断、坏框架、永不齐头、4xx/501 映射、每阶段生命周期三重检查）。压测上游另立 `tools/bench_upstream_main.cc`：`tests/` 那个对端 poll 单线程、上限 32 条连接，1000 并发下它拒绝的是连接而不是延迟问题；`tools/` 不进 ctest，理由是"哪段代码被断言过"这个性质不能被压测工具稀释。这里有一条踩过的坑值得固化：`/dies` 是 `/dies-mid-body` 的前缀，**路径分派的顺序就是正确性**，长前缀必须排前面——排反了冒烟测的是 before_head 分支，而报告里写的是 in_body。
+
+实测（全部本任务重跑取数）：三 preset 各 **100/100**（debug / asan-ubsan / tsan），本任务新增 **26** 条（19 `S1_06_Framing` 纯函数 + 7 `S1_06_Reactor` 闭环），非 gtest 警告 **0 条**——这个 0 是门禁抓出来的：asan/tsan 首跑各报 1 条 `-Wunused-const-variable`（`tools/` 里一个只用于注释目的的常量），debug 用 gcc 不报、clang 的两个 preset 才报，删掉未用常量后归零；纯函数那 19 条里 `MappingTableOwnsEveryErrorCode` 是把"每个 `ParseError` 都有归属"写成数据断言的（表里没有 default，靠遍历枚举核），`GatewayRepliesAreCompleteAndSelfConsistent` 逐条核对 CL 与字面字节数。逐字节一致那条：`ProxiedResponseIsByteIdenticalToDirectUpstream` + 冒烟阶段一（1200 B 固定体，直连与经网关两份文件比 sha），chunked 那条同口径但带 `--raw`，且额外断言框架边界不吃掉下一条响应（`ChunkedResponseIsByteIdenticalAndLeavesTheNextResponseAlone`）。两种截断分别落在两条互斥的计数上：`UpstreamDyingBeforeAnyResponseGetsDefined502`（before_head + 502 + `gateway_replies_sent`）与 `UpstreamDyingMidBodyIsTruncatedByEofWithoutASecondReply`（in_body + 零追加字节）；`EndlessResponseHeadIsKilledAtTheBudget` 打的是头超预算那条早期判定；`ClosePairCompletesAtTheFramingBoundary` 是 S1-05 那个口子的兑现点。回归：`smoke-s1-04.sh` 真 curl 10000 仍全绿（3.04 s、fd 9→9、`header_scan_bytes == bytes_down_to_upstream == 838,894`）。**结构成本照记**：`sizeof(Connection)` 从 400 涨到 **512**（`ResponseTracking` + `ChunkedProgress` 的支出，1.11 那条口径要跟着改），空闲 128 条下游连接本轮 5.31 KiB/连接。第一份 p99 与归因在 `docs/BENCHMARK.md` B-001（增量 p99 = 57.540 ms，**未达标**）。
+
+已知边界，照记不藏：411 在映射表里没有触发路径（解析器把"无 CL 无 TE"判成无 body，见上）；`gateway_error_reply` 只覆盖 400/411/413/501/502，503/504 的字节模板存在但没有产生它们的代码路径（限流与超时是 S4）；响应头的语法只做框架声明级别的一致性检查（不当响应解析器用，S1 不需要）；优雅停止在语义上是"停止接受新连接 + 退出循环"，**不排水在飞连接**——压测脚本因此必须先静置再 SIGTERM，否则报告里的 `live_connections` 反映的是我杀进程的时机而不是网关的收尾能力（这条在 B-001 的生命周期段有对账）。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -230,7 +268,7 @@ S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲�
 只写到接口形状，实现归属看 `TASKS.md`。S1-03 结尾挂着的两笔债（**已扫描游标**、**view 生命周期**）已经在 S1-04 还掉，还款记录在 1.6 和 1.4 的末尾，这里不再列为待办。
 
 - **S1-07 的背压：钩子齐了，动作没做。** Buffer 侧（`ReadResult::limit_reached` + 「返回时 `readable_bytes() <= high_water_mark`」）和 Connection 侧（`queue_bytes` 装不下整块就返回 false）都就位，`high_water_hits` 也在统计。缺的是 reactor 里那一步：**收到 `limit_reached` 就摘掉该 fd 的 EPOLLIN，等对端腾出空间再把读事件加回来**。现在的行为是撞水位后继续让 EPOLLOUT/EPOLLIN 挂着、靠 `forward_pending_requests` 返回 `kBlocked` 把字节留在原地——不丢数据，但也不压对端，所以「内存不继续增长」这条能过、「停止消费下游可读事件」那条不能过。这个缺口是我明知故留的：S1-04 的验收只打生命周期，把背压混进去会让两条结论互相解释不清。
-- **转发语义（S1-06）**：`on_downstream_readable` 里 `round.reject` 那一行现在只做一件事——关连接。它就是 ParseError→400/411/413/501 那张映射表将插入的位置，22 个错误码在 S1-03 就已经 `to_string` 齐了。响应侧目前完全不认识状态码、不判定截断、不做 chunked 框架的透传验证。
+- **转发语义（S1-06）**：已实现，记录在 1.14。`on_downstream_readable` 里 `round.reject` 那一行现在按 `reply_status_for_parse_error` 的映射表回自产响应；响应侧认状态码、认框架、判截断。留给 S1-07 的仍是同一条缺口：撞水位之后"摘掉 EPOLLIN 压回对端"的动作没有做。
 - **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
 - **多 Reactor + 上游连接池（S2）**：连接对象的销毁路径从 S1 就按"可能被别的线程持有"设计（六步关闭 + `retiring_`），`ReactorStats` 全原子也是给 TSan 留的基线——这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的具体支出。`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方。
 - **`filter/chain`（S1-08）**：空壳先立。验收标准是「新增 filter 不修改转发主路径的任何一行代码」——S1-04 之后主路径真的存在了（`forward_pending_requests` → `forward_request` → `pump_upstream_to_downstream`），所以这条验收现在才有意义：它检验的是"我能不能在不动这三条函数的情况下插进去"。

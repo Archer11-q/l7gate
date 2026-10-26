@@ -135,6 +135,7 @@ add_library(l7gate_core STATIC
   src/net/reactor.cc
   src/net/socket.cc
   src/http/request_parser.cc
+  src/http/response_framing.cc
   src/http/response_head.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
@@ -153,3 +154,7 @@ target_link_libraries(l7gate PRIVATE l7gate_core)
 
 enable_testing()
 add_subdirectory(tests)
+# 压测辅助可执行文件（SLO #1 的上游）。它跟着每个 preset 一起构建，包括
+# sanitizer 那几个——这不是浪费：sanitizer 构建下的它同样能跑，只是数字不能
+# 当 SLO 证据用（那条规矩写在 ENVIRONMENT.md 2.2：优化与插桩会改变被检测的东西）。
+add_subdirectory(tools)

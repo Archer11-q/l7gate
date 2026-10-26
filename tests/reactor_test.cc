@@ -294,6 +294,28 @@ class Client {
     }
   }
 
+  // 读到 EOF 为止，把**全部**收到的字节带回来。S1-06 的截断用例用它：
+  // 截断的响应按定义读不完整，任何"按框架齐了才算完"的读法都会把它判成失败。
+  // 返回 false 只有一种可能——超时且没断，那是"网关根本没表态"，必须红。
+  bool drain_to_eof(std::string* out, std::string* why) {
+    char buf[4096];
+    while (true) {
+      const ssize_t n = ::read(fd_, buf, sizeof(buf));
+      if (n > 0) {
+        out->append(buf, static_cast<std::size_t>(n));
+        continue;
+      }
+      if (n == 0) return true;
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        *why = "读超时：网关既没发完也没关闭";
+        return false;
+      }
+      *why = "read errno=" + std::to_string(errno);
+      return false;
+    }
+  }
+
  private:
   static constexpr int kReadTimeoutMs = 5000;
 
@@ -627,13 +649,22 @@ TEST(S1_04_Reactor, MalformedRequestClosesConnectionWithoutLeak) {
   ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(client.write_all("NOT HTTP AT ALL\r\n\r\n"));
 
-  // S1-04 的畸形处理只到"关连接"为止：不回 4xx（那是 S1-06 的映射表）。
-  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  // S1-04 当年这条只断"关连接"；S1-06 把 reject 映射成 4xx 之后，这里必须
+  // **先读到那条 400 再看到 EOF**。我特意改写而不是留着让它继续绿：留着的写法
+  // 是 `wait_for_eof`，而它遇到"先有字节、后是 FIN"会照样返回 true ——
+  // 一条绿着却什么都不证明的用例，比一条红的更糟。
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "畸形请求没有换来可定义的 4xx：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 400 Bad Request");
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "400 之后连接必须收尾（自产响应带 close）：" << why;
 
   ReactorStats& stats = harness.reactor()->stats();
   EXPECT_EQ(stats.load(stats.requests_rejected), 1u);
   EXPECT_EQ(stats.load(stats.requests_parsed), 0u);
   EXPECT_EQ(stats.load(stats.upstream_opened), 0u) << "畸形请求不该换来一条回源连接";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
   ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
   EXPECT_EQ(stats.load(stats.connections_constructed), 1u) << "只建了下游对象";
   EXPECT_EQ(stats.load(stats.connections_destructed), 1u);
@@ -1070,6 +1101,303 @@ TEST(S1_05_Reactor, TunnelSurvivesSplitResponseHead) {
   EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
   EXPECT_EQ(stats.load(stats.parse_calls), 1u)
       << "隧道之后的字节连一次解析尝试都不许发生（release 后也不许重建 scratch 再解析）";
+}
+
+// --- S1-06：响应语义面（逐字节一致 / 截断 / reject 映射 / close 边界） --------
+// 验收句逐条对应：
+//   「curl -v 经网关与直连上游：状态码、Content-Length、body 逐字节一致」
+//     → ProxiedResponseIsByteIdenticalToDirectUpstream（同一上游、同一请求字节，
+//       两条连接各取一次全响应，比对到**字节**而不是比对到"解析结果"）
+//   「上游返回 chunked 时，转发结果与直连一致」
+//     → ChunkedResponseIsByteIdenticalAndLeavesTheNextResponseAlone
+//       （顺带证明框架游标停在边界上：chunked 之后的下一条响应还能被完整取回）
+//   「上游中途断开时，网关返回可定义的 5xx，且不残留半包」
+//     → UpstreamDyingBeforeAnyResponseGetsDefined502
+//     → UpstreamDyingMidBodyIsTruncatedByEofWithoutASecondReply（分工见下）
+//     → EndlessResponseHeadIsKilledAtTheBudget
+//   「第一份 p99」→ 不在这里（wrk 跑在真实进程上，脚本取数后记进 TASKS.md）
+//
+// 截断的两条分支必须**分别**有用例，因为它们的表态方式根本不同：
+// 最终头没出去时网关还有资格自产 502；头已经出去了就只能以 EOF 表态——
+// 那时候再回一条 5xx 等于给同一个请求两条响应，那才是真正的"残留"。
+
+namespace {
+
+// 固定体的两种期望响应模板。写在这里而不是从上游的构造函数抄：用例必须
+// 能独立说出"我期望的字节长什么样"，否则上游改了模板我用例跟着改，
+// 一致就只是同一份代码的自证。
+std::string expected_cl_response(std::string_view body) {
+  return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
+         "\r\nConnection: keep-alive\r\n\r\n" + std::string(body);
+}
+
+std::string fixed_body_text() { return "0123456789"; }
+
+std::string fixed_request_text(std::size_t i) {
+  return "GET /r" + std::to_string(i) + " HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+}
+
+}  // namespace
+
+TEST(S1_06_Reactor, ProxiedResponseIsByteIdenticalToDirectUpstream) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  const std::string body = fixed_body_text();
+  harness.upstream().set_fixed_response_body(body);
+  const std::string expected = expected_cl_response(body);
+
+  // 基线：直连上游，发**同一串请求字节**。
+  Client direct;
+  ASSERT_TRUE(direct.connect_to(harness.upstream().port(), &why)) << why;
+  ASSERT_TRUE(direct.write_all(fixed_request_text(1)));
+  std::string direct_bytes;
+  ASSERT_TRUE(direct.read_exact(&direct_bytes, expected.size(), &why))
+      << "直连基线就没取满一条完整响应：" << why;
+  EXPECT_EQ(direct_bytes, expected) << "期望模板和对端的实际输出不一致：用例先失效了";
+
+  // 经网关。
+  Client via;
+  ASSERT_TRUE(via.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(via.write_all(fixed_request_text(1)));
+  std::string via_bytes;
+  ASSERT_TRUE(via.read_exact(&via_bytes, expected.size(), &why))
+      << "经网关没有取满同样长度的响应：" << why;
+
+  EXPECT_EQ(via_bytes, direct_bytes) << "验收句原文：与直连上游逐字节一致";
+  EXPECT_EQ(via_bytes, expected);
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.responses_completed), 1u) << "框架判定要给这条响应落下完结点";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "正常转发不许掺自产响应";
+  EXPECT_EQ(stats.load(stats.bytes_up_to_downstream),
+            static_cast<std::uint64_t>(expected.size()));
+
+  direct.close();
+  via.close();
+}
+
+TEST(S1_06_Reactor, ChunkedResponseIsByteIdenticalAndLeavesTheNextResponseAlone) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  const std::string body = fixed_body_text();
+  harness.upstream().set_fixed_response_body(body);
+
+  // 上游的 chunked 形态：10 字节的体切成 5 + 5，last-chunk 后跟空行。
+  const std::string expected =
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+      "5\r\n01234\r\n5\r\n56789\r\n0\r\n\r\n";
+  const std::string chunked_request =
+      "GET /chunked HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+
+  Client direct;
+  ASSERT_TRUE(direct.connect_to(harness.upstream().port(), &why)) << why;
+  ASSERT_TRUE(direct.write_all(chunked_request));
+  std::string direct_bytes;
+  ASSERT_TRUE(direct.read_exact(&direct_bytes, expected.size(), &why)) << why;
+  EXPECT_EQ(direct_bytes, expected);
+
+  Client via;
+  ASSERT_TRUE(via.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(via.write_all(chunked_request));
+  std::string via_bytes;
+  ASSERT_TRUE(via.read_exact(&via_bytes, expected.size(), &why))
+      << "chunked 没有逐字节透传：" << why;
+  EXPECT_EQ(via_bytes, direct_bytes) << "上游回 chunked 时转发结果必须与直连一致";
+
+  // 关键的第二半：chunked 的**终止空行之后**还有字节可读的话，那些字节属于
+  // 下一条响应。游标若多走一格，下一条响应的头就会被喂进框架判定并被吃掉，
+  // 表现是第二个请求挂住（不是报错）。这里用同一条连接再要一次来钉住它。
+  ReactorStats& stats = harness.reactor()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == 1u; }, 3000))
+      << "chunked 流的边界没有被认成完结点";
+  const std::uint64_t completed_at_boundary = stats.load(stats.responses_completed);
+
+  ASSERT_TRUE(via.write_all(fixed_request_text(2)));
+  std::string status;
+  std::string second_body;
+  ASSERT_TRUE(via.read_response(&status, &second_body, &why))
+      << "chunked 之后的第二条请求没有换来响应：框架游标越界吃掉了下一条响应的头";
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(second_body, body);
+  EXPECT_EQ(stats.load(stats.responses_completed), completed_at_boundary + 1u);
+  EXPECT_EQ(stats.load(stats.downstream_accepted), 1u) << "全程一条下游连接";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "chunked 之后复用同一条回源连接";
+
+  direct.close();
+  via.close();
+}
+
+TEST(S1_06_Reactor, UpstreamDyingBeforeAnyResponseGetsDefined502) {
+  const std::size_t fd_before = count_open_fds();
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all("GET /dies HTTP/1.1\r\nHost: gateway.test\r\n\r\n"));
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "上游一个字节的响应都没回，网关没有给出可定义的 5xx：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "502 之后这条配对连接必须收尾：" << why;
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.upstream_truncated_before_head), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_truncated_in_body), 0u) << "两个截断类别互斥";
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u) << "自产的 502 不是上游的响应";
+
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  EXPECT_EQ(stats.load(stats.connections_constructed), 2u) << "下游 + 一条已断的上游";
+  EXPECT_EQ(stats.load(stats.connections_destructed), 2u);
+  client.close();
+  harness.shutdown_all();
+  EXPECT_EQ(count_open_fds(), fd_before) << "502 那条配对留下没关的 fd";
+}
+
+TEST(S1_06_Reactor, UpstreamDyingMidBodyIsTruncatedByEofWithoutASecondReply) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  const std::string body = fixed_body_text();
+  harness.upstream().set_fixed_response_body(body);
+  const std::string full = expected_cl_response(body);
+  const std::size_t head_bytes = full.size() - body.size();
+  // 头 + 半条 body 之后断：最终头**已经**在客户端手里，网关此时没有任何资格
+  // 再产一条响应，只能让连接以 EOF 结束（客户端按 CL 判定"没读满"就是截断）。
+  harness.upstream().set_die_after_response_bytes(head_bytes + 4);
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(fixed_request_text(1)));
+
+  std::string got;
+  ASSERT_TRUE(client.drain_to_eof(&got, &why)) << why;
+  EXPECT_EQ(got, full.substr(0, head_bytes + 4))
+      << "已到达的字节必须原样交付；网关一个字节都不许多、不许少";
+  EXPECT_EQ(got.find("502"), std::string::npos)
+      << "头已透传还追加 5xx，就是给同一个请求两条响应";
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.upstream_truncated_in_body), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_truncated_before_head), 0u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "这一支网关不该自产任何响应";
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u) << "CL 没读满不算完结";
+
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  EXPECT_EQ(stats.load(stats.connections_constructed), 2u);
+  EXPECT_EQ(stats.load(stats.connections_destructed), 2u);
+  client.close();
+}
+
+TEST(S1_06_Reactor, EndlessResponseHeadIsKilledAtTheBudget) {
+  // 半包不是错误——但"大到不可能是合法头"是。这条用例把那条分界线钉住：
+  // 上游发 70 KiB 还没有终止串、而且**不关连接**。网关要么无限把字节往入向
+  // 缓冲里堆（内存放大口开给上游），要么在预算处判死。判死之后 502 依然合法，
+  // 因为最终头从没排给下游。
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all("GET /endless-head HTTP/1.1\r\nHost: gateway.test\r\n\r\n"));
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "永不完结的响应头没有被在预算处判死：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.upstream_truncated_before_head), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
+      << "判死之后配对连接没有收尾";
+  EXPECT_EQ(stats.load(stats.connections_constructed), 2u);
+  EXPECT_EQ(stats.load(stats.connections_destructed), 2u);
+  client.close();
+}
+
+TEST(S1_06_Reactor, RejectCodesKeepTheirOwnStatusCodesEndToEnd) {
+  // 映射表在** reactor 层**的可观测版本：framing_test 证的是表本身，这里证的是
+  // "表里的状态码真的从网关流到了客户端"，而且不同错误码给出不同状态码。
+  struct Case {
+    std::string request;
+    std::string_view expected_status;
+  };
+  const std::vector<Case> cases = {
+      {"NOT HTTP AT ALL\r\n\r\n", "HTTP/1.1 400 Bad Request"},
+      {"GET / HTTP/1.1\r\nHost: gateway.test\r\nHost: other\r\n\r\n", "HTTP/1.1 400 Bad Request"},
+      {"GET / HTTP/9.9\r\nHost: gateway.test\r\n\r\n", "HTTP/1.1 400 Bad Request"},
+      {"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+       "HTTP/1.1 501 Not Implemented"},
+      {"GET / HTTP/1.1\r\nHost: gateway.test\r\nX-Big: " + std::string(9000, 'a') +
+       "\r\n\r\n",
+       "HTTP/1.1 413 Content Too Large"},
+  };
+
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  for (std::size_t i = 0; i < cases.size(); ++i) {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << "第 " << i << " 条连接：" << why;
+    ASSERT_TRUE(client.write_all(cases[i].request));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why))
+        << "第 " << i << " 条畸形请求没有换来响应：" << why;
+    EXPECT_EQ(status, cases[i].expected_status) << "第 " << i << " 条错误码映射错了";
+    ASSERT_TRUE(client.wait_for_eof(&why)) << "第 " << i << " 条：错误响应之后必须收尾";
+    ReactorStats& stats = harness.reactor()->stats();
+    EXPECT_EQ(stats.load(stats.gateway_replies_sent), i + 1) << "自产响应要留可断言的计数";
+    EXPECT_EQ(stats.load(stats.upstream_opened), 0u) << "畸形请求一条都不该回源";
+    client.close();
+  }
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.requests_rejected), static_cast<std::uint64_t>(cases.size()));
+  EXPECT_EQ(stats.load(stats.requests_parsed), 0u);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+}
+
+TEST(S1_06_Reactor, ClosePairCompletesAtTheFramingBoundary) {
+  // S1-05 把 close 落成"意图 + EOF 级联"，并把"什么时候算响应完结"留给 S1-06。
+  // 这里兑现的是**完结点本身**：CL 读满那一刻 responses_completed 落 1，
+  // 截断计数器保持 0（读满不是截断），随后配对在这一点上收尾。
+  // 我不在这里断"是网关先关还是上游先关"——TestUpstream 认得 `Connection: close`
+  // 并会在这条响应后自己收尾，两种顺序都是合法时序，断言它们中的某一种
+  // 只会把测试绑到对端的脾气上（S1-05 的 take-once 教训，同一课）。
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(close_request_text(1)));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(body, expected_body(1));
+
+  ReactorStats& stats = harness.reactor()->stats();
+  // 内核级证据先行（响应已经收到），之后才等收尾计数 —— 观测纪律那条。
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "close 的响应完结后网关没收尾这条连接：" << why;
+  EXPECT_EQ(stats.load(stats.responses_completed), 1u) << "完结点必须由框架判定给出";
+  EXPECT_EQ(stats.load(stats.close_headers_honored), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_truncated_in_body), 0u) << "读满 CL 不是截断";
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  EXPECT_EQ(stats.load(stats.connections_constructed), 2u);
+  EXPECT_EQ(stats.load(stats.connections_destructed), 2u);
+  client.close();
 }
 
 }  // namespace

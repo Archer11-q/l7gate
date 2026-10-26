@@ -5,7 +5,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <poll.h>
 #include <sched.h>
 #include <string>
@@ -86,6 +88,14 @@ class TestUpstream {
   void set_response_body_bytes(std::size_t n) { response_body_bytes_ = n; }
   void set_delay_before_response_ms(int ms) { delay_ms_ = ms; }
   void set_close_after_first_response(bool on) noexcept { close_after_response_ = on; }
+  // S1-06 的逐字节一致验收需要"同一个字节序列被取两次"：一次直连、一次经网关。
+  // seq 编号会让两次取到不同的体，所以这里把体钉成固定串——钉死之后"一致"
+  // 才是可比命题。默认不开，S1-04/05 的用例继续用带 seq 的体（它们要的就是编号）。
+  void set_fixed_response_body(std::string body) { fixed_body_ = std::move(body); }
+  // 只发前 n 字节就断（n=0 → accept 后一个字节的响应都不发就关）。
+  // 请求路径带 /dies，或全局开关打开时对**所有**请求生效。它是"坏上游"的
+  // 可控版本：截断的位置由测试定，断的行为由内核定。
+  void set_die_after_response_bytes(std::size_t n) noexcept { die_after_bytes_ = n; }
 
  private:
   struct Client {
@@ -100,6 +110,9 @@ class TestUpstream {
     // 原样回显（一次 read 回一次，正好和"网关每事件搬一块"对齐）。测试对端
     // 在这里同样"不解析帧"：它证明的只是"另一端原样收到"，语义都在网关侧断言。
     bool tunneled = false;
+    // S1-06：这一条由上游**主动断掉**（坏上游的两种形态：不回话 / 回半条）。
+    // 断完之后本轮就把 client 摘掉，不让它带着 -1 的 fd 再进一次 poll 表。
+    bool hang_up = false;
   };
 
   void loop() {
@@ -139,7 +152,8 @@ class TestUpstream {
           serve_complete_requests(client);
         }
         const bool should_drop =
-            !alive || (close_after_response_ && client.served_any) ||
+            !alive || client.hang_up ||
+            (close_after_response_ && client.served_any) ||
             (client.closed_by_close_header && client.served_any);
         if (should_drop) {
           client.fd.close_now();
@@ -214,7 +228,66 @@ class TestUpstream {
       if (client.pending.size() < block_end + body_len) return;  // body 还没到齐
       const bool want_close = lower.find("connection: close") != std::string::npos;
       if (want_close) client.closed_by_close_header = true;
-      respond(client, build_response(want_close), block_end + body_len);
+
+      // S1-06 的故障与框架模式。判定口径只看请求 target 里的路径前缀——
+      // 上游不需要 HTTP 语义，只需要"看到不同路径回不同字节"，聪明留给网关。
+      const std::string_view target = first_line_target(headers);
+      // **顺序就是正确性**：/dies 是 /dies-mid-body 的前缀，先匹配短的那条，
+      // 长的那条永远轮不到——我第一次跑冒烟时"回半条 body"这一步实际打的是
+      // "一个字节都不回"的分支，而两边的断言恰好都能被"502 + 计数"糊过去。
+      // 前缀匹配表要么按长度降序排，要么改成全等比较；这里选降序并把它写下来。
+      if (target.rfind("/dies-mid-body", 0) == 0) {
+        // 头是完整的、body 只回一半就关——框架意义上的"截断在 body 中途"。
+        // 与 /dies 的区别就是这一刀落在最终头之后：网关此时已经剥夺了自产
+        // 5xx 的资格，只能以连接终止表态。用例要靠这两条分别打到两个分支。
+        const std::string payload = build_response(want_close);
+        const std::size_t head_end = payload.find("\r\n\r\n") + 4;
+        const std::size_t cut = head_end + (payload.size() - head_end) / 2;
+        echo_all(client, payload.substr(0, cut));
+        client.pending.erase(0, block_end + body_len);
+        client.hang_up = true;
+        return;
+      }
+      if (target.rfind("/dies", 0) == 0) {
+        // 断在声明之外：一个字节响应都不发就关（截断在头之前）。
+        client.hang_up = true;
+        return;
+      }
+      if (target.rfind("/chunked", 0) == 0) {
+        respond(client, build_chunked(), block_end + body_len);
+        if (client.closed_by_close_header) return;
+        continue;
+      }
+      if (target.rfind("/bad-chunk", 0) == 0) {
+        // 合法的 chunked 头 + 非法的框架字节（非 hex 的 size 行）。
+        respond(client, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        "ZZ\r\n",
+                block_end + body_len);
+        if (client.closed_by_close_header) return;
+        continue;
+      }
+      if (target.rfind("/endless-head", 0) == 0) {
+        // 一个**永远不会齐**的响应头：超过网关的响应头预算仍没有终止串，而且
+        // 不关连接。这是"慢上游"和"坏上游"的分界线——半包本身不是错误，
+        // 只有当它大到不可能是合法头时才允许判死（否则正常的慢上游会被 502 错杀）。
+        std::string huge = "HTTP/1.1 200 OK\r\nX-Pad: ";
+        huge.append(70u * 1024u, 'p');  // 70 KiB > 默认 64 KiB 的响应头预算
+        echo_all(client, huge);
+        client.pending.erase(0, block_end + body_len);  // 请求要消费掉，否则这个循环永不退出
+        requests_served_.fetch_add(1, std::memory_order_relaxed);
+        return;  // 一条请求换来一段永不完结的头，本轮到此为止
+      }
+
+      std::string payload = build_response(want_close);
+      if (die_after_bytes_ < payload.size()) {
+        // 全局断链模式：只发前 die_after_bytes_ 字节就关（0 时一个字节的响应都不发）。
+        // 截断的**位置**由测试定，断的**动作**由内核的 FIN 完成——这条分工让
+        // "头之前断"和"body 中途断"两个分支能用同一个旋钮打出来。
+        if (die_after_bytes_ > 0) echo_all(client, payload.substr(0, die_after_bytes_));
+        client.hang_up = true;
+        return;
+      }
+      respond(client, payload, block_end + body_len);
       if (client.closed_by_close_header) return;  // 收尾由外层 should_drop 兑现
     }
   }
@@ -258,15 +331,62 @@ class TestUpstream {
   }
 
   std::string build_response(bool close_after) {
+    // 计数在两种模式下都要落："服务过几条"是测试侧的独立证据，不该因为
+    // 体被钉成固定串就消失（那样经网关/直连比对的两条请求就不在任何账上了）。
     const std::uint64_t seq = requests_served_.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::string body = "seq=" + std::to_string(seq);
-    while (body.size() < response_body_bytes_) body += '.';
-    body.resize(response_body_bytes_);
+    std::string body;
+    if (!fixed_body_.empty()) {
+      body = fixed_body_;
+    } else {
+      body = "seq=" + std::to_string(seq);
+      while (body.size() < response_body_bytes_) body += '.';
+      body.resize(response_body_bytes_);
+    }
     if (delay_ms_ > 0) {
       ::usleep(static_cast<useconds_t>(delay_ms_) * 1000u);
     }
     return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
            "\r\nConnection: " + (close_after ? "close" : "keep-alive") + "\r\n\r\n" + body;
+  }
+
+  // S1-06 的 chunked 模板：两段 + last-chunk + 空行。体由 response_body_bytes_
+  // 决定并**按声明长度切分**，这样"chunk 之和 == 体长"这件事不需要用例再核对一遍。
+  std::string build_chunked() {
+    const std::uint64_t seq = requests_served_.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::string body;
+    if (!fixed_body_.empty()) {
+      body = fixed_body_;
+    } else {
+      body = "seq=" + std::to_string(seq);
+      while (body.size() < response_body_bytes_) body += '.';
+      body.resize(response_body_bytes_);
+    }
+    const std::size_t half = body.size() / 2;
+    char size_buf[32];
+    std::string out = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                      "Connection: keep-alive\r\n\r\n";
+    std::snprintf(size_buf, sizeof(size_buf), "%zX\r\n", half);
+    out += size_buf;
+    out += body.substr(0, half);
+    out += "\r\n";
+    std::snprintf(size_buf, sizeof(size_buf), "%zX\r\n", body.size() - half);
+    out += size_buf;
+    out += body.substr(half);
+    out += "\r\n";
+    out += "0\r\n\r\n";
+    return out;
+  }
+
+  // 请求行的第二格就是 target。上游不做解析，只认前缀。
+  static std::string_view first_line_target(const std::string& headers) {
+    const std::size_t line_end = headers.find("\r\n");
+    const std::string_view line(headers.data(),
+                                line_end == std::string::npos ? headers.size() : line_end);
+    const std::size_t sp1 = line.find(' ');
+    if (sp1 == std::string_view::npos) return {};
+    const std::size_t sp2 = line.find(' ', sp1 + 1);
+    if (sp2 == std::string_view::npos) return {};
+    return line.substr(sp1 + 1, sp2 - sp1 - 1);
   }
 
   // 隧道回显：和 respond 同一套"有上限自旋"的写法——一个不再读的对端不能把这个
@@ -328,6 +448,8 @@ class TestUpstream {
   std::size_t response_body_bytes_ = 64;
   int delay_ms_ = 0;
   bool close_after_response_ = false;
+  std::string fixed_body_;
+  std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
 };
 
 }  // namespace l7gate::testing

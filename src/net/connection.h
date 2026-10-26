@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "http/request_parser.h"
+#include "http/response_framing.h"
 #include "net/buffer.h"
 #include "net/fd.h"
 #include "net/stats.h"
@@ -106,6 +107,12 @@ class Connection {
   // 调用方必须据此停止从对端继续读 —— 这就是 S1-07 背压的入口。
   bool queue_bytes(const void* data, std::size_t len) noexcept;
 
+  // 尽力排入，最多 len，返回**实际排入**的字节数（0 = 一点都放不下）。
+  // 只允许用在"字节边界自由"的路径上——响应 body 透传。头必须整块排
+  // （queue_bytes），因为半截头会让对端收到无法解析的响应：截不截断
+  // 的权力在调用方的框架知识里，不在这个函数里。
+  std::size_t queue_bytes_partial(const void* data, std::size_t len) noexcept;
+
   // --- 事件入口 ---------------------------------------------------------
   ReadRound on_readable();
   WriteRound on_writable();
@@ -179,6 +186,41 @@ class Connection {
   // 游标夹到当前末尾，下一次从"新字节 - 3"处续扫）。
   std::size_t detect_response_head_101() noexcept;
 
+  // --- 响应跟踪（S1-06）--------------------------------------------------
+  // 上游侧"正在收的这条响应"的状态。它是纯数据：判定来自 http/response_framing，
+  // 推进只发生在 reactor 的上游路径（唯一读写方），Connection 自己不消费它——
+  // 和隧道三态同一个分工：对象存状态，策略归 reactor。
+  // 生命周期：初始 kHead；pump 逐条响应推进 kHead→kBody→kComplete；kComplete 且
+  // 缓冲里还有字节（pipelining / keep-alive 下一条响应）时 reactor 负责重置。
+  // 上游连接复用期不存在"跨请求残留"：每条配对连接在 S1 只可能有一条在途响应
+  // 序列，重置点全在 reactor 手里，写死在 pump_response 的循环里。
+  enum class ResponsePhase : std::uint8_t { kHead, kBody, kComplete };
+  struct ResponseTracking {
+    ResponsePhase phase = ResponsePhase::kHead;
+    http::ResponseFraming framing = http::ResponseFraming::kHeadIncomplete;
+    std::size_t declared_body_bytes = 0;  // 观测用（kContentLength 时）
+    std::size_t body_remaining = 0;       // kContentLength：还差几字节算完结
+    http::ChunkedProgress chunked;        // kChunked：框架边界游标
+    // 截断分类的边界证据：**最终**响应头有没有已经排进下游出向。
+    // false → 网关还能自己产一个 502；true → 只能以 EOF 表态（头都发出去了，
+    // 再回 5xx 就是两条响应）。1xx 中间响应不算"头已发出"这个表态能力——
+    // 见 response_framing.h 的 kProvisional 注释，502 跟在 1xx 之后依然合法。
+    bool final_head_forwarded = false;
+  };
+  ResponseTracking& response_tracking() noexcept { return resp_; }
+  const ResponseTracking& response_tracking() const noexcept { return resp_; }
+  // 重置到"下一条响应"的起点。顺带清头扫描游标——可读区起点被 consume 挪动后，
+  // 旧游标指向的已经不是这条响应的头了，留着它就又是一个"需要记得同步"的隐藏状态。
+  void reset_response_tracking() noexcept {
+    resp_ = {};
+    head_scan_pos_ = 0;
+  }
+
+  // 通用响应头检测（任何状态行）：可读区开头存在完整头（CRLFCRLF 恰好闭合）
+  // 时返回含终止串的头字节数，未齐返回 npos。与 detect_response_head_101 共用
+  // 同一个游标——它们回答的是同一个问题的两种收尾："头在哪结束"。
+  std::size_t detect_response_head() noexcept;
+
   // 隧道模式的字节入口：只把 fd 上的字节读进入向缓冲（读到 EAGAIN / 撞水位
   // 为止，ET 契约不变），**不解析、不产生任何 HTTP 语义**。
   Buffer::ReadResult read_raw() noexcept;
@@ -222,6 +264,8 @@ class Connection {
   bool close_after_forward_ = false;
   bool close_after_response_ = false;
   bool tunneling_ = false;
+  // 响应跟踪（S1-06）：纯数据，判定与推进全在 reactor 的上游路径（见上面注释）。
+  ResponseTracking resp_;
   // 已解析出一个完整请求、但调用方还没 finish_request。挡住重复解析，
   // 否则 requests_parsed 会随下一批字节到达而虚高。
   bool request_ready_ = false;

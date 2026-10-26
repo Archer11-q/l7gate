@@ -123,7 +123,20 @@ class Reactor {
   // 由本函数决定落到哪条连接、何时置 kClosing。判定不碰字节：转发出去的仍是原始请求。
   bool forward_request(const std::shared_ptr<Connection>& downstream,
                        std::size_t request_bytes, bool upgrade, bool close_after);
-  void pump_upstream_to_downstream(const std::shared_ptr<Connection>& upstream);
+  // 响应语义泵（S1-06）：上游入向缓冲里的字节按"当前响应的阶段"过一遍框架判定
+  // （http/response_framing 的纯函数），然后透传——头整块排（半个头排出去就是把
+  // 畸形喂给客户端），body 按框架边界拆散排（截断的权力在框架知识，不在这条泵）。
+  // 它取代了 S1-04/05 的 pump_upstream_to_downstream（整块透传，无框架判定）。
+  // 隧道路径不经过这里（ADR-09）。
+  void pump_response(const std::shared_ptr<Connection>& upstream);
+
+  // reject → 4xx（S1-06）：把 gateway_error_reply(status) 排进下游出向，然后
+  // **不对称**关闭配对——上游 kDiscardOutbound（它接到的可能是半条请求，没有
+  // 值得发的货），下游 kFlushThenClose（4xx 还躺在它的出向里）。先手工把两侧
+  // 的 peer_fd_ 解开，否则 close_connection 的级联会把同一个 why 传染给对端，
+  // 下游的 4xx 就跟着被丢掉了。
+  void fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
+                            std::uint16_t status);
 
   // 隧道泵（S1-05）：不解析、不改写、不重新分帧，把 src 入向缓冲里的全部可读
   // 字节整块搬进 dst 的出向缓冲。装不下（出向水位）就一个字节都不搬——和请求侧

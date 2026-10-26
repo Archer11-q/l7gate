@@ -59,8 +59,14 @@ void usage(std::FILE* out) {
       "l7gate_test_upstream —— 冒烟/联调用极简上游（只服务测试，不参与任何 SLO 测量）\n"
       "用法: l7gate_test_upstream [--listen <ipv4:port>]   (端口 0 = 内核选，默认)\n"
       "               [--body-bytes N] [--delay-ms N] [--close-after-first-response]\n"
+      "               [--fixed-body TEXT]\n"
       "行为: 凑齐一个完整请求（\\r\\n\\r\\n 再加 Content-Length 那么多 body）就回一段\n"
       "      Content-Length 已知的 200，正文形如 seq=<累计条数>....，序号用来发现串号。\n"
+      "--fixed-body 把正文钉成同一个字符串：S1-06 要证\"直连与经网关逐字节一致\"，\n"
+      "      带 seq 的两次取值本来就不同，钉死之后\"一致\"才是可比命题。\n"
+      "路径前缀决定响应形态（/dies 不回话就关、/dies-mid-body 回半条 body 就关、\n"
+      "      /chunked 回 chunked、/bad-chunk 回坏框架、/endless-head 回永不齐的头），\n"
+      "      其余走默认模板。上游只需要\"看路径回不同字节\"，聪明留给网关。\n"
       "单线程 + poll：--delay-ms 会同时拖住它的所有客户端，这正是\"上游比下游慢\"\n"
       "那个场景要的行为，不是缺陷。\n");
 }
@@ -73,6 +79,7 @@ int main(int argc, char** argv) {
   long body_bytes = 64;
   long delay_ms = 0;
   bool close_after = false;
+  std::string fixed_body;  // 空 = 不钉，继续用带 seq 的模板体
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -94,6 +101,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "参数错误: --delay-ms 要的是 0..60000，收到 %s\n", value);
         return 2;
       }
+      ++i;
+    } else if (flag == "--fixed-body" && value != nullptr) {
+      fixed_body = value;
       ++i;
     } else if (flag == "--close-after-first-response") {
       close_after = true;
@@ -117,14 +127,15 @@ int main(int argc, char** argv) {
   upstream.set_response_body_bytes(static_cast<std::size_t>(body_bytes));
   upstream.set_delay_before_response_ms(static_cast<int>(delay_ms));
   upstream.set_close_after_first_response(close_after);
+  if (!fixed_body.empty()) upstream.set_fixed_response_body(fixed_body);
   std::string failure;
   if (!upstream.start(&failure, listen_address, listen_port)) {
     std::fprintf(stderr, "上游启动失败: %s\n", failure.c_str());
     return 1;
   }
-  std::printf("[upstream] 监听 %s:%u body=%ld delay=%ldms close_after=%d\n", listen_address.c_str(),
-              static_cast<unsigned int>(upstream.port()), body_bytes, delay_ms,
-              close_after ? 1 : 0);
+  std::printf("[upstream] 监听 %s:%u body=%ld delay=%ldms close_after=%d fixed=%d\n",
+              listen_address.c_str(), static_cast<unsigned int>(upstream.port()), body_bytes,
+              delay_ms, close_after ? 1 : 0, fixed_body.empty() ? 0 : 1);
   std::fflush(stdout);
 
   while (!g_stop_requested.load(std::memory_order_relaxed)) {
