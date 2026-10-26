@@ -31,10 +31,13 @@
 
 **仓库状态**（S1 门禁收尾时）：**S1 的八个任务全部 DONE**。S1-07 在 `68f1823`（+ 一条执行位修正 `33923d2`，`sed -i` 会新建文件并把 `chmod +x` 抹掉——下面第二条纪律讲的就是这个），S1-08 在 `477a45c`；本段与 `docs/ROADMAP.md` 是紧随其后的**门禁提交**。**push 已按你的授权执行**：`5093ab3..4ba422b`（16 个提交，含 S1-07/S1-08/门禁文档）与 `4ba422b..57ef77d`（三项裁决）都已在 `origin/main`；下一次 push 我仍然先问——门禁收尾是一次性授权，不是长期授权。三 preset 各 **112/112**、非 gtest 警告 **0 条**（S1-07 那一轮是 104/104，S1-08 之后重跑）。套件构成 14 个：6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 个 101 判定 + 19 响应框架纯函数 + 7 S1-06 闭环 + **4 S1_07_Backpressure + 6 S1_08_FilterChain + 2 S1_08_FilterReactor** = 112。
 
+**搬家记录（2026-10-26 23:2x，用户要求）**：仓库从 `/home/archer/l7gate` 平移到 **`/home/archer/workspace/l7gate`**（同发行版、同 ext4 设备 `/dev/sdf`，所以契约 9.4 的条件与全部历史数字继续成立）。代价与处置：① 7 个脚本开头硬编码的 `cd /home/archer/l7gate` 全部改成由脚本自身位置推导（`cd "$(dirname "$(readlink -f "$0")")/.."`，`bench/` 下是 `/../..`），`env-snapshot.sh` 里那条 `findmnt -T /home/archer/l7gate` 改成 `-T .`——它正是契约 9.4 的 ext4 证据行，留死路径等于留一颗雷；② 四个 preset 的 build 树全部作废重建（CMake cache 里都是绝对路径），`build/bench/` 与 `build/smoke-s1-0{4,6,7}/` 这些**压测与冒烟证据目录原地保留**，所以 B-001…B-005 引用的相对路径一条没失效；③ 文档侧改了 TASKS 交接段、ROADMAP 复现命令、ENVIRONMENT §6；④ `.idea/workspace.xml` 里仍是旧 UNC 路径，**这一条要用户在 CLion 里用新路径重新打开工程来解决**，我不手改 IDE 的状态文件。
+**复跑证据（搬家当天，全部在新路径上）**：`verify-all-presets.sh` → debug / asan-ubsan / tsan 各 **112/112**、非 gtest 警告 **0 条**（clang 两个 preset 的 `warning_total=1` 是已登记的 gtest `-Wcharacter-conversion` 第三方噪声，见 ARCHITECTURE 第 4 节）；三个冒烟脚本 `✗` 计数均为 0、退出码 0（s1-04 真 curl 10000 请求 3.15 s）；`--self-check` 一行正常。**最硬的一条：新路径上重新构建的 `build/release/l7gate` 的 sha256 前缀是 `fc29b40f49e22bfa`，与搬家前 B-004/B-005 记录的那个值逐字符相同**——构建产物不受仓库位置影响，这条比"我看起来一切正常"强得多，因为它排除了"搬家悄悄改了编译参数或链接了旧对象"这一整类可能。
+
 **一条命令拿到今天的门禁证据**（必须在 WSL 原生文件系统内跑，不能在 `/mnt/d`）：
 
 ```bash
-cd /home/archer/l7gate
+cd /home/archer/workspace/l7gate
 bash scripts/verify-all-presets.sh                       # 三 preset 构建 + ctest 112/112 + 我方警告计数
 PRESET=debug ./scripts/smoke-s1-04.sh                    # 真 curl 10000：fd/存活连接/字节数全绿
 PRESET=debug ./scripts/smoke-s1-06.sh                    # 八阶段：逐字节一致 / chunked / 两类截断 / 坏框架 / 映射表

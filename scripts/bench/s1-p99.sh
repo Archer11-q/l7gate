@@ -20,7 +20,7 @@
 #       DURATION=5s WARMUP=1s scripts/bench/s1-p99.sh   # 只用来验证脚本本身，
 #       # 输出会在文件头写「非标准口径」，别把它抄进 BENCHMARK.md
 set -uo pipefail
-cd /home/archer/l7gate || exit 1
+cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 
 BIN="build/release"
 GATEWAY="$BIN/l7gate"

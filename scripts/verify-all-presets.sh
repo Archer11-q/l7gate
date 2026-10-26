@@ -2,7 +2,7 @@
 # 三 preset 全量构建 + ctest，并统计我方代码警告与第三方噪声警告。
 # 用途：任务收尾时的一次性验证，结论写进 TASKS.md 的「实测数字」列。
 set -uo pipefail
-cd /home/archer/l7gate || exit 1
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 
 for p in debug asan-ubsan tsan; do
   cfg=/tmp/l7_${p}_cfg.log

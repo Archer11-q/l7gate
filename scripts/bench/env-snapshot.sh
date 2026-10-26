@@ -10,7 +10,7 @@
 # 排版给人看的部分归 BENCHMARK.md，这份是给机器核对的。
 set -uo pipefail
 
-cd /home/archer/l7gate || exit 1
+cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 OUT_DIR="${OUT_DIR:-build/bench/env}"
 mkdir -p "$OUT_DIR" || exit 1
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
@@ -70,7 +70,7 @@ k() { printf '%-28s = %s\n' "$1" "$2"; }
   k git_dirty "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 
   # --- 仓库所在文件系统：契约 9.4 的硬约束（9P 抖动会直接进 p99） ---------
-  k repo_device "$(findmnt -no FSTYPE -T /home/archer/l7gate 2>/dev/null || echo 不可读)"
+  k repo_device "$(findmnt -no FSTYPE -T . 2>/dev/null || echo 不可读)"
   k repo_note "必须是 ext4/WSL 原生；9p/drvfs 上的数字既不属于网关也不属于 Nginx（契约 9.4）"
 
   # --- 构建产物：release 才是 BENCHMARK 允许的那一个 ----------------------

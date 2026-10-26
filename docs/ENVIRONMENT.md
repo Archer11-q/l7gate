@@ -154,7 +154,7 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 
 ## 6. 文件系统位置（会影响数据的一条）
 
-仓库与全部构建、压测都在 WSL 原生 ext4 内。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\l7gate` 形式）查看和编辑同一批文件。
+仓库与全部构建、压测都在 WSL 原生 ext4 内。当前仓库位置是 `/home/archer/workspace/l7gate`（2026-10-26 从 `/home/archer/l7gate` 平移进来，同发行版同文件系统，所以契约 9.4 的条件与全部历史数字继续成立；搬家的代价与复跑记录见 TASKS 交接段的「搬家」一条）。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\workspace\l7gate` 形式）查看和编辑同一批文件。
 
 把构建或压测放到 `/mnt/c`、`/mnt/d` 这类 drvfs/9P 挂载点是禁止的：9P 的 IO 抖动会直接进 p99/p999，测出来的数既不属于网关也不属于 Nginx。详细理由记在契约第 9.4 节。
 

@@ -28,7 +28,7 @@
 ### 一键复现门禁
 
 ```bash
-cd /home/archer/l7gate                      # 必须在 WSL 原生 ext4 内（契约 9.4）
+cd /home/archer/workspace/l7gate                      # 必须在 WSL 原生 ext4 内（契约 9.4）
 bash scripts/verify-all-presets.sh          # 三 preset 各 112/112 + 非 gtest 警告 0 条
 PRESET=debug bash scripts/smoke-s1-04.sh    # 真 curl 10000：fd 回基线、live=0、constructed==destructed
 PRESET=debug bash scripts/smoke-s1-06.sh    # 八阶段逐字节/截断/坏框架/映射表

@@ -32,7 +32,7 @@
 # 输出：build/bench/s2-nginx-<stamp>/（每档 wrk 原始输出 + nginx 配置 + summary.txt）
 # 退出码：0 = 五档全部跑完且每档 non-2xx=0；任何一档塌了就是非 0（判定不成立）。
 set -uo pipefail
-cd /home/archer/l7gate || exit 1
+cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 
 BIN="build/release"
 GATEWAY="$BIN/l7gate"

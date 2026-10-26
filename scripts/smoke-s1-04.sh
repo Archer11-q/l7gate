@@ -10,7 +10,7 @@
 # 用法：PRESET=debug scripts/smoke-s1-04.sh
 # 输出：build/smoke-s1-04/ 里的日志 + fd 曲线；退出码 0 = 全部通过。
 set -uo pipefail
-cd /home/archer/l7gate || exit 1
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 
 PRESET="${PRESET:-debug}"
 BIN="build/$PRESET"
