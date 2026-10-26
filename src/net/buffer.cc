@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace l7gate::net {
@@ -42,11 +43,15 @@ Buffer::Buffer(Buffer&& other) noexcept
       read_pos_(other.read_pos_),
       write_pos_(other.write_pos_),
       peak_capacity_(other.peak_capacity_),
+      generation_(other.generation_),
       read_hint_(other.read_hint_) {
   other.read_pos_ = 0;
   other.write_pos_ = 0;
   other.peak_capacity_ = 0;
   other.read_hint_ = 0;
+  // 移动换了 storage_ 的地址，别人手里指向旧地址的 view 当场作废。
+  other.invalidate_views();
+  invalidate_views();
 }
 
 Buffer& Buffer::operator=(Buffer&& other) noexcept {
@@ -56,11 +61,14 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
     read_pos_ = other.read_pos_;
     write_pos_ = other.write_pos_;
     peak_capacity_ = other.peak_capacity_;
+    generation_ = other.generation_;
     read_hint_ = other.read_hint_;
     other.read_pos_ = 0;
     other.write_pos_ = 0;
     other.peak_capacity_ = 0;
     other.read_hint_ = 0;
+    other.invalidate_views();
+    invalidate_views();
   }
   return *this;
 }
@@ -79,13 +87,17 @@ std::pair<std::uint8_t*, std::size_t> Buffer::writable_region(std::size_t hint) 
   // 读空了就把两个指针拉回起点。这一步顺手做的收益很大：
   // 稳态 keep-alive 下 buffer 会反复"写满→读空"，不做归零就会一路 memmove/扩容。
   if (read_pos_ == write_pos_) {
-    read_pos_ = 0;
-    write_pos_ = 0;
+    if (read_pos_ != 0) {
+      read_pos_ = 0;
+      write_pos_ = 0;
+      invalidate_views();
+    }
     // 突发流量过后要能把容量还回去。不还的话，一条曾经传过大 body 的连接
     // 会终身占着那块内存 —— 而对 100k 长连接来说，"终身"就是稳态本身。
     // 阈值取 2 倍初始容量，避免在 1 倍上下反复 realloc 抖动。
     if (storage_.size() > config_.initial_capacity * 2) {
       storage_.resize(config_.initial_capacity);
+      invalidate_views();
     }
   }
 
@@ -95,6 +107,7 @@ std::pair<std::uint8_t*, std::size_t> Buffer::writable_region(std::size_t hint) 
     std::memmove(storage_.data(), storage_.data() + read_pos_, live);
     read_pos_ = 0;
     write_pos_ = live;
+    invalidate_views();
   }
 
   // 只在**真满了**的时候才扩容。
@@ -110,6 +123,10 @@ std::pair<std::uint8_t*, std::size_t> Buffer::writable_region(std::size_t hint) 
     if (target > storage_.size()) {
       storage_.resize(target);
       record_peak();
+      // 扩容换了 storage_ 的地址，所有指进来的 view 当场作废。这一条是
+      // generation 存在的主要理由：解析器给出的 view 与"下一次读"之间
+      // 谁都可能触发它。
+      invalidate_views();
     }
   }
 
@@ -172,9 +189,45 @@ Buffer::ReadResult Buffer::read_until_blocked(int fd) {
   return result;
 }
 
+Buffer::WriteResult Buffer::write_to_fd(int fd) {
+  WriteResult result;
+  while (readable_bytes() > 0) {
+    const ssize_t n = ::send(fd, readable_data(), readable_bytes(), MSG_NOSIGNAL);
+    ++result.write_syscalls;
+    if (n > 0) {
+      result.bytes_written += static_cast<std::size_t>(n);
+      read_pos_ += static_cast<std::size_t>(n);
+      invalidate_views();
+      continue;
+    }
+    if (n == 0) {
+      // send() 在流套接字上返回 0 不是"对端关了"（那是 recv 的语义），内核文档里
+      // 它意味着这次没写出去。按 would_block 处理并结束本轮：如果把它当成功继续循环，
+      // 这里就是一个不消耗任何数据的忙循环，而它的表现是 CPU 100%、不是报错。
+      result.would_block = true;
+      break;
+    }
+    const int e = errno;
+    if (e == EINTR) continue;
+    if (e == EAGAIN || e == EWOULDBLOCK) {
+      result.would_block = true;
+      break;
+    }
+    if (e == EPIPE || e == ENOTCONN || e == ECONNRESET) {
+      result.peer_closed = true;
+      result.errno_value = e;  // 归一成"对端不在了"，但真码留着给日志
+      break;
+    }
+    result.errno_value = e;
+    break;
+  }
+  return result;
+}
+
 bool Buffer::consume(std::size_t n) {
   if (n > readable_bytes()) return false;
   read_pos_ += n;
+  invalidate_views();
   return true;
 }
 
@@ -183,6 +236,7 @@ std::size_t Buffer::retrieve(void* out, std::size_t n) {
   if (take > 0) {
     std::memcpy(out, readable_data(), take);
     read_pos_ += take;
+    invalidate_views();
   }
   return take;
 }
@@ -190,12 +244,14 @@ std::size_t Buffer::retrieve(void* out, std::size_t n) {
 bool Buffer::peek_consume(std::size_t n) {
   if (n > readable_bytes()) return false;
   read_pos_ += n;
+  invalidate_views();
   return true;
 }
 
 void Buffer::clear() noexcept {
   read_pos_ = 0;
   write_pos_ = 0;
+  invalidate_views();
 }
 
 }  // namespace l7gate::net

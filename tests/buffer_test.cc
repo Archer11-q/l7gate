@@ -3,6 +3,7 @@
 #include "pipe_fixture.h"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -301,6 +302,111 @@ TEST(S1_02_Buffer, PeakCapacityUnderOneKiBKeepAliveWorkload) {
               buf.capacity(), buf.peak_capacity(), buf.capacity(), rounds_with_syscall_gt1);
   EXPECT_EQ(buf.peak_capacity(), 4096u);
   EXPECT_EQ(buf.capacity(), 4096u);
+}
+
+// --- 写出侧（S1-04 随事件循环一起加的能力，测试留在 Buffer 套件旁边）------
+//
+// 套件名故意不叫 S1_02_Buffer：那个名字钉着 S1-02 收尾时的 15/15，
+// 把新用例塞进去会让已完成任务的实测数字变成历史不可复现的东西。
+
+TEST(S1_04_BufferWrite, WritesUntilWouldBlockAndConsumesOnlyWhatLeft) {
+  // 对端必须是 socket，不能是管道：write_to_fd 走 ::send(fd, ..., MSG_NOSIGNAL)，
+  // 而 send() 只对 socket 成立 —— 我第一版用 PipeFixture 写这条，它失败在
+  // errno_value=88（ENOTSOCK），而不是断言的缓冲逻辑有问题。
+  // 修法换的是测试对端，不是往生产代码里加一条"fd 不是 socket 就改用 write()"的
+  // 分支：生产路径的 fd 全部来自 accept()/connect()，那条分支永远跑不到，
+  // 只会把 ENOTSOCK 伪装成"我测过的代码"。
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+  const int wfd = fds[0];
+  const int rfd = fds[1];
+
+  // 让"写不完"成为必然而不是碰运气：先读回内核对这条 socket 的发送缓冲，
+  // 再保证负载显著大于它。SO_SNDBUF 的实际值会被内核抬到最小值以上，
+  // 所以我不断言它等于我设的数，只断言负载 > 2 × 读回值 —— 环境差异留在
+  // 读回的数里，不进断言。
+  int want = 16384;
+  (void)::setsockopt(wfd, SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
+  int sndbuf = 0;
+  socklen_t optlen = sizeof(sndbuf);
+  ASSERT_EQ(::getsockopt(wfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen), 0);
+  ASSERT_GT(sndbuf, 0);
+
+  const std::vector<std::uint8_t> payload(512u << 10, 0x5Au);  // 512 KiB
+  ASSERT_GT(payload.size(), static_cast<std::size_t>(sndbuf) * 2)
+      << "负载没有明显超过对端发送缓冲，would_block 就成了碰运气；sndbuf=" << sndbuf;
+
+  Buffer buf;
+  ASSERT_EQ(append_all(buf, payload.data(), payload.size()), payload.size());
+  ASSERT_EQ(buf.readable_bytes(), payload.size());
+
+  const auto result = buf.write_to_fd(wfd);
+  EXPECT_GT(result.bytes_written, 0u);
+  EXPECT_TRUE(result.would_block) << "对端发送缓冲已满，必须撞 EAGAIN";
+  EXPECT_EQ(result.errno_value, 0);
+  // 关键不变量：只有**真正发出去**的字节才被消费。多消费一个字节就是丢数据。
+  EXPECT_EQ(buf.readable_bytes(), payload.size() - result.bytes_written);
+  // ≥2 次 syscall 才是"撞过 EAGAIN"的证据：一次就返回意味着它自认为写完了全部，
+  // 那和 would_block 矛盾。上界我不断言——内核发送缓冲的精确大小受实现影响，
+  // 拿 sndbuf 反推次数会把一个环境差异变成测试失败。
+  EXPECT_GE(result.write_syscalls, 2u);
+
+  // 排空：读掉对端再写，直到写空。
+  std::vector<std::uint8_t> sink(64u << 10);
+  Buffer::WriteResult tail;
+  do {
+    const ssize_t n = ::read(rfd, sink.data(), sink.size());
+    if (n > 0) { /* 排空内核缓冲 */ }
+    tail = buf.write_to_fd(wfd);
+  } while (buf.readable_bytes() > 0 && !tail.peer_closed && tail.errno_value == 0);
+
+  EXPECT_EQ(buf.readable_bytes(), 0u) << "排空后必须全部写出：bytes_written 之和要等于负载长度";
+  ::close(wfd);
+  ::close(rfd);
+}
+
+TEST(S1_04_BufferWrite, WriteAfterPeerGoneReportsPeerClosedNotCrash) {
+  // 这条用例真正的价值在于 MSG_NOSIGNAL。少了它，send() 对已关闭的对端会发
+  // SIGPIPE，默认动作是**杀死进程**——测试的表现不是失败断言而是整个二进制挂掉。
+  // 我把它写成一条普通用例而不是"手动验证"，因为这条路径在压测里每天跑几百次
+  // （客户端中途断连），而它的失效方式是进程消失。
+  int fds[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+  const int wfd = fds[0];
+  ::close(fds[1]);  // 对端立刻消失
+
+  Buffer buf;
+  const std::vector<std::uint8_t> payload(64, 0x11u);
+  ASSERT_EQ(append_all(buf, payload.data(), payload.size()), payload.size());
+
+  const auto result = buf.write_to_fd(wfd);
+  EXPECT_TRUE(result.peer_closed);
+  EXPECT_EQ(result.errno_value, EPIPE);
+  EXPECT_EQ(result.bytes_written, 0u);
+  ::close(wfd);
+}
+
+TEST(S1_04_BufferWrite, GenerationOnlyMovesWhenViewsActuallyDie) {
+  PipeFixture pipe;
+  ASSERT_TRUE(pipe.ok());
+  Buffer buf;
+
+  const std::uint64_t initial = buf.generation();
+  const std::string text(1024, 'a');
+  pipe.write_all(text);
+  const auto read = buf.read_until_blocked(pipe.rfd());
+  ASSERT_GT(read.bytes_read, 0u);
+  // 纯追加不改读位置、不换地址 —— view 仍然有效，generation 不该动。
+  EXPECT_EQ(buf.generation(), initial) << "读进数据不该作废 view，否则作废信号就失去了含义";
+
+  ASSERT_TRUE(buf.consume(1));
+  EXPECT_NE(buf.generation(), initial) << "consume 推进读位置，指向前面的 view 当场作废";
+
+  buf.clear();
+  const std::uint64_t after_clear = buf.generation();
+  EXPECT_NE(after_clear, initial);
+  buf.clear();  // 空仓再 clear 仍然是"我动过"，语义上保守一点更安全
+  EXPECT_NE(buf.generation(), after_clear);
 }
 
 }  // namespace

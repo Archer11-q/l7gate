@@ -63,7 +63,19 @@ class Buffer {
   std::size_t writable_bytes() const noexcept { return storage_.size() - write_pos_; }
   std::size_t peak_capacity() const noexcept { return peak_capacity_; }
   std::size_t max_capacity() const noexcept { return config_.max_capacity; }
+  // 停读线本身也要可读：出向缓冲的背压判断（`Connection::queue_bytes`）问的是
+  // "还能不能装下这一整块"，那条线就是这个数。不给 getter 的话调用方只能自己
+  // 复制一份配置，于是同一个限制又有了第二个真相来源。
+  std::size_t high_water_mark() const noexcept { return config_.high_water_mark; }
   bool above_high_water_mark() const noexcept;
+
+  // 每次"会让已发出的指针/偏移作废"的改动都自增：消费、memmove 压缩、
+  // 容量归还、clear。解析层的 `ParsedRequest` 里全是 `string_view`，它们指向
+  // 的就是这块内存（契约见 http/request_parser.h），所以作废这件事必须可查询，
+  // 不能只写在注释里等我记得。S1-04 的连接对象在进入下一个请求前会比对
+  // 这个代次，对不上就是"我在拿上一个请求的 view"——那类 bug 的表现是
+  // 偶发的错乱转发，而不是崩溃，靠人盯是盯不住的。
+  std::uint64_t generation() const noexcept { return generation_; }
 
   // --- 写入侧 -----------------------------------------------------------
   // 返回一块可以直接 recv()/read() 进去的可写区域。
@@ -86,6 +98,26 @@ class Buffer {
   //      而不是内核那边。这个区别就是 S1-07 能否正确恢复读取的前提。
   ReadResult read_until_blocked(int fd);
 
+  // 写出侧的对称件：把可读区一直写到 EAGAIN 或写空为止，边写边消费。
+  //
+  // 用 ::send(fd, ..., MSG_NOSIGNAL) 而不是 ::write，这是**必须**的而不是风格：
+  // 对端已关闭时 write() 会发 SIGPIPE，默认动作是**杀死进程**。一个网关在
+  // 客户端中途断连时把自己打死，而压测里客户端断连是每天几百次的常态事件，
+  // 所以这条不是防御性编程，是功能正确性。（也可以改成进程级忽略 SIGPIPE，
+  // 但那会把"信号"变成整个进程的隐式全局状态，测试里谁都能改；MSG_NOSIGNAL
+  // 的作用域只有这一次调用。）
+  //
+  // EPIPE / ENOTCONN 归一成 peer_closed：它们是"对端不在了"，不是"我写坏了"。
+  // S1-06 要按这个区分决定是回 5xx 还是静默断开。
+  struct WriteResult {
+    std::size_t bytes_written = 0;
+    std::size_t write_syscalls = 0;
+    bool would_block = false;  // 内核发送缓冲满了：等下一次可写事件接着刷
+    bool peer_closed = false;  // EPIPE / ENOTCONN
+    int errno_value = 0;       // 真错误时的 errno；0 表示没有错误
+  };
+  WriteResult write_to_fd(int fd);
+
   // --- 读取侧 -----------------------------------------------------------
   const std::uint8_t* readable_data() const noexcept { return storage_.data() + read_pos_; }
   // 消费 n 字节（不拷出）。n 超过可读长度时返回 false 且不改动状态。
@@ -99,12 +131,16 @@ class Buffer {
 
  private:
   void record_peak() noexcept;
+  // 作废所有已发出的指针/偏移。凡是改动 read_pos_、或让 storage_ 换地址/内容挪位
+  // 的路径都要调用它，漏一处就是给"解析层拿着过期 view"开门。
+  void invalidate_views() noexcept { ++generation_; }
 
   Config config_;
   std::vector<std::uint8_t> storage_;
   std::size_t read_pos_ = 0;
   std::size_t write_pos_ = 0;
   std::size_t peak_capacity_ = 0;
+  std::uint64_t generation_ = 1;
   // 单次 ::read 的申请量，自适应：只在"上一次把申请量读满了"时才翻倍，上限 64 KiB。
   // 这个数就是每连接内存的**下限**，所以我在这里记全踩过的两版：
   //   1. 固定按 64 KiB 申请 → 1 KiB keep-alive 稳态把容量顶到 128 KiB；
