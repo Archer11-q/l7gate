@@ -128,6 +128,7 @@ message(STATUS "l7gate: GoogleTest ${L7GATE_GTEST_VERSION} (contract-locked v1.1
 # ---------------------------------------------------------------------------
 add_library(l7gate_core STATIC
   src/core/build_info.cc
+  src/net/buffer.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
 target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers)

@@ -6,14 +6,15 @@
 
 ## 现在的状态
 
-**S1 第一步（构建骨架）已完成，网关本体还没有。** 我不在这段含糊其辞：仓库当前能构建、能跑测试、能自述编译期环境事实，但还转发不了任何一个请求。下面是每个数字的实际出处，没有的一律标"未测"。
+**S1 前两步（构建骨架、动态缓冲）已完成，网关本体还没有。** 我不在这段含糊其辞：仓库当前能构建、能跑测试、能自述编译期环境事实，`net/Buffer` 带高水位停读语义并且测到了单连接峰值内存的口径，但还转发不了任何一个请求。下面是每个数字的实际出处，没有的一律标"未测"。
 
 | 项目 | 状态 |
 |---|---|
+| 动态缓冲 `net/Buffer` | 已实现（S1-02）：连续、带高水位、`read()` 到 `EAGAIN` 才算一轮结束；默认配置下 1 KiB keep-alive × 1000 轮实测 `peak_capacity=4096` |
 | HTTP/1.1 转发 | 未实现（S1-04 / S1-06） |
 | 尾延迟 p99 | **未测**（S1 门禁交付第一份） |
 | QPS vs Nginx | **未测**（且 Docker 尚未接入，基线起不来） |
-| 100k 长连接每连接内存 | **未测**（S2 之后） |
+| 100k 长连接每连接内存 | **未测**（S2 之后；当前只有 buffer 层的容量口径，不等于每连接内存） |
 | 限流 / 熔断 / 路由 / 热重载 | 未实现（S3–S5） |
 
 ## 三个数字
@@ -27,6 +28,8 @@
 第三个数还有附加产出：与 Nginx 的差值必须定位到 HTTP 解析、内存分配、连接管理、日志写盘、系统调用次数中的哪几项。「差多少」谁都能测，**「差在哪」才是这个项目**。
 
 关于性能的一句实话：我选 epoll **边缘触发**，但 ET 并不比 LT "更先进"，两者性能差别极小。选它的真实理由是它逼出正确的 Buffer 设计——一次必须读到 `EAGAIN`（[ADR-02](docs/adr/ADR-02-epoll-et-io-uring-deferred.md)）。
+
+这句"逼出"现在有实物支撑了：`net/Buffer` 的扩容策略我改了两版，两版都是被内存用例打回来的——固定 64 KiB 申请把每连接容量下限抬到 128 KiB，改成按 hint 预留仍然抬到 8 KiB，而 SLO #2 的预算是 20 KB。细节与最终口径在 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 第 1.3 节。
 
 ## 与 Nginx 的功能差异（不是性能差异）
 
@@ -63,7 +66,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
 ```bash
 cmake --preset debug          # GCC 15.2，日常开发
 cmake --build --preset debug
-ctest --preset debug          # 当前 6/6
+ctest --preset debug          # 当前 15/15（6 条工具链 + 9 条 buffer）
 
 ./build/debug/l7gate --self-check
 # version=0.1.0 compiler=gcc 15.2.0 __cplusplus=202002 gtest=1.14.0 \
@@ -80,6 +83,8 @@ ctest --preset debug          # 当前 6/6
 | `tsan` | Clang | S2 门禁：连接对象跨线程传递与异步销毁的唯一自动化验证手段 |
 
 > `debug` / `release` 之外的一切数字都不进 `BENCHMARK.md`；sanitizer preset 一律用 `-O0`，因为在 `-O1` 起，"可被证明无副作用的坏写入"会被优化掉，ASan 什么都不报——那种"干净"是假的。
+
+任务收尾时用 `bash scripts/verify-all-presets.sh` 一次性拿到三个 preset 的构建退出码、警告计数与 `ctest` 结果——「ASan 干净」这句话不该靠我手敲，而该有一条命令能复现。
 
 ## 明确不做的东西
 
