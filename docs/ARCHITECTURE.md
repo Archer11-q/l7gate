@@ -382,6 +382,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 | 单 worker 的 nginx 档测的是"被自己的连接上限打死" | `upstream keepalive` 池**按 worker 计**，1 worker 时 128 撑不住 1000 并发 | 池抬到 1024 且所有档共用同一份配置文本：`s2-qps-vs-nginx.sh` 的 `write_nginx_conf`（B-005） |
 | 从 Windows 侧编辑过的脚本跑不了 / `unexpected condition` | UNC 编辑丢执行位、带进 CRLF；`sed -i` 还会新建文件把 `chmod +x` 抹掉 | 提交固化 100755 + `file x.sh` 查 CRLF（`bash -n` 验不出行尾）：TASKS 交接段纪律二 |
 | 仓库搬家后 7 个脚本全部 `exit 1`，`env-snapshot` 的 ext4 证据行读的是死路径 | 脚本开头硬编码 `cd /home/archer/l7gate`，`findmnt -T` 也写死了同一个绝对路径 | **结构上消除**：改成由脚本自身位置推导（`cd "$(dirname "$(readlink -f "$0")")/.."`）、`findmnt -T .`。这一条的**第三条缺**——没有任何断言管"仓库能不能换位置"，只有搬家当天的一次全量复跑（三 preset 112/112 + 三个冒烟全绿）证明它当时成立 |
+| 一档测出 3,148.41 QPS（正常值的三分之一），只因为它是"对照组"就看着无害 | Docker Desktop 的 WSL Integration 当天掉过两次线，引擎正在退出时 wrk 照样能发完 60 s 并交出一个**语法完全合法**的读数 | 作废轮留档不进表、比值异常先查**被测方那一轮的绝对值**（B-005 附 第二条）；`s2-qps-vs-nginx.sh` 只在镜像缺失时拒绝。**这一条的第三条只有一半**——脚本能证明"基线容器起来了"，证不了"这台机器的容器路径此刻没有退化"；补法要么在每档前断言 `docker info` 与引擎启动时间，要么靠取样规程的两轮复现兜住（目前选的是后者） |
 | "ASan/TSan 干净"其实是构建没开 sanitizer，或优化把坏写入消掉了 | `-O1` 起 dead store elimination 会删掉可证明无副作用的坏写入 | preset 强制 `-O0 -g` + `S1_01_Toolchain.RequestedSanitizersAreActuallyCompiledIn` + 阳性样本（ENVIRONMENT 2.2） |
 | 一个没人引用的常量活了两个 preset 才被抓到 | gcc 的 debug 不报 `-Wunused-const-variable`，clang 才报 | `verify-all-presets.sh` 的「非 gtest 警告 = 0」门禁（FAULT-INJECTION 第 3 节反证） |
 
