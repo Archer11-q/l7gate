@@ -329,3 +329,65 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 | `build/` 下每个 preset 各自下载一次 googletest | 三个 preset 三次 FetchContent | 构建耗时 15–20s 里含下载。可接受；共享 `_deps` 会引入 preset 间状态耦合，不值得 |
 | WSL 里 `ulimit -n` = 10240 | S1-04 的用例最多同时用 265 个 fd，撞不到；`max_connections` 默认 4096 也够不到 | S2 的 100k 长连接场景必须先解决 rlimit（`docs/ENVIRONMENT.md` 记了当前值），否则那条 SLO 测出来的第一行会是 `accept_errors` |
 | 冒烟脚本的 fd 采样是 0.2 s 一轮的外部观测 | 它能证"曲线不爬升"，证不了"每个瞬间都不爬升" | 所以 fd 归零那条判定以**网关自报的 `fd_start`/`fd_end`** 为准（同一个进程、同一次 `getrlimit` 视野），外部采样只做旁证 |
+## 5. 踩坑索引（postmortem 索引）
+
+这一节只做一件事：**指路**，不复制内容。每条一行，格式固定三行式——**现象 / 根因 / 防复发的断言**。
+
+模板为什么是这个顺序，以及为什么第三条不可省：前两条谁都会写，写下来也只是"我知道当时发生了什么"；**第三条（哪条用例、哪句断言让它再也回不来）才是资产**——没有它，同一个坑会在下一次重构里以新面孔回来，而我会再次以为它被修过了。所以规矩是：**凡是修掉一个会静默失败的 bug（表现是"挂住"、"数字看着正常但是错的"、"全绿但什么都没测"），必须留下第三条**；只留下前两次的记录，等于承认这个 bug 仍然活着。索引里的"防复发"那一栏可以直接 `ctest -R` 或对脚本 grep 验证，写不出来的条目我不收。
+
+（同一份纪律在 `docs/FAULT-INJECTION.md` 开头的第四条里；那边管故障注入与 sanitizer，本节管实现期的坑。）
+
+### 边沿触发的坑不报错，它挂住
+
+| 现象 | 根因 | 防复发的断言 |
+|---|---|---|
+| 过一会儿不接新连接了，退出码 0、日志一行没有 | 超容量时 `return` 掉了监听事件；带未排空队列退出，内核不再投第二次 | `S1_04_Reactor.OverCapacityRejectionDoesNotStallTheListener`（ARCH 1.6） |
+| keep-alive 客户端卡住等响应 | 一次事件里读进多条请求只处理了一条 | `S1_04_Reactor.PipelinedRequestsInOneSegmentAreAllForwarded` |
+| 空闲 CPU 打满、SLO #2 第一条先断在这 | `EPOLLOUT` 刷空后没摘，对着"随时可写"的 fd 自旋 | `S1_04_Reactor.IdleConnectionDoesNotSpinOnEpollOut` |
+| 摘了 `EPOLLIN` 又挂回去之后，连接永久睡死 | 边沿触发不为已经在接收缓冲里的字节负责；恢复必须带一次主动读 | `S1_07_Backpressure.ResponseDirectionSurvivesASlowClientByteForByte`（ARCH 1.15） |
+| 只看水位会睡死、只看跳变会在水位线上多打 `epoll_ctl` | 摘/挂是跳变、"欠一次读"是另一件事，两判据必须分开写 | `S1_07_Backpressure.KeepAliveWorkloadWithoutPressureAddsNoEpollCtl` |
+
+### 所有权、生命周期与"检查动作改变了答案"
+
+| 现象 | 根因 | 防复发的断言 |
+|---|---|---|
+| `EXPECT_EQ(conn.scratch(), nullptr)` 自己把 scratch 建了出来 | 观测接口用了惰性创建版本 | `S1_04_Connection.OutboundAndScratchAreLazy`（拆成 `has_*()` + 私有 `*_or_create()`，TASKS 卡点行） |
+| 偶发把别人的连接关掉（fd 编号被新连接复用） | 事件批内析构连接对象，批内后续事件拿着悬垂指针 | 六步关闭 + `retiring_` 批末析构 + 注册表反查；`S1_04_Reactor.TenThousandSequentialRequestsLeaveNothingAlive`（ARCH 1.6） |
+| 大头部被逐字节 dribble 时重扫 7,474,911 字节（1956×） | 解析器无"已扫描游标"可用（纯函数不能存状态） | `S1_04_Connection.HeaderDribbleScanIsLinearNotQuadratic`（ARCH 1.4/1.6） |
+| view 在下一次读之后被继续引用 | `consume`/扩容使 view 作废，而调用方不知道 | `ConsumeInvalidatesParsedViews`、`ReleaseScratchInvalidatesViews`、`InvalidatedViewsAreReparsedNotDropped`、`RepeatedParseDoesNotDoubleCountRequests` |
+| 级联关闭把刚排进配对的 502 当残留字节丢掉 | `kDiscardOutbound` 的传染性；`close_connection` 的"同一种 why"会传给对端 | `fail_pair_with_reply` 先手工解链再分别关；`S1_06_Reactor.UpstreamDyingBeforeAnyResponseGetsDefined502`（ARCH 1.14） |
+
+### 测试自己写的错，比实现的错更难发现
+
+| 现象 | 根因 | 防复发的断言 |
+|---|---|---|
+| dribble 用例"全绿"，证明的是 nothing | 忘了 `read_raw()` 已把字节搬进缓冲，扫的是一片空缓冲 | `S1_03_Parser.DribblesThroughBufferAndParseEachRound`（TASKS S1-05 行失败清单） |
+| take-once 在 reactor 层测不出来 | 宽松 echo 上游把第二条普通请求当隧道字节弹回——测的是对端不是网关 | 改到 Connection 层直测三接口时序：`S1_05_Connection.UpgradeIntentSurvivesRequestAndIsTakenOnce` |
+| 连接层用例把纯函数的"头后有字节就拒"搬进来 | 两个函数的**问题不同**：头后字节恰恰是隧道第一帧 | `S1_05_Connection.ResponseHeadHalfPacketIsNeverATunnel` + `S1_05_Reactor.TunnelSurvivesSplitResponseHead` |
+| "HTTP/1.1 1015" 被误判成 101 | 最短头长写成 18（真值 16），且没查第 12 字节必须是 SP/CR | `S1_05_ResponseHead.NearMissesAreAllRejected`、`AcceptsExactlyAComplete101Head` |
+| 阶段五实际测的是 before_head 分支 | `/dies` 是 `/dies-mid-body` 的**前缀**，路径分派必须长前缀优先 | `smoke-s1-06.sh` 阶段五/六各自独立断言（ARCH 1.14） |
+| `responses_completed` 期望写 1、实发 2 条 | 期望值从"我希望网关怎么表现"推出来，而不是从"我发了几次" | 阶段二/三期望值改为按发送次数推导（ARCH 1.14 末） |
+| 平台期数字恰好等于整个载荷，断言为一个不成立的理由通过 | 写侧没货冒充"网关摘读" | 载荷 256→384 条：`S1_07_Backpressure.RequestDirectionStopsReadingAndRecoversWithoutLoss`（ARCH 1.15） |
+| 为了让水位线成为第一道墙而钉对端接收窗口，结果测的是内核计时器 | 显式设小 `SO_RCVBUF` 后 `window_clamp` 不回涨；"放开"是无效的 | 整段钉窗机器删除，两组同位置的数字留在 `tests/test_upstream.h` 的删除记录里（ARCH 1.15、FAULT-INJECTION 第 5 节） |
+| 循环还在跑时读非原子的 epoll 计数器 | 违反 `stats.h` 的观测纪律——写纪律的人自己犯的 | 先 `stop_loop()` join 再读：`S1_08_FilterReactor.PassThroughFiltersChangeNothingInTheForwardingPath`（FAULT-INJECTION 第 3 节反证） |
+
+### 取数与脚本：一片 0 比一片 ? 危险
+
+| 现象 | 根因 | 防复发的断言 |
+|---|---|---|
+| 报告里 p50…p99 全空、增量被算成 **0.000 ms** | wrk 的 `Latency Distribution` 整行缩进两个空格，锚写成顶格 | `s1-p99.sh` 的 `/^[ \t]*Latency Distribution[ \t]*$/` 锚 + 解析失败即 `die`（BENCHMARK B-001） |
+| `fd_end=351`、`live_connections=342` 被当成泄漏 | 1000 并发还在跑就 SIGTERM；网关停止语义不排水在飞连接 | 静置 5 s 后**断言**归零（`fatal` 不是 `warn`）：`s1-p99.sh`、`s2-qps-vs-nginx.sh` 生命周期段 |
+| 只发了 1 个请求，退出码 0、耗时 0.02 s | `{1..10000}` 是 bash 的 brace expansion，curl 的 glob 只认 `[1-N]`/`{a,b,c}`，原样当路径吞了 | `smoke-s1-04.sh` 里那句 `requests_parsed == 10000` 断言（TASKS 卡点二） |
+| 一档崩了 5,622 条非 2xx，脚本仍然退出码 0 | `fatal` 写在 `$(...)` 命令替换的子 shell 里，`exit` 只结束子 shell | `run_wrk` 改 `return 1` + 每个调用点自己 `|| fatal`：`s2-qps-vs-nginx.sh`（BENCHMARK B-005） |
+| 单 worker 的 nginx 档测的是"被自己的连接上限打死" | `upstream keepalive` 池**按 worker 计**，1 worker 时 128 撑不住 1000 并发 | 池抬到 1024 且所有档共用同一份配置文本：`s2-qps-vs-nginx.sh` 的 `write_nginx_conf`（B-005） |
+| 从 Windows 侧编辑过的脚本跑不了 / `unexpected condition` | UNC 编辑丢执行位、带进 CRLF；`sed -i` 还会新建文件把 `chmod +x` 抹掉 | 提交固化 100755 + `file x.sh` 查 CRLF（`bash -n` 验不出行尾）：TASKS 交接段纪律二 |
+| "ASan/TSan 干净"其实是构建没开 sanitizer，或优化把坏写入消掉了 | `-O1` 起 dead store elimination 会删掉可证明无副作用的坏写入 | preset 强制 `-O0 -g` + `S1_01_Toolchain.RequestedSanitizersAreActuallyCompiledIn` + 阳性样本（ENVIRONMENT 2.2） |
+| 一个没人引用的常量活了两个 preset 才被抓到 | gcc 的 debug 不报 `-Wunused-const-variable`，clang 才报 | `verify-all-presets.sh` 的「非 gtest 警告 = 0」门禁（FAULT-INJECTION 第 3 节反证） |
+
+### 索引之外还欠的两类记录
+
+- **实现期决策**（滞回为什么取半线、探测读为什么复用事件路径、`armed_events` 为什么是"回执"而不是"意图"、filter 链为什么没有 `priority` 字段）现在只活在代码注释与本节引用的段落里。**不给它们补 ADR**——ADR 留给不可逆决策，通胀比缺失更糟；这一节的表就是它们的索引。
+- **还没被断言钉住的坑**：`tc netem` 与 `perf` 在本机的可用性、Docker 镜像 digest 无法与官方对账、每连接内存那 0.50 KiB 的未归因差额。按模板它们缺第三条，所以在这里明写"缺"而不是不写。
+
+
+

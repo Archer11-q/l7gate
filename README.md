@@ -202,7 +202,7 @@ scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网�
 | [TASKS.md](TASKS.md) | 任务表（唯一真相源）：ID / 可断言验收标准 / 状态 / 实测数字 |
 | [docs/SLO.md](docs/SLO.md) | 三个数字的目标与写死的测量条件 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 环境自检实测版本、版本偏离的理由、sanitizer 阳性验证、Docker 与镜像源现状 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 已实现的现状（严格区分"已实现"与"已定但未实现"） |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 已实现的现状（严格区分"已实现"与"已定但未实现"）；**第 5 节是踩坑索引**——一行一条、只指路不复制，格式固定「现象 / 根因 / 防复发的断言」，写不出第三条的记录在索引里明写"缺" |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录：B-001…B-005 + 口径变更节，**未达标照记** |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障注入的预期 vs 实测 + sanitizer 结论（每条"干净"都带反证） |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**：S1 四件套对账、一键复现、留给 S2 的九条债、待答复事项 |
