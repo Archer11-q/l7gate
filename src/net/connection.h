@@ -125,7 +125,63 @@ class Connection {
 
   // 隧道化之后调用（S1-05 的 Upgrade 路径）：握手完成后 header 不再需要，
   // 而 100k 空闲长连接每人挂着 2048 字节就是 200 MB，正好把 SLO #2 的预算吃满。
+  // 触发点只有一个：Reactor 把完整的 101 响应头排进下游出向缓冲**之后**
+  // （见 reactor.cc 的 maybe_enter_tunnel）。这里刻意**没有**任何"请求结束就
+  // 释放"的自动路径——那样 keep-alive 的下一条请求会重新分配这 2048 字节，
+  // 等于白省（交接段点名不许写的那条，落成结构：想触发只能显式调用本函数）。
   void release_scratch() noexcept;
+
+  // --- 隧道（S1-05）------------------------------------------------------
+  // 语义来自 ADR-09：带 `Connection: upgrade` + `Upgrade` 的请求在上游回出完整
+  // 的 101 响应头之后，这条连接对**不再存在"请求"这个单位**——两个方向都是
+  // 不透明字节流，不解析、不改写、不重新分帧。
+
+  // 转发一条请求前调用（此时 view 还有效）：命中 upgrade 形态就把意图记在
+  // 连接上，请求被 finish_request 消费掉之后 view 作废了也丢不掉。
+  void mark_upgrade_request() noexcept { pending_upgrade_ = true; }
+  // 命中 `Connection: close`：这条配对连接是一次性的。本函数只落意图；
+  // reactor 在转发成功的那一刻把它传播给配对的上游（mark_close_after_response），
+  // 真正的收尾走 EOF 级联。"立刻关"不是 close 的语义——那会把还在路上的响应
+  // 字节丢掉，所以这条捷径我从结构上就没开（响应边界判定归 S1-06）。
+  void mark_close_after_forward() noexcept { close_after_forward_ = true; }
+
+  bool pending_upgrade() const noexcept { return pending_upgrade_; }
+  // 取走一次性意图。用"取"而不是"读"：转发的语义是**下一条** 101 才成隧道，
+  // 同一条连接上更晚的普通响应不该被更早一次没成形的 upgrade 意图影响。
+  bool take_upgrade_pending() noexcept {
+    const bool v = pending_upgrade_;
+    pending_upgrade_ = false;
+    return v;
+  }
+  bool close_after_forward() const noexcept { return close_after_forward_; }
+  bool tunneling() const noexcept { return tunneling_; }
+
+  // 上游侧的一次性标记（S1-05 的 close 语义）：由 reactor 在转发 close 请求时
+  // 从下游传播过来。语义口径写死在这里，免得被误读成"立刻关"：
+  //   - 这条配对连接是**一次性**的，不承诺复用；
+  //   - "响应边界"的精确判定（几条字节算一条响应完结）归 S1-06，本任务不做
+  //     预支——网关不在没有框架知识的情况下猜边界；
+  //   - 实际收尾走既有的 EOF/断开级联路径（上游 EOF → 六步关闭 → 级联下游），
+  //     与 S1-06 里"上游中途断开"的处理复用同一条机制。这里只固化意图与观测。
+  void mark_close_after_response() noexcept { close_after_response_ = true; }
+  bool close_after_response() const noexcept { return close_after_response_; }
+
+  // 进入隧道态。前置条件是 pending_upgrade_ 已经被 take 掉（调用方负责时序），
+  // 这里只落状态。幂等：重复调用无副作用。
+  void enter_tunnel() noexcept { tunneling_ = true; }
+
+  // 仅上游角色有意义（调用方是 reactor 的上游可读路径，它保证这一点）：
+  // 判断"入向可读区的开头恰好是一个完整的 101 响应头"。成立返回该头的字节数，
+  // 调用方据此转入隧道；不成立返回 npos，**不做任何状态改变**。
+  // 扫描带游标（head_scan_pos_）：每轮只看新到的字节 + 一个常数回退窗口，
+  // 不重扫整个头部区——和下游侧 scan_pos_ 还的是同一笔债（游标是相对可读区
+  // 起点的；可读区起点被 consume 挪动后游标自动作废，所以每次返回 npos 都把
+  // 游标夹到当前末尾，下一次从"新字节 - 3"处续扫）。
+  std::size_t detect_response_head_101() noexcept;
+
+  // 隧道模式的字节入口：只把 fd 上的字节读进入向缓冲（读到 EAGAIN / 撞水位
+  // 为止，ET 契约不变），**不解析、不产生任何 HTTP 语义**。
+  Buffer::ReadResult read_raw() noexcept;
 
   std::size_t header_scan_bytes() const noexcept { return header_scan_bytes_; }
   std::size_t parse_calls() const noexcept { return parse_calls_; }
@@ -158,6 +214,14 @@ class Connection {
   // 记得同步的隐藏状态。
   std::size_t scan_pos_ = 0;
   bool headers_complete_ = false;
+  // 上游侧 101 检测的扫描游标（相对可读区起点；上游不消费，起点恒为 0）。
+  std::size_t head_scan_pos_ = 0;
+  // 隧道三态（S1-05）：见上面隧道接口的注释。pending/ close 是"这条请求带来的
+  // 连接级意图"，tunneling_ 是"配对连接已切换为不透明字节流"。
+  bool pending_upgrade_ = false;
+  bool close_after_forward_ = false;
+  bool close_after_response_ = false;
+  bool tunneling_ = false;
   // 已解析出一个完整请求、但调用方还没 finish_request。挡住重复解析，
   // 否则 requests_parsed 会随下一批字节到达而虚高。
   bool request_ready_ = false;

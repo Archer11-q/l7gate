@@ -72,6 +72,15 @@ struct ReactorStats {
   // --- S1-07 的钩子：水位撞了几次（本任务只统计，不摘事件） -------------
   std::atomic<std::uint64_t> high_water_hits{0};
 
+  // --- S1-05：Upgrade 透传与 Connection: close 的观测面 ------------------
+  // 101 透传路径的进入次数。"每条隧道恰好一次"就是它的全部语义：帧的收发
+  // 不计数（透传不感知内容，感知了就违反 ADR-09），字节的量由下面两个数覆盖。
+  std::atomic<std::uint64_t> upgrades_101{0};
+  std::atomic<std::uint64_t> bytes_tunnel_down{0};  // 下游 → 上游（隧道方向之一）
+  std::atomic<std::uint64_t> bytes_tunnel_up{0};    // 上游 → 下游（含完整 101 响应头）
+  // 请求侧 `Connection: close` 被兑现的次数（配对连接置为一次性）。
+  std::atomic<std::uint64_t> close_headers_honored{0};
+
   // 出向 Buffer 的实际分配情况，卡点四那笔账的数据来源：
   // 惰性分配到底省下了多少，只有把"创建了几个"和"每个多大"分开记才算得出来。
   std::atomic<std::uint64_t> outbound_buffers_created{0};

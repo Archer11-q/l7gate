@@ -135,6 +135,7 @@ add_library(l7gate_core STATIC
   src/net/reactor.cc
   src/net/socket.cc
   src/http/request_parser.cc
+  src/http/response_head.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
 target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers)

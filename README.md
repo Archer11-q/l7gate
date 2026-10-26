@@ -6,7 +6,7 @@
 
 ## 现在的状态
 
-**S1 前四步（构建骨架、动态缓冲、HTTP/1.1 解析器、epoll ET 事件循环 + 双向转发）已完成，网关现在真的能转发请求了——但它还不认识 HTTP 的响应。** 我不在这段含糊其辞：`l7gate --serve --listen ... --upstream ...` 起一个单线程 epoll 边缘触发循环，把下游解析出的完整请求按**原始字节**搬到上游、把上游的响应原样搬回来，keep-alive 复用同一条回源连接；真 curl 打 10000 个请求跑完之后，存活连接归零、fd 回到基线、构造数等于析构数，ASan/LSan 与 TSan 都是 0 报告。缺的是语义那一层：状态码映射、chunked 与截断判定、Upgrade 透传、背压的"摘事件"动作、filter 链、路由、限流、熔断——下面每一行都分开写清楚，没有的一律标"未测"。
+**S1 前五步（构建骨架、动态缓冲、HTTP/1.1 解析器、epoll ET 事件循环 + 双向转发、keep-alive 复用与 Upgrade 透传）已完成，网关现在真的能转发请求、也认得 101 了——但除了 101 之外它还不认识 HTTP 的响应。** 我不在这段含糊其辞：`l7gate --serve --listen ... --upstream ...` 起一个单线程 epoll 边缘触发循环，把下游解析出的完整请求按**原始字节**搬到上游、把上游的响应原样搬回来，keep-alive 复用同一条回源连接，`Connection: close` 兑现成一次性配对；带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**——帧不解析、不改写（ADR-09），101 之后那 2048 字节的解析 scratch 被显式释放。真 curl 打 10000 个请求跑完之后，存活连接归零、fd 回到基线、构造数等于析构数，ASan/LSan 与 TSan 都是 0 报告。缺的是语义的其余部分：状态码映射、chunked 与截断判定、背压的"摘事件"动作、filter 链、路由、限流、熔断——下面每一行都分开写清楚，没有的一律标"未测"。
 
 | 项目 | 状态 |
 |---|---|
@@ -15,7 +15,7 @@
 | `net/Connection` + `net/Reactor` + 双向透传 | 已实现（S1-04）：六步关闭（含"先刷完出向"那一步）、accept 读到 EAGAIN、一次事件走完管线里的所有请求；真 curl 10000 请求 → `requests_parsed=10000`、`requests_rejected=0`、`downstream_accepted=1`、`upstream_opened=1`、`fd 9→9`、`live_connections=0`、constructed=destructed=2 |
 | S1-03 欠的两笔债（已扫描游标 / view 生命周期） | 已还（S1-04）：10000 请求下 `header_scan_bytes = 838,894` 与 `bytes_down_to_upstream` **完全相等**，一次重扫都没有；无游标的 dribble 场景原本是 7,474,911 字节（1956×） |
 | HTTP 响应语义（状态码映射 / chunked / 截断 / 逐字节一致验收） | 未实现（S1-06）——畸形请求现在只关连接，不回 400 |
-| keep-alive 复用与 Upgrade 透传 | 未实现（S1-05）；透传的**字节**现在就走 keep-alive 连接，但帧语义与 101 之后的隧道化没做 |
+| keep-alive 复用与 Upgrade 透传 | 已实现（S1-05）：3 个顺序请求共用一条下游与一条回源连接（`downstream_accepted=1`、`upstream_opened=1`、fd 回基线，有断言）；`Connection: close` 走意图传播 + EOF 级联兑现成一次性配对（不 eager close，响应边界精确判定归 S1-06）；双条件（`Connection` 含 `upgrade` 记号 **且** 有 `Upgrade` 头）命中才记握手意图，101 之后两个方向的字节逐字节透传、`parse_calls` 不再增长——二进制帧回显逐字节比对在 reactor 用例里锁住；`release_scratch()` 全仓唯一触发点在 101 之后 |
 | 背压（高水位触发后摘掉读事件） | 未实现（S1-07）；钩子齐了（`limit_reached` + `queue_bytes` 拒绝整块），摘 EPOLLIN 那一步没做 |
 | 尾延迟 p99 | **未测**（S1 门禁交付第一份） |
 | QPS vs Nginx | **未测**（且 Docker 尚未接入，基线起不来）；单连接串行的 10000 请求耗时 3.00 s 是 debug 构建的观测，**不构成 QPS** |
@@ -57,7 +57,9 @@ S1-04 又添了一条，这条更能说明 ET 的代价在哪：**边缘触发�
 ```
 client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parser
                        │              │
-                       │              └─ 原始字节 ──▶ 上游连接（S1-04 已通：一条下游配一条回源，keep-alive 复用）
+                       │              └─ 原始字节 ──▶ 上游连接（S1-04 已通：一条下游配一条回源，keep-alive 复用；
+                       │                              S1-05 已通：双条件 upgrade 命中且上游回出完整 101 头后，
+                       │                              这条配对整体转纯字节隧道——不解析、不改写、不重新分帧）
                        │                              上游响应 ──▶ 下游（同一形状反向，已通）
                        │
                filter chain（配置决定顺序）           ← S1-08，还没有
@@ -78,7 +80,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
 ```bash
 cmake --preset debug          # GCC 15.2，日常开发
 cmake --build --preset debug
-ctest --preset debug          # 当前 60/60（6 工具链 + 9 buffer + 21 解析 + 3 buffer 写出侧 + 11 连接 + 10 事件循环）
+ctest --preset debug          # 当前 74/74（6 工具链 + 9 buffer + 21 解析 + 3 buffer 写出侧 + 11 连接 + 10 事件循环 + 5 101 判定 + 4 连接层隧道 + 5 握手闭环）
 
 ./build/debug/l7gate --self-check
 # version=0.1.0 compiler=gcc 15.2.0 __cplusplus=202002 gtest=1.14.0 \

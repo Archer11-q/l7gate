@@ -118,8 +118,26 @@ class Reactor {
   // 的出向缓冲，然后消费掉下游的这些字节。不改写、不重新分帧——逐字节透传的前提
   // 是"我碰过的字节和我没碰过的字节长得一样"，这条归 S1-06 的验收负责证明。
   // 返回 false 表示这一条没转出去（上游还没连上 / 上游出向满了），字节留在原地。
-  bool forward_request(const std::shared_ptr<Connection>& downstream, std::size_t request_bytes);
+  // upgrade / close_after 是 S1-05 的两条连接级意图：从**这条请求自己的**已解析
+  // view 判出（调用方必须在 finish_request 之前取用 view，这里是唯一的取用点），
+  // 由本函数决定落到哪条连接、何时置 kClosing。判定不碰字节：转发出去的仍是原始请求。
+  bool forward_request(const std::shared_ptr<Connection>& downstream,
+                       std::size_t request_bytes, bool upgrade, bool close_after);
   void pump_upstream_to_downstream(const std::shared_ptr<Connection>& upstream);
+
+  // 隧道泵（S1-05）：不解析、不改写、不重新分帧，把 src 入向缓冲里的全部可读
+  // 字节整块搬进 dst 的出向缓冲。装不下（出向水位）就一个字节都不搬——和请求侧
+  // "整块不转"同一条背压方向。S1-06 之后响应侧有了框架判定，这条路依然原样保留：
+  // 隧道里的字节永远不该被任何 HTTP 语义过一遍（ADR-09）。
+  void pump_tunnel(const std::shared_ptr<Connection>& src,
+                   const std::shared_ptr<Connection>& dst);
+
+  // 上游可读之后调用：若下游配对连接带着 upgrade 意图、且入向开头是一个完整的
+  // 101 响应头，则把这**恰好 len 字节**的响应头原样排进下游（它是握手的一部分，
+  // 之后才轮到帧），两侧进入隧道态，释放下游的 ParseScratch（release_scratch()
+  // 自 S1-04 落地以来的第一个调用点），并计 upgrades_101。返回是否进入隧道。
+  // 非 101 / 头未完整：什么都不改，正常响应路径继续。
+  bool maybe_enter_tunnel(const std::shared_ptr<Connection>& upstream);
 
   // 把这条下游连接上"已经完整、但还没转出去"的请求一路转干净。
   enum class ForwardOutcome : std::uint8_t {

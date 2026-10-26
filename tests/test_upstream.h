@@ -27,7 +27,10 @@ namespace l7gate::testing {
 //
 // 它 dumb 是有意的：固定模板响应、不做 HTTP 语义校验、不解析 chunked。
 // 上游唯一需要的能力是"按请求回一段已知字节"，外加两个造故障的旋钮（延迟、
-// 回完就断）。上游一旦开始"聪明"，网关的失败就分不清是我坏还是它坏——
+// 回完就断），以及 S1-05 的两条握手配合：请求头里出现 `Upgrade:` 就回完整 101
+// 并转入裸回显（它自己同样不解析帧——对端越"笨"，网关的透传越无处藏），
+// 请求带 `Connection: close` 就按语义在这条响应之后收尾。
+// 上游一旦开始"聪明"，网关的失败就分不清是我坏还是它坏——
 // 那正是测试对端最不该有的性质。
 //
 // 单线程 + poll，所以 `set_delay_before_response_ms` 会同时拖住它的所有客户端。
@@ -89,6 +92,14 @@ class TestUpstream {
     net::UniqueFd fd;
     std::string pending;  // 还没凑成一个完整请求的字节
     bool served_any = false;
+    // S1-05：请求带 `Connection: close` 时，上游按语义在这条响应之后收尾。
+    // 网关侧的 close 兑现走"配对一次性"路径，不依赖对端配合；这里配合一下，
+    // 让"上游先关"与"网关按 close 收尾"两种时序都能被同一套用例打到。
+    bool closed_by_close_header = false;
+    // S1-05：回过 101 之后这个连接就是隧道——**不再按 HTTP 读**，收到的字节
+    // 原样回显（一次 read 回一次，正好和"网关每事件搬一块"对齐）。测试对端
+    // 在这里同样"不解析帧"：它证明的只是"另一端原样收到"，语义都在网关侧断言。
+    bool tunneled = false;
   };
 
   void loop() {
@@ -117,9 +128,19 @@ class TestUpstream {
         if (revents == 0) continue;
         Client& client = clients[i - 1];
         const bool alive = read_into(client, revents);
-        if (alive) serve_complete_requests(client);
+        if (client.tunneled) {
+          // 隧道：不碰语义，pending 里是什么就回显什么（包括"看起来像畸形 HTTP"
+          // 的帧字节）。回显掉即清空——这里没有"请求"可消费。
+          if (alive && !client.pending.empty()) {
+            echo_all(client, client.pending);
+            client.pending.clear();
+          }
+        } else if (alive) {
+          serve_complete_requests(client);
+        }
         const bool should_drop =
-            !alive || (close_after_response_ && client.served_any);
+            !alive || (close_after_response_ && client.served_any) ||
+            (client.closed_by_close_header && client.served_any);
         if (should_drop) {
           client.fd.close_now();
           clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i - 1));
@@ -167,17 +188,46 @@ class TestUpstream {
       if (header_end == std::string::npos) return;
       const std::size_t block_end = header_end + 4;
 
+      const std::string headers = client.pending.substr(0, block_end);
+      std::string lower = headers;
+      for (auto& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+
+      // S1-05 的 upgrade 分支：请求头部里出现 `Upgrade:` 就回完整的 101 响应头，
+      // 这个连接从此进隧道。判定刻意比网关侧宽松（不看 Connection 记号）——
+      // "宽松的上游 + 严格的网关"组合起来，才能把"网关只认双条件"这件事测出来：
+      // 只带 Upgrade 头的请求若被网关当握手，这里的 101 会原样漏给客户端并被
+      // 隧道计数断言抓住（见 S1_05_Reactor 的 negative 用例）。
+      if (lower.find("upgrade:") != std::string::npos) {
+        respond(client, build_101(), block_end);
+        client.tunneled = true;
+        return;
+      }
+
       std::size_t body_len = 0;
       bool has_cl = false;
-      if (!content_length_of(client.pending.substr(0, block_end), &body_len, &has_cl)) {
+      if (!content_length_of(headers, &body_len, &has_cl)) {
         // 读不懂声明的长度就回 400：测试对端可以 dumb，但不能装看不见。
         respond(client, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", block_end);
         return;
       }
       (void)has_cl;
       if (client.pending.size() < block_end + body_len) return;  // body 还没到齐
-      respond(client, build_response(), block_end + body_len);
+      const bool want_close = lower.find("connection: close") != std::string::npos;
+      if (want_close) client.closed_by_close_header = true;
+      respond(client, build_response(want_close), block_end + body_len);
+      if (client.closed_by_close_header) return;  // 收尾由外层 should_drop 兑现
     }
+  }
+
+  std::string build_101() {
+    // 握手计入"已服务"（脚本侧的上游自报数要保持同一条口径），但 101 没有
+    // seq 体——隧道里没有响应体这回事。
+    requests_served_.fetch_add(1, std::memory_order_relaxed);
+    return "HTTP/1.1 101 Switching Protocols\r\n"
+           "Upgrade: websocket\r\n"
+           "Connection: Upgrade\r\n"
+           "Sec-WebSocket-Accept: dGhpcyBpcyBub3QgcmVhbCBjcnlwdG9ncmFwaHk=\r\n"
+           "\r\n";
   }
 
   static bool content_length_of(const std::string& headers, std::size_t* out, bool* found) {
@@ -207,7 +257,7 @@ class TestUpstream {
     return true;
   }
 
-  std::string build_response() {
+  std::string build_response(bool close_after) {
     const std::uint64_t seq = requests_served_.fetch_add(1, std::memory_order_relaxed) + 1;
     std::string body = "seq=" + std::to_string(seq);
     while (body.size() < response_body_bytes_) body += '.';
@@ -216,7 +266,31 @@ class TestUpstream {
       ::usleep(static_cast<useconds_t>(delay_ms_) * 1000u);
     }
     return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) +
-           "\r\nConnection: keep-alive\r\n\r\n" + body;
+           "\r\nConnection: " + (close_after ? "close" : "keep-alive") + "\r\n\r\n" + body;
+  }
+
+  // 隧道回显：和 respond 同一套"有上限自旋"的写法——一个不再读的对端不能把这个
+  // 线程永远卡住，否则测试的表现从"断言不通过"退化成"TIMEOUT 挂 30 秒"。
+  void echo_all(Client& client, const std::string& data) {
+    std::size_t off = 0;
+    int spins = 0;
+    constexpr int kMaxSpins = 100000;
+    while (off < data.size() && spins < kMaxSpins) {
+      const ssize_t n = ::send(client.fd.get(), data.data() + off, data.size() - off,
+                               MSG_NOSIGNAL);
+      if (n <= 0) {
+        const int e = errno;
+        if (e == EINTR) continue;
+        if (e == EAGAIN || e == EWOULDBLOCK) {
+          ++spins;
+          ::sched_yield();
+          continue;
+        }
+        break;  // EPIPE 之类：对端已经不读了
+      }
+      off += static_cast<std::size_t>(n);
+      spins = 0;
+    }
   }
 
   void respond(Client& client, const std::string& payload, std::size_t consumed) {

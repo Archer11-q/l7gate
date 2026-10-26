@@ -28,9 +28,11 @@ void usage(std::FILE* out) {
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>\n"
       "               [--serve-requests N] [--max-connections N]\n"
       "\n"
-      "--serve 是 S1-04 的透传路径：epoll 边缘触发单线程循环，下游请求原样搬到上游，\n"
-      "上游响应原样搬回来，keep-alive 复用同一条回源连接。它不做状态码映射、不改写\n"
-      "响应、不解析 Upgrade（S1-06/S1-05），畸形请求只关连接不回 400。\n"
+      "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
+      "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
+      "upgrade + Upgrade 的请求在拿到完整 101 响应头后切纯透传（ADR-09，不解析帧），\n"
+      "Connection: close 的请求按语义收尾配对连接。它不做状态码映射、不改写响应\n"
+      "（S1-06），畸形请求只关连接不回 400。\n"
       "N 为正整数。--serve-requests 是「解析满 N 条就停循环」，它可能在最后一条响应\n"
       "送达之前就 break —— 要「把 N 条全部送完再停」就用信号，冒烟脚本就是这么做的。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：事件循环停下、统计打印出来、连接按六步关闭。\n"
@@ -149,6 +151,12 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
       static_cast<long long>(stats.load(stats.outbound_buffers_created)));
   put("scratches_created", static_cast<long long>(stats.load(stats.scratches_created)));
   put("high_water_hits", static_cast<long long>(stats.load(stats.high_water_hits)));
+  // S1-05 的三条观测线：握手次数（应恰好等于隧道数）、两个方向的透传字节、
+  // close 意图被兑现的次数。
+  put("upgrades_101", static_cast<long long>(stats.load(stats.upgrades_101)));
+  put("bytes_tunnel_down", static_cast<long long>(stats.load(stats.bytes_tunnel_down)));
+  put("bytes_tunnel_up", static_cast<long long>(stats.load(stats.bytes_tunnel_up)));
+  put("close_headers_honored", static_cast<long long>(stats.load(stats.close_headers_honored)));
   put("epoll_registrations", static_cast<long long>(reactor.epoll_registrations()));
   put("epoll_unregistrations", static_cast<long long>(reactor.epoll_unregistrations()));
   put("epoll_modifications", static_cast<long long>(reactor.epoll_modifications()));

@@ -114,6 +114,22 @@ std::string request_text(std::size_t i) {
   return "GET /r" + std::to_string(i) + " HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
 }
 
+// S1-05 的两种请求形态。close 那条带显式 `Connection: close`；
+// upgrade 那条按 RFC 9113 §4.1 的握手形态来（Connection 含 upgrade 记号 +
+// Upgrade 头 + Sec-WebSocket-Key），网关判定认的就是这两个记号。
+std::string close_request_text(std::size_t i) {
+  return "GET /r" + std::to_string(i) + " HTTP/1.1\r\nHost: gateway.test\r\n"
+         "Connection: close\r\n\r\n";
+}
+
+std::string upgrade_request_text() {
+  return "GET /ws HTTP/1.1\r\nHost: gateway.test\r\n"
+         "Connection: keep-alive, Upgrade\r\n"
+         "Upgrade: websocket\r\n"
+         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+         "Sec-WebSocket-Version: 13\r\n\r\n";
+}
+
 std::string expected_body(std::size_t seq) {
   std::string body = "seq=" + std::to_string(seq);
   while (body.size() < kBodyBytes) body += '.';
@@ -208,6 +224,69 @@ class Client {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         *why = "读超时：对端没有关闭";
+        return false;
+      }
+      *why = "read errno=" + std::to_string(errno);
+      return false;
+    }
+  }
+
+  // --- S1-05 的三种读法 ---------------------------------------------------
+  // 隧道之后"响应"这个单位不存在了，read_response 的 Content-Length 口径失效，
+  // 所以下面三个函数都只认**字节**：这是刻意贴近验收句的写法——
+  // "帧内容不被解析、不被改写"只能用字节比对来证明，不能用语义解析来证明。
+
+  // 读到下一个 CRLFCRLF 为止，返回含终止串的头部区（101 的形态断言用）。
+  bool read_head(std::string* out, std::string* why) {
+    if (!fill([](const std::string& s) { return s.find("\r\n\r\n") != std::string::npos; },
+              why)) {
+      return false;
+    }
+    const std::size_t term = carry_.find("\r\n\r\n");
+    out->assign(carry_.substr(0, term + 4));
+    carry_.erase(0, term + 4);
+    return true;
+  }
+
+  // 恰好读 n 个字节（多读到的塞回 carry_）：透传"一块进一块出"的形状用它来证明。
+  bool read_exact(std::string* out, std::size_t n, std::string* why) {
+    char buf[4096];
+    while (out->size() < n) {
+      const std::size_t want = n - out->size();
+      const ssize_t got = ::read(fd_, buf, want);
+      if (got > 0) {
+        out->append(buf, static_cast<std::size_t>(got));
+        continue;
+      }
+      if (got == 0) {
+        *why = "对端在凑满之前关闭";
+        return false;
+      }
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        *why = "读超时：字节没有透传回来";
+        return false;
+      }
+      *why = "read errno=" + std::to_string(errno);
+      return false;
+    }
+    return true;
+  }
+
+  // EOF 或"任何数据"先到算哪个。close 用例用它：隧道已关、只剩一个 FIN，
+  // 拿到的必须是 0，不是又一次超时。
+  bool wait_eof_or_data(std::string* why) {
+    char buf[64];
+    while (true) {
+      const ssize_t n = ::read(fd_, buf, sizeof(buf));
+      if (n == 0) return true;
+      if (n > 0) {
+        *why = "不该有字节回来，实际回来了 " + std::to_string(n);
+        return false;
+      }
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        *why = "读超时：EOF 没等到";
         return false;
       }
       *why = "read errno=" + std::to_string(errno);
@@ -779,6 +858,218 @@ TEST(S1_04_Reactor, MemoryPerIdleConnectionIsMeasured) {
   harness.shutdown_all();
   EXPECT_EQ(count_open_fds(), fd_before)
       << "循环和上游都关掉之后 fd 没回到基线：连接对象或 socket 泄漏了";
+}
+
+// --- S1-05：keep-alive 复用与 Upgrade 透传 --------------------------------
+// 验收句逐条对应：
+//   「同一 curl 连接发 3 个顺序请求，全部成功且各自响应内容正确对应」
+//     → ThreeSequentialRequestsGetTheirOwnResponsesInOrder
+//   「请求间不重建下游连接（fd 计数器可断言）」
+//     → 同一条用例里的 accepted/opened/registrations/fd 四组断言
+//   「对 keep-alive 与 close 分别按语义处理」
+//     → CloseRequestIsHonoredEndToEnd
+//   「带 Upgrade: websocket 的请求在 101 之后走纯透传，帧内容不被解析、不被改写」
+//     → UpgradeRequestSwitchesToRawTunnelAfterThe101（字节比对，不是语义比对）
+//     UpgradeHeaderWithoutConnectionTokenIsNotATunnel（双条件判定的 negative 面）
+//     TunnelSurvivesSplitResponseHead（半包的 101 不许提前点燃隧道）
+//   交接段点名的"意图是一次性的"：
+//     → 在连接层直测（connection_test.cc 的 UpgradeIntentSurvivesRequestAndIsTakenOnce）——
+//       本文件的用例都跑在 TestUpstream 这个**宽松对端**上：它见 Upgrade 头就回 101
+//       并进 echo 模式，同一条连接上追加第二条普通请求会被它当隧道字节原样弹回，
+//       在 reactor 层断"第二条拿回自己的 200"测的是对端的脾气不是网关的意图语义。
+//       take-once 的时序责任在 Connection 的三个接口上，就该在那三个接口上钉死。
+
+TEST(S1_05_Reactor, ThreeSequentialRequestsGetTheirOwnResponsesInOrder) {
+  const std::size_t fd_before = count_open_fds();
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  for (std::size_t i = 1; i <= 3; ++i) {
+    ASSERT_TRUE(client.write_all(request_text(i)));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK");
+    EXPECT_EQ(body, expected_body(i)) << "第 " << i << " 条的响应串号了";
+  }
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.requests_parsed), 3u);
+  EXPECT_EQ(stats.load(stats.downstream_accepted), 1u) << "三条请求共用一条下游连接";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "回源连接没有随请求重建";
+  std::size_t request_bytes = 0;
+  for (std::size_t i = 1; i <= 3; ++i) request_bytes += request_text(i).size();
+  EXPECT_EQ(stats.load(stats.bytes_down_to_upstream), static_cast<std::uint64_t>(request_bytes));
+  EXPECT_EQ(harness.upstream().requests_served(), 3u);
+
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->epoll_registrations(), 4u)
+      << "监听 + eventfd + 1 下游 + 1 上游；多一次注册就是请求之间重建了连接";
+  client.close();
+  harness.shutdown_all();
+  EXPECT_EQ(count_open_fds(), fd_before) << "三条请求跑完 fd 没回到基线";
+}
+
+TEST(S1_05_Reactor, CloseRequestIsHonoredEndToEnd) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(close_request_text(1)));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(body, expected_body(1));
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.close_headers_honored), 1u) << "close 意图要被兑现，兑现要留计数";
+
+  // 上游按 close 语义收尾之后，EOF 级联必须把客户端这侧也关掉（内核级证据：
+  // read() 返回 0）。先等到这一行，才允许去碰收尾计数 —— 观测纪律那条。
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "close 的响应送达后连接没有收尾：" << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
+      << "close 兑现之后还有连接对象活着";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "一次性配对不等于新建配对";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+  EXPECT_EQ(stats.load(stats.upgrades_101), 0u) << "close 不是握手，不许蹭隧道的计数";
+}
+
+TEST(S1_05_Reactor, UpgradeRequestSwitchesToRawTunnelAfterThe101) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string req = upgrade_request_text();
+  ASSERT_TRUE(client.write_all(req));
+
+  std::string head;
+  ASSERT_TRUE(client.read_head(&head, &why)) << "101 没有回来：" << why;
+  EXPECT_EQ(head.find("HTTP/1.1 101"), 0u) << "回来的不是 101: " << head;
+  EXPECT_NE(head.find("Upgrade: websocket"), std::string::npos);
+
+  ReactorStats& stats = harness.reactor()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upgrades_101) == 1u; }, 3000))
+      << "101 已经送达客户端，但隧道计数还没落——进入动作与字节交付的时序串了";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u);
+  EXPECT_EQ(stats.load(stats.bytes_down_to_upstream), static_cast<std::uint64_t>(req.size()))
+      << "只有握手请求走过 HTTP 路径，帧字节一律记在隧道账上";
+
+  // 双向回显闭环。两条刻意"不像合法 HTTP"的帧：
+  //   帧一 0x81 0x83 0x37 0xfa 0x76 —— 开头就是 CRLF 家族的裸 0x0D 形态，
+  //          被当请求解析必然 reject（畸形 → 关连接），被透传则毫发无损；
+  //   帧二 "\r\n\r\nGARBAGE" —— 头部区终止串打头，后面跟"永远读不齐的半截头"。
+  // 断言全部是**字节比对**：验收句是"不被解析、不被改写"，那它就只能用字节证明，
+  // 拿语义断言（比如"状态码是 101"）去证它，等于用我的理解印证我的理解。
+  const std::string frame1("\x81\x83\x37\xfa\x76", 5);
+  const std::string frame2("\r\n\r\nGARBAGE", 9);
+  ASSERT_TRUE(client.write_all(frame1));
+  std::string echoed1;
+  ASSERT_TRUE(client.read_exact(&echoed1, frame1.size(), &why))
+      << "帧一没有原样回显（一块进一块出）：" << why;
+  EXPECT_EQ(echoed1, frame1);
+
+  ASSERT_TRUE(client.write_all(frame2));
+  std::string echoed2;
+  ASSERT_TRUE(client.read_exact(&echoed2, frame2.size(), &why))
+      << "帧二（终止串打头的二进制）没有原样回显：" << why;
+  EXPECT_EQ(echoed2, frame2);
+
+  EXPECT_EQ(stats.load(stats.upgrades_101), 1u) << "帧的往返不许再点燃第二条隧道";
+  EXPECT_GE(stats.load(stats.bytes_tunnel_down),
+            static_cast<std::uint64_t>(frame1.size() + frame2.size()));
+  EXPECT_GE(stats.load(stats.bytes_tunnel_up),
+            static_cast<std::uint64_t>(frame1.size() + frame2.size()));
+  // requests_parsed 停在 1 是"不被改写"的另一半：改写的前提是我读懂过它。
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+
+  // 隧道关（客户端 FIN）级联两侧收尾，fd 回基线 —— 与 S1-04 同一条纪律。
+  client.shutdown_write();
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "隧道没有随客户端半关闭收尾：" << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  const std::uint64_t parsed = stats.load(stats.requests_parsed);
+  const std::uint64_t constructed = stats.load(stats.connections_constructed);
+  const std::uint64_t destructed = stats.load(stats.connections_destructed);
+  harness.stop_loop();
+  EXPECT_EQ(constructed, destructed) << "隧道两端有对象抱着不死（帧状态不该延长生命周期）";
+  EXPECT_EQ(parsed, 1u);
+  client.close();
+  harness.shutdown_all();
+}
+
+TEST(S1_05_Reactor, UpgradeHeaderWithoutConnectionTokenIsNotATunnel) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  // 只有 Upgrade 头、Connection 里没有 upgrade 记号 —— 网关的判定是双条件
+  // （见 reactor.cc 的 is_upgrade_request），这条不配进隧道。测试上游是故意
+  // 宽松的（看到 Upgrade: 就回 101），于是 101 会作为**普通响应字节**漏下来：
+  // 这正是"宽松对端 + 严格网关"要测的组合 —— 网关若单条件就点燃隧道，这里
+  // 会多出一个 upgrades_101 并且后续帧被透传，断言当场红。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string req =
+      "GET /ws HTTP/1.1\r\nHost: gateway.test\r\nConnection: keep-alive\r\n"
+      "Upgrade: websocket\r\n\r\n";
+  ASSERT_TRUE(client.write_all(req));
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 101 Switching Protocols")
+      << "网关不认隧道，就必须把对端的 101 当普通字节逐样交给客户端（不改写）";
+
+  ReactorStats& stats = harness.reactor()->stats();
+  EXPECT_EQ(stats.load(stats.upgrades_101), 0u);
+  EXPECT_EQ(stats.load(stats.bytes_tunnel_up), 0u);
+  EXPECT_EQ(stats.load(stats.bytes_tunnel_down), 0u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+  EXPECT_EQ(stats.load(stats.bytes_down_to_upstream), static_cast<std::uint64_t>(req.size()));
+}
+
+TEST(S1_05_Reactor, TunnelSurvivesSplitResponseHead) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string req = upgrade_request_text();
+  ASSERT_TRUE(client.write_all(req));
+
+  std::string head;
+  ASSERT_TRUE(client.read_head(&head, &why)) << why;
+  EXPECT_EQ(head.find("HTTP/1.1 101"), 0u);
+  ReactorStats& stats = harness.reactor()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upgrades_101) == 1u; }, 3000)) << why;
+
+  // 上游的响应头在这里已经整块送达（TestUpstream 一次性 send）。把它的**字节数**
+  // 再分成三段喂给隧道之后的帧流：证明隧道对"一条消息被 TCP 切开"免疫——
+  // 半包在隧道里根本不是概念，因为这里没有"包"可齐。
+  std::string split;
+  split.append("\x00\x01\x02", 3);
+  split.append("tunnel-half");
+  split.append("\x0D\x0A\x0D\x0A", 4);
+  ASSERT_TRUE(client.write_all(split.substr(0, 3)));
+  std::string got;
+  ASSERT_TRUE(client.read_exact(&got, 3, &why)) << "隧道第一段没有回显：" << why;
+  ASSERT_TRUE(client.write_all(split.substr(3)));
+  ASSERT_TRUE(client.read_exact(&got, split.size(), &why))
+      << "被切开的第二段没有拼回原样：" << why;
+  EXPECT_EQ(got, split) << "透传改写了字节";
+
+  EXPECT_EQ(stats.load(stats.upgrades_101), 1u) << "分段到达的帧不是新握手";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+  EXPECT_EQ(stats.load(stats.parse_calls), 1u)
+      << "隧道之后的字节连一次解析尝试都不许发生（release 后也不许重建 scratch 再解析）";
 }
 
 }  // namespace

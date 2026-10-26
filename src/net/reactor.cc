@@ -3,8 +3,10 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -32,6 +34,49 @@ void* wake_tag() noexcept { return &g_wake_tag; }
 
 constexpr std::uint32_t kReadEvents = EPOLLIN;
 constexpr std::uint32_t kReadWriteEvents = EPOLLIN | EPOLLOUT;
+
+// S1-05 的请求侧意图判定。口径逐条写死，避免"看起来支持、实际看心情"：
+//   upgrade    —— `Connection` 值里含逗号分隔的 `upgrade` 记号（不区分大小写、
+//                 忽略记号两侧 OWS），**且**存在 `Upgrade` 头。两个条件缺一不立：
+//                 只看 Upgrade 头会把"头里出现 websocket 字样的普通请求"当握手，
+//                 而真实的握手在 RFC 9113 §4.1 里两个头都在。
+//   close      —— `Connection` 值里含 `close` 记号。
+// 判定只读已解析的 view，不碰原始字节——转出去的仍是逐字一致的请求。
+bool connection_has_token(const http::ParsedRequest& req, std::string_view token) {
+  const auto conn = req.find_header("connection");
+  if (!conn.has_value()) return false;
+  std::string_view rest = *conn;
+  while (true) {
+    const std::size_t comma = rest.find(',');
+    std::string_view item = (comma == std::string_view::npos) ? rest : rest.substr(0, comma);
+    // 剥 OWS（SP / HTAB）。
+    while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.remove_prefix(1);
+    while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.remove_suffix(1);
+    if (item.size() == token.size()) {
+      bool same = true;
+      for (std::size_t i = 0; i < item.size(); ++i) {
+        const char a = static_cast<char>(::tolower(static_cast<unsigned char>(item[i])));
+        const char b = static_cast<char>(::tolower(static_cast<unsigned char>(token[i])));
+        if (a != b) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return true;
+    }
+    if (comma == std::string_view::npos) break;
+    rest = rest.substr(comma + 1);
+  }
+  return false;
+}
+
+bool is_upgrade_request(const http::ParsedRequest& req) {
+  return connection_has_token(req, "upgrade") && req.find_header("upgrade").has_value();
+}
+
+bool is_close_request(const http::ParsedRequest& req) {
+  return connection_has_token(req, "close");
+}
 
 }  // namespace
 
@@ -300,6 +345,23 @@ void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
     // 正在收尾的连接上追加它永远发不出去的东西。
     return;
   }
+  if (conn->tunneling()) {
+    // 隧道：读完就搬，不解析、不改写（ADR-09）。Connection::on_readable 在这里
+    // 退化成 read_raw 的同义路径，所以直接走观测面更窄的那一个入口。
+    const Buffer::ReadResult read = conn->read_raw();
+    if (read.errno_value != 0) {
+      close_connection(conn);
+      return;
+    }
+    const bool eof = read.peer_closed || (revents & EPOLLHUP) != 0;
+    auto it = connections_.find(conn->peer_fd());
+    if (it != connections_.end()) {
+      pump_tunnel(conn, it->second);
+    }
+    if (eof) close_connection(conn);
+    return;
+  }
+
   Connection::ReadRound round = conn->on_readable();
 
   if (round.read.errno_value != 0) {
@@ -340,10 +402,29 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests(
     // 正在收尾的连接不再往外转：新建的上游连接没人用，转出去的请求也没地方回响应。
     return ForwardOutcome::kBlocked;
   }
+  if (downstream->tunneling()) {
+    // 隧道里没有请求可转发：这条路径上的字节全部走 pump_tunnel（见
+    // on_downstream_readable / flush_outbound 的两个隧道路）。留在缓冲里的
+    // 尾部字节是帧的一部分，不是"还没解析完的请求"。
+    // 握手指意在这里取走（而不是只读）：maybe_enter_tunnel 没消费到的残留意图
+    // ——比如 101 之后客户端又发了一条带 Upgrade 头的请求——不该漂向更远的将来。
+    (void)downstream->take_upgrade_pending();
+    return ForwardOutcome::kDrained;
+  }
+  if (downstream->close_after_forward()) {
+    // close 是一次性配对：不再往这条连接对转发第二条请求。
+    // 留在缓冲里的字节不归本函数处置——它们要么随连接收尾一起结束，要么
+    // 在 S1-06 的语义面里被判定（close 之后还发请求的客户端就是畸形流量）。
+    return ForwardOutcome::kBlocked;
+  }
   for (;;) {
     const http::ParsedRequest* pending = downstream->request();
     if (pending != nullptr) {
-      if (!forward_request(downstream, pending->consumed)) {
+      // 意图必须在看板还有效的这一刻取（view 指向入向缓冲，finish_request 一消费
+      // 就作废）——这也正是"判定"与"取用"分开写的原因：字节照原样转，意图另存。
+      const bool upgrade = is_upgrade_request(*pending);
+      const bool close_after = is_close_request(*pending);
+      if (!forward_request(downstream, pending->consumed, upgrade, close_after)) {
         return ForwardOutcome::kBlocked;  // 上游没连上或出向满了，字节一条都没消费
       }
       continue;
@@ -370,7 +451,7 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests(
 }
 
 bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
-                              std::size_t request_bytes) {
+                              std::size_t request_bytes, bool upgrade, bool close_after) {
   std::shared_ptr<Connection> upstream = ensure_upstream(downstream);
   if (upstream == nullptr) {
     return false;  // 正在 connect 或超出 fd 预算；请求还留在下游缓冲里，没丢
@@ -386,6 +467,18 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
     return false;
   }
 
+  // 意图落在连接上，必须赶在 finish_request 作废 view 之前（此刻 pending 还有效，
+  // 而上面一次字节都没动过状态——这个顺序是刻意的，转发失败时意图也不会残留）。
+  if (upgrade) downstream->mark_upgrade_request();
+  if (close_after) {
+    downstream->mark_close_after_forward();
+    // 传播到配对上游：这条连接对是一次性的。不在这里关任何 fd——响应还在路上，
+    // 网关在没有框架知识（S1-06）的情况下猜"响应到没到齐"然后提前关闭，
+    // 丢的是已经接受的字节。收尾走 EOF 级联（on_upstream_event 的 peer_closed）。
+    upstream->mark_close_after_response();
+    stats_.close_headers_honored.fetch_add(1, std::memory_order_relaxed);
+  }
+
   downstream->finish_request(request_bytes);
   stats_.bytes_down_to_upstream.fetch_add(static_cast<std::uint64_t>(request_bytes),
                                           std::memory_order_relaxed);
@@ -395,6 +488,11 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
 }
 
 void Reactor::pump_upstream_to_downstream(const std::shared_ptr<Connection>& upstream) {
+  if (upstream->tunneling()) {
+    // 隧道路径在调用方（on_upstream_event / pump_tunnel 的对称重试）已经分走，
+    // 这里只保留一道断言式的守卫：状态串了宁可原地停住，也不把帧当响应搬。
+    return;
+  }
   auto it = connections_.find(upstream->peer_fd());
   if (it == connections_.end()) return;  // 对端已关（或编号已被复用）：无去处
   const std::shared_ptr<Connection> downstream = it->second;
@@ -414,6 +512,58 @@ void Reactor::pump_upstream_to_downstream(const std::shared_ptr<Connection>& ups
   arm_write(downstream);
 }
 
+void Reactor::pump_tunnel(const std::shared_ptr<Connection>& src,
+                          const std::shared_ptr<Connection>& dst) {
+  auto it = connections_.find(src->peer_fd());
+  if (it == connections_.end()) return;  // 对端已关（或编号已被复用）：无去处
+  const std::size_t available = src->inbound().readable_bytes();
+  if (available == 0) return;
+  // 整块搬运：装不下就一个字节都不动（与请求侧"整块不转"同一条背压方向）。
+  // 半截帧比半截请求更糟——透传的意义就是两端看到的字节流完全一致。
+  if (!dst->queue_bytes(src->inbound().readable_data(), available)) return;
+  src->inbound().consume(available);
+  if (src->role() == Role::kDownstream) {
+    stats_.bytes_tunnel_down.fetch_add(static_cast<std::uint64_t>(available),
+                                       std::memory_order_relaxed);
+  } else {
+    stats_.bytes_tunnel_up.fetch_add(static_cast<std::uint64_t>(available),
+                                     std::memory_order_relaxed);
+  }
+  arm_write(dst);
+}
+
+bool Reactor::maybe_enter_tunnel(const std::shared_ptr<Connection>& upstream) {
+  auto it = connections_.find(upstream->peer_fd());
+  if (it == connections_.end()) return false;
+  const std::shared_ptr<Connection> downstream = it->second;
+  if (!downstream->pending_upgrade()) return false;  // 没握手意图：一次判定都不做
+
+  const std::size_t head_len = upstream->detect_response_head_101();
+  if (head_len == std::string_view::npos) {
+    // 到这里只可能是两种"还不成立"：完整响应头没到齐，或到了但不是 101。
+    // 都不改变隧道语义判定的材料（字节没被消费过），等下一轮可读再来一次即可。
+    return false;
+  }
+  // 101 的响应头是握手的一部分，必须**先原样交给客户端**再谈隧道：此刻上游
+  // 入向可读区的开头就是整个头（配对连接在握手期间不会有第二条响应进来）。
+  if (!downstream->queue_bytes(upstream->inbound().readable_data(), head_len)) {
+    return false;  // 下游出向满了：头留在原地，等腾出空间后的下一轮再进隧道
+  }
+  upstream->inbound().consume(head_len);
+  stats_.bytes_tunnel_up.fetch_add(static_cast<std::uint64_t>(head_len),
+                                   std::memory_order_relaxed);
+  downstream->take_upgrade_pending();  // 意图已被消费：这条配对连接的握手到此完成
+  upstream->enter_tunnel();
+  downstream->enter_tunnel();
+  // release_scratch() 自 S1-04 落地以来的**唯一**调用点。触发点就是这里
+  // （101 之后），不是"请求结束"——交接段点名的那条禁止路径在结构上不成立：
+  // Connection 里没有任何自动调用它的地方。
+  downstream->release_scratch();
+  stats_.upgrades_101.fetch_add(1, std::memory_order_relaxed);
+  arm_write(downstream);
+  return true;
+}
+
 void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::uint32_t revents) {
   if (conn->state() == State::kConnecting) {
     if ((revents & EPOLLOUT) == 0) return;
@@ -431,10 +581,38 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
     }
   }
 
+  if (conn->state() == State::kClosing) {
+    // 一次性配对（S1-05 的 close 语义）把上游置成 kClosing 后，它唯一该做的
+    // 是把出向的货刷完。这里不再读新字节：留着读就等于让"已决定关闭"的上游
+    // 还能往下游灌第二条响应，而那条响应没人负责判定边界（边界判定归 S1-06）。
+    if ((revents & EPOLLOUT) != 0) flush_outbound(conn);
+    return;
+  }
+
   if ((revents & (EPOLLIN | EPOLLHUP)) != 0) {
+    if (conn->tunneling()) {
+      // 隧道（ADR-09）：双向都是不透明字节，方向只由角色决定。
+      const Buffer::ReadResult read = conn->read_raw();
+      if (read.errno_value != 0) {
+        close_connection(conn);
+        return;
+      }
+      const bool eof = read.peer_closed || (revents & EPOLLHUP) != 0;
+      auto it = connections_.find(conn->peer_fd());
+      if (it != connections_.end()) {
+        pump_tunnel(conn, it->second);
+      }
+      if (eof) close_connection(conn);
+      return;
+    }
     const Connection::ReadRound round = conn->on_readable();
     if (round.read.errno_value != 0) {
       close_connection(conn);
+      return;
+    }
+    if (maybe_enter_tunnel(conn)) {
+      // 握手完成：101 已排进下游出向缓冲，帧字节留在上游缓冲里，
+      // 由后续可读事件/可写重试按隧道路径搬运。本条事件到此为止。
       return;
     }
     pump_upstream_to_downstream(conn);
@@ -483,12 +661,20 @@ void Reactor::flush_outbound(const std::shared_ptr<Connection>& conn) {
   if (it == connections_.end()) return;
   const std::shared_ptr<Connection> peer = it->second;
   if (conn->role() == Role::kDownstream) {
-    pump_upstream_to_downstream(peer);
+    if (peer->tunneling()) {
+      pump_tunnel(peer, conn);  // 对端（上游）在隧道里：重试帧字节的搬运
+    } else {
+      pump_upstream_to_downstream(peer);
+    }
   } else {
     // 我刚腾出空间的那个 fd 是**上游**，所以压着不动的是对端（下游）那条还没转出去的
     // 请求。走 forward_pending_requests 而不是只试一次：出向缓冲刚空出来，
     // 排队的请求可能有好几条，只放一条过去就等于把同一个 bug 换成另一个触发条件。
-    (void)forward_pending_requests(peer);
+    if (peer->tunneling()) {
+      pump_tunnel(peer, conn);  // 下游在隧道里：重试帧字节往上游的搬运
+    } else {
+      (void)forward_pending_requests(peer);
+    }
   }
 }
 

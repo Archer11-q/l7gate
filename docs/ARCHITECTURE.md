@@ -2,7 +2,7 @@
 
 > 契约第 6 节第 2 步要求这里写的是**已实现的现状，不是规划**。所以我用两个明确分开的部分：第 1 节是仓库里真实存在、能构建能跑的东西；第 3 节是已定但未实现的结构意图，只到「接口形状」这一层，避免把愿望写成事实。
 >
-> 现状一句话：**仓库里有了一个能转发请求的网关骨架，但它还不认识 HTTP 的语义。** `l7gate --serve` 起一个单线程 epoll 边缘触发循环，下游收到的完整请求按**原始字节**搬到上游、上游的响应按原始字节搬回来，keep-alive 复用同一条回源连接——10000 个真 curl 请求跑完 fd 回到基线、存活连接归零。它不做状态码映射、不改写响应、不解析 Upgrade、畸形请求只关连接不回 400，这些全部是 S1-06/S1-05 的活。filter 链、路由、负载均衡、限流、熔断、多线程、连接池仍然未实现。
+> 现状一句话：**仓库里有了一个能转发请求、并且认得 101 的网关骨架，但它还不认识 HTTP 的其余语义。** `l7gate --serve` 起一个单线程 epoll 边缘触发循环，下游收到的完整请求按**原始字节**搬到上游、上游的响应按原始字节搬回来，keep-alive 复用同一条回源连接；`Connection: close` 按语义兑现成一次性配对，带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**（帧不解析、不改写，ADR-09）——10000 个真 curl 请求跑完 fd 回到基线、存活连接归零。它不做状态码映射、不改写响应、畸形请求只关连接不回 400，这些是 S1-06 的活。filter 链、路由、负载均衡、限流、熔断、多线程、连接池仍然未实现。
 
 ## 1. 当前真实存在的模块
 
@@ -25,26 +25,29 @@ l7gate/
 │   │   ├── stats.h         ReactorStats：全原子的观测面（「观测不是同步手段」）
 │   │   ├── buffer.h        Buffer + Config + ReadResult：接口、不变量、口径都写在头文件
 │   │   ├── buffer.cc       读满即停 / 压缩 / 扩容 / 水位停止 / 空仓归还 / 写到 EAGAIN
-│   │   ├── connection.h    Connection：一条 fd + 入向/出向 Buffer + 解析游标 + view 生命周期
-│   │   ├── connection.cc   已扫描游标推进 / 惰性分配 / generation 作废判定 / 收尾释放
+│   │   ├── connection.h    Connection：一条 fd + 入向/出向 Buffer + 解析游标 + view 生命周期 + 隧道态
+│   │   ├── connection.cc   已扫描游标推进 / 惰性分配 / generation 作废判定 / 101 检测 / 收尾释放
 │   │   ├── reactor.h       Reactor + Config：六步关闭、ET accept、延后析构的接口与理由
-│   │   └── reactor.cc      事件循环、上下游配对、双向 pump、背压挂起点的形状
+│   │   └── reactor.cc      事件循环、上下游配对、双向 pump、隧道 pump、背压挂起点的形状
 │   └── http/
 │       ├── request_parser.h    三态返回 + 22 个错误码 + ParsedRequest 的字段口径
-│       └── request_parser.cc   请求行 / 头部区 / CL 与 chunked 框架的校验与定位
+│       ├── request_parser.cc   请求行 / 头部区 / CL 与 chunked 框架的校验与定位
+│       ├── response_head.h     两个纯函数：找响应头终止串 / 判定完整 101 头（S1-05 的全部响应知识面）
+│       └── response_head.cc    定长前缀比较 + "终止串恰好收尾"；不校验其余内容——透传不裁决
 └── tests/
     ├── CMakeLists.txt      gtest_discover_tests：标签按阶段打（s1），任务级筛选靠套件名，TIMEOUT 30
-    ├── pipe_fixture.h      非阻塞管道夹具，S1-02 与 S1-03 共用
-    ├── test_upstream.h     仓库内极简 HTTP 上游：单测夹具，也是冒烟脚本的服务端
+    ├── pipe_fixture.h      非阻塞管道夹具，S1-02/03/05 共用（S1-05 起 PipePair 从 connection_test 上移在此）
+    ├── test_upstream.h     仓库内极简 HTTP 上游：单测夹具，也是冒烟脚本的服务端（S1-05 起懂 101 与 close）
     ├── test_upstream_main.cc  上面那个类的独立可执行版（l7gate_test_upstream）
     ├── build_info_test.cc  6 条工具链断言（S1_01_Toolchain）
     ├── buffer_test.cc      9 条缓冲断言（S1_02_Buffer），含 10000 次随机读写与 1 KiB keep-alive 稳态
     ├── request_parser_test.cc  21 条解析断言（S1_03_Parser），含 37 类畸形输入与 40000 例随机字节
-    ├── connection_test.cc  11 条（S1_04_Connection）+ 3 条写入侧（S1_04_BufferWrite）
-    └── reactor_test.cc     10 条（S1_04_Reactor），含真 curl 之外的 10000 请求生命周期用例
+    ├── connection_test.cc  11 条（S1_04_Connection）+ 3 条写入侧（S1_04_BufferWrite）+ 4 条隧道语义（S1_05_Connection）
+    ├── reactor_test.cc     10 条（S1_04_Reactor），含真 curl 之外的 10000 请求生命周期用例 + 5 条握手闭环（S1_05_Reactor）
+    └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 10 事件循环 = 60**。S1-04 交出去 24 条。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 = 74**。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数）。
 
 ### 1.1 `core/build_info`
 
@@ -125,7 +128,7 @@ S1-04 之前它是仓库里唯一的功能模块，现在 `net/` 已经把它比
 
 ### 1.6 `net/Connection`：一条 fd，和 S1-03 欠的两笔债的还款地点
 
-`Connection` = `UniqueFd` + Role（下游/上游）+ State（kConnecting/kOpen/kClosing/kClosed）+ 入向 `Buffer` + 惰性出向 `Buffer` + 惰性 `ParseScratch` + 解析游标 + view 生命周期。它只回答两个问题：「这个 fd 上到了什么字节」「这些字节里有没有一个完整的、合法的请求」。**它不做路由、不做转发决策、不碰 epoll**——那些是 reactor 的策略。分开不是审美：S1-08 的 filter 链要插在策略侧，如果策略埋在连接对象里，「新增 filter 不改主路径任何一行」那条验收就只能靠重构来实现。
+`Connection` = `UniqueFd` + Role（下游/上游）+ State（kConnecting/kOpen/kClosing/kClosed）+ 入向 `Buffer` + 惰性出向 `Buffer` + 惰性 `ParseScratch` + 解析游标 + view 生命周期 + 隧道态（S1-05 加，见 1.13）。它只回答两个问题：「这个 fd 上到了什么字节」「这些字节里有没有一个完整的、合法的请求」——隧道态下第二个问题被短路掉，第一个问题继续如实回答。**它不做路由、不做转发决策、不碰 epoll**——那些是 reactor 的策略。分开不是审美：S1-08 的 filter 链要插在策略侧，如果策略埋在连接对象里，「新增 filter 不改主路径任何一行」那条验收就只能靠重构来实现。
 
 四处值得单独写：
 
@@ -189,6 +192,24 @@ S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲�
 
 这和我在 S1-01 就写进 `build_info` 的那条断言（`RequestedSanitizersAreActuallyCompiledIn`）是同一件事的两半：先证明 sanitizer 真的编译进去了，再证明它真的会报。两半都过，"ASan/LSan 干净"才是一条可复现的结论，而不是我的一句自述——契约第 7 节要求任务收尾时有 `bash scripts/verify-all-presets.sh` 这一条命令能复现它，就是为此。
 
+### 1.13 `http/response_head` 与隧道态：S1-05 落地的三件事
+
+这个任务我交付的不是"WebSocket 支持"——帧的验证、分派、心跳全部不存在（ADR-09 明写只透传）——而是三件互相咬合的小事：**认出 101、把连接转成字节隧道、把 close 头兑现成一次性配对**。
+
+**判定面是 `http/response_head` 的两个纯函数，和请求侧解析器同一个理由与 socket 完全分离。** `find_header_terminator(data, len, from)` 只找 `CRLFCRLF`；`looks_like_101_response_head(data, len)` 的口径我逐字节钉死：终止串必须**恰好收尾**（`term == len-4`，头后还有字节就不是"头部区的边界"）、前缀 `HTTP/1.` 且大版本必须是 '1'（HTTP/2 没有文本口径，ADR-01）、状态码恰好三位（第 12 字节必须是 SP 或 CR——这一格是 `NearMissesAreAllRejected` 的 "HTTP/1.1 1015" 样本逼出来的，第一版没查它，四位码被误判成 101）、**minor 不拒**（`HTTP/1.0 101` 成立：判定认的是状态码，老上游回 101 用 1.0 是真实形态，拒掉等于把能成的握手判成不能成）。除此之外一概不校验——不比对 `Sec-WebSocket-Accept`、不数 `Upgrade` 头。**透传不裁决**：网关若校验握手内容，就把"上游必须按我的理解实现"写进了契约，那是 ADR-09 拒绝的立场。连接层的 `detect_response_head_101()` 带 `head_scan_pos_` 游标（npos 时回退 3 字节的重叠窗口，跨界终止串不放过），它问的问题和纯函数不同——"可读区**开头**是不是完整 101 头、占几字节"——所以 101 + 首帧同段到达（TCP 合包常态）时它必须返回头长而不是 npos。这条分工我第一版测试写反了（把纯函数的"头后有字节就拒"搬进连接层用例），跑出来才看清哪个才是对隧道正确的语义。
+
+**握手成立与否由网关侧的双条件决定：`Connection` 头里有 `upgrade` 记号（逗号分隔、大小写不敏感、剥 OWS）且存在 `Upgrade` 头。** 只有 `Upgrade:` 头没有记号、或只有记号没有头，都不记意图。`TestUpstream` 刻意比网关宽松（见 `Upgrade:` 就回 101）——这个不对称组合是设计出来的：宽松上游回出的 101 对没记意图的网关来说就是一段普通响应字节，原样漏给下游，`upgrades_101` 保持 0。负例（`UpgradeHeaderWithoutConnectionTokenIsNotATunnel`）测的正是"点燃隧道的按钮在网关的判定手里，不在上游的脾气手里"。
+
+**意图是一次性的，用"取"不用"读"。** 转发前 `mark_upgrade_request()` 把意图记在连接上（view 作废也丢不掉），101 到达点 `take_upgrade_pending()` 取走——同一条连接上更晚的普通响应不会被更早一次没成形的意图误点燃。take-once 我原先写在 reactor 层测，第一轮就失败了：在宽松 echo 上游上，第二条普通请求会被上游当隧道字节弹回来，那测的是对端不是网关；删掉后改在 Connection 层直测三个接口的时序（`UpgradeIntentSurvivesRequestAndIsTakenOnce`），失败原因也写进了测试文件的注释里。**`Connection::release_scratch()` 的调用点全仓只有一个**：`maybe_enter_tunnel` 把完整 101 头排进下游出向缓冲之后。交接段那条红线（不许写成"请求结束就释放"）落成的是结构而不是约定——接口上不存在任何自动释放路径，想触发只能显式调用。隧道化之后 100k 空闲长连接那 200 MB 的 scratch 预算（1.6 第四条）才算真的省到手。
+
+**隧道里字节只负责搬。** `pump_tunnel` 与 `forward_request` 同一条背压口径：装不下**一个字节都不动**；两个方向各记 `bytes_tunnel_down`/`bytes_tunnel_up`（101 头本身计入上行），`upgrades_101` 每条隧道恰好一次。`Connection::on_readable()` 顶部有 tunneling 短路——少了它，101 之后第一帧二进制字节会被下游侧当请求解析成畸形、被**我自己的透传逻辑**杀掉（`TunnelModeShortCircuitsParsing` 断言帧字节不产生任何 `parse_calls`、不重建 scratch）。ET 契约不变：`read_raw()` 同样读到 EAGAIN 或撞水位为止。
+
+**close 语义的教训是这个任务里唯一的设计级返工。** 第一版我在转发 close 请求后立即 `close_connection(upstream)`——那会在响应字节还没产生/没送达时关掉回源 fd，等于把已经接受的请求丢掉。改成**意图传播**：下游 close 请求 → `downstream.mark_close_after_forward()` + `upstream.mark_close_after_response()` + `close_headers_honored` 计数，**不 eager close**；实际收尾走既有的 EOF 级联（上游按 close 语义回完响应自己收尾 → 六步关闭 → 级联下游）。「几条字节算一条响应完结」的精确边界判定**刻意不预支**——那是 S1-06 的响应语义面，网关不在没有框架知识的情况下猜边界。口径写死在 `connection.h` 的接口注释上，防止被误读成"立刻关"。
+
+实测（全部本任务重跑取数）：三 preset 各 **74/74**（debug 4.31 s / asan-ubsan 8.39 s / tsan 9.45 s，TSan 下含 5 条握手闭环用例**零 data race 报告**），非 gtest 警告 **0 条**；`scripts/smoke-s1-04.sh` 回归通过——10000 请求 3.03 s、fd 9→9、`header_scan_bytes == bytes_down_to_upstream == 838,894` 仍然逐字节相等（隧道路径没有扰动普通转发的稳态）。S1-05 新交 14 条：5 纯函数（含全称前缀断言与 12 类近邻样本）+ 4 连接层 + 5 reactor 闭环（三条请求各自对应响应且共用一条下游连接、close 端到端、二进制帧逐字节回显比对、negative 组合、101 三段切分拼回原样）。
+
+已知边界，照记不藏：`--serve` 冒烟脚本不覆盖 upgrade 路径（curl 造 101 闭环要额外的 `--upload` 花活，收益低于 reactor 用例）；隧道的撞水位后恢复仍与 S1-07 的背压动作是同一个缺口；`bytes_tunnel_up/down` 是累计字节不是速率，S3 的指标面再说。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -210,7 +231,7 @@ S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲�
 
 - **S1-07 的背压：钩子齐了，动作没做。** Buffer 侧（`ReadResult::limit_reached` + 「返回时 `readable_bytes() <= high_water_mark`」）和 Connection 侧（`queue_bytes` 装不下整块就返回 false）都就位，`high_water_hits` 也在统计。缺的是 reactor 里那一步：**收到 `limit_reached` 就摘掉该 fd 的 EPOLLIN，等对端腾出空间再把读事件加回来**。现在的行为是撞水位后继续让 EPOLLOUT/EPOLLIN 挂着、靠 `forward_pending_requests` 返回 `kBlocked` 把字节留在原地——不丢数据，但也不压对端，所以「内存不继续增长」这条能过、「停止消费下游可读事件」那条不能过。这个缺口是我明知故留的：S1-04 的验收只打生命周期，把背压混进去会让两条结论互相解释不清。
 - **转发语义（S1-06）**：`on_downstream_readable` 里 `round.reject` 那一行现在只做一件事——关连接。它就是 ParseError→400/411/413/501 那张映射表将插入的位置，22 个错误码在 S1-03 就已经 `to_string` 齐了。响应侧目前完全不认识状态码、不判定截断、不做 chunked 框架的透传验证。
-- **Upgrade 透传（S1-05）**：`release_scratch()` 已经落地并且有断言（`ReleaseScratchInvalidatesViews`），但**没有人调用它**——真正的触发点是 Upgrade 握手完成。留一个没人调的函数比留一个"顺手在请求结束时释放"的函数诚实：后者会把 keep-alive 的下一个请求打回重新分配，那个 2048 字节就白省了。
+- **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
 - **多 Reactor + 上游连接池（S2）**：连接对象的销毁路径从 S1 就按"可能被别的线程持有"设计（六步关闭 + `retiring_`），`ReactorStats` 全原子也是给 TSan 留的基线——这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的具体支出。`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方。
 - **`filter/chain`（S1-08）**：空壳先立。验收标准是「新增 filter 不修改转发主路径的任何一行代码」——S1-04 之后主路径真的存在了（`forward_pending_requests` → `forward_request` → `pump_upstream_to_downstream`），所以这条验收现在才有意义：它检验的是"我能不能在不动这三条函数的情况下插进去"。
 - **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。

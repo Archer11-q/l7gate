@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
+
+#include "http/response_head.h"
 
 namespace l7gate::net {
 
@@ -89,6 +92,14 @@ bool Connection::advance_header_scan() noexcept {
 }
 
 Connection::ReadRound Connection::on_readable() {
+  if (tunneling_) {
+    // 隧道里没有"请求"这个单位（ADR-09）：字节只负责搬，不负责被解析。
+    // 上游角色本来就跳过解析，这里是下游侧的等价短路——少了它，101 之后的
+    // 第一帧二进制字节会被当请求解析、判成畸形、整条连接被我自己的透传逻辑杀掉。
+    ReadRound round;
+    round.read = read_raw();
+    return round;
+  }
   ReadRound round;
   round.read = inbound_.read_until_blocked(fd_.get());
   if (round.read.limit_reached) {
@@ -227,6 +238,34 @@ void Connection::release_scratch() noexcept {
   request_.reset();
   request_ready_ = false;
   request_parsed_counted_ = false;
+}
+
+Buffer::ReadResult Connection::read_raw() noexcept {
+  Buffer::ReadResult read = inbound_.read_until_blocked(fd_.get());
+  if (read.limit_reached) {
+    stats_->high_water_hits.fetch_add(1, std::memory_order_relaxed);
+  }
+  return read;
+}
+
+std::size_t Connection::detect_response_head_101() noexcept {
+  const std::uint8_t* d = inbound_.readable_data();
+  const std::size_t n = inbound_.readable_bytes();
+  std::size_t from = head_scan_pos_;
+  if (from > 0) from -= 3;  // 回退一个终止串的重叠窗口，跨界形态不放过（同下游游标那条）
+  const std::size_t term = http::find_header_terminator(d, n, from);
+  if (term == std::string_view::npos) {
+    head_scan_pos_ = (n > 3) ? n : 0;
+    return std::string_view::npos;
+  }
+  // 101 是三条字节的定长前缀比较，合法响应头不可能大到让"重复判定"成为成本，
+  // 所以这里不留"已判定非 101"的缓存位：一个需要记得失效的缓存位，
+  // 就是 ARCHITECTURE 1.4 第四条说的那种"看起来有两个旋钮"的东西。
+  head_scan_pos_ = 0;
+  if (!http::looks_like_101_response_head(d, term + 4)) {
+    return std::string_view::npos;  // 完整响应头但不是 101：隧道语义不成立
+  }
+  return term + 4;
 }
 
 }  // namespace l7gate::net
