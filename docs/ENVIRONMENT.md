@@ -46,7 +46,7 @@ git config user.name; git config user.email   # 提交前置检查
 | perf | 未锁 | 7.0.14 | ⚠️ 待验证，见第 4 节 |
 | vCPU | SLO #3 写死 16 | 16 | ✅ |
 | 内存 | 未锁 | ≈11 GB（WSL 分配上限） | ✅ 100k 长连接目标够用 |
-| Docker CLI | 必需 | **可用且基线镜像已就位**：Docker 29.4.3（build 055a478）、Docker Compose v5.1.3、引擎侧 Server 29.4.3 / storage driver `overlayfs` / `NCPU=16` / `MemTotal=12407373824`（与本机 `nproc=16`、`MemTotal=12116576 kB` 同一台机器同一上限，**不是另起一台小 VM**）；`nginx:1.25.4` 已 pull 成功，id/digest `sha256:9ff236ed47fe39cf1f0acf349d0e5137f8b8a6fd0b46e5117a401010e56222e1`，容器内 `nginx -v` = **nginx/1.25.4**（契约 9.1 锁定的 tag 字面命中） | ✅ 已解锁（2026-10-26 由用户换掉失效 mirror 之后） |
+| Docker CLI | 必需 | **当前不可用（2026-10-26 23:3x 复查）**：本发行版内 `docker` 报"could not be found in this WSL 2 distro，建议开启 WSL Integration"——白天开启过的集成又掉了。**当天 20:44 之前它是好的**，那一时段完成了 `nginx:1.25.4` 的 pull 与 B-005 五档取数（引擎 29.4.3 / compose v5.1.3 / overlayfs / NCPU 16 / 同内存上限，全部实测在册）。 | ⚠️ 影响 **#3 基线的可复现性**（S5 终判前要能重跑），不影响 B-005 已记录的数据与原始输出；修复在 Docker Desktop 图形界面侧，我不自行改共享环境配置 |
 | GitHub SSH | 必需 | 认证成功（`ssh -T git@github.com` 返回 `Hi <user>!`） | ✅ |
 | git | 必需 | 2.53.0，`user.name` / `user.email` 已配置 | ✅ |
 
@@ -119,7 +119,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 - 这项我没有验证——S1/S2 还用不到它，但**绝不能到 S5 才发现用不了**。
 - 计划：S4 期间跑一次 `perf stat -a sleep 1` 与最小火焰图冒烟，结果补进本文件。如果不通，备选是微软官方 WSL 内核的 perf 支持路径，或退到 `async-profiler`/eBPF 之外的用户态统计手段（届时按 8.2 禁令先写 ADR）。
 
-## 5. Docker Desktop WSL Integration（2026-10-26 已开启，但镜像源仍阻塞 SLO #3）
+## 5. Docker Desktop WSL Integration（当天开过、当天又掉了；#3 基线目前不可复现）
 
 Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3）。**用户已于 2026-10-26 在 Docker Desktop 里开启本发行版的 WSL Integration**，实测：`docker --version` = 29.4.3（build 055a478）、`docker compose version` = v5.1.3、`docker info` 引擎侧 Server 29.4.3 / storage driver `overlayfs`——**引擎这一侧真的可用**，本文件第 2 节原先那句「❌ 阻塞项」已按实测改成半开状态。
 
@@ -151,6 +151,8 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 | 容器 → `$(WSL eth0 IP):上游端口` | **200 + 1024 字节** | 出向要走容器→WSL 那一跳；上游因此必须绑 `0.0.0.0`（绑 `127.0.0.1` 容器够不到） |
 
 于是 **#3 的「同机、同参数」在网络这一维上做不齐**：nginx 的客户端 leg 多一次端口发布（DNAT/userland proxy）、上游 leg 多一次容器出向，而网关两侧都是原生回环。方向上这是**拖累 nginx**，所以拿它算出来的 `QPS_网关/QPS_nginx` 对**我**偏乐观——B-005 的比值和结论都带着这条声明，#3 是否算"达标"由项目所有人裁，我不给自己发这张证明。另外两条同场记下的不齐项：nginx 容器用的是它自己镜像的 libc/分配器（契约要求「同一分配器记录」，这一条没满足）；镜像默认 `worker_processes auto` = 16 worker，而 S1 按 ADR-03 就是单 Reactor（多线程是 S2 的内容）——所以 B-005 额外跑了「关 access_log」与「单 worker」两个**只差一个变量的对照组**，用来把"日志写盘"和"并发分摊"这两维从差值里拆出来。
+
+**同日 23:3x 复查追加一条（当前状态）**：仓库搬到 `workspace/` 之后重跑门禁时，`docker` 在本发行版里又不可用了（WSL Integration 掉线）。这一条只影响 **#3 基线的可复现性**（S5 终判要求那一轮能重跑），不影响 B-005 已记录的数据与 `build/bench/s2-nginx-*/` 里的原始输出。修它在 Docker Desktop 的图形设置里，属共享环境，按纪律报给项目所有人、我不自行改动。顺带一句值得留档的：`s2-qps-vs-nginx.sh` 遇到镜像不在本地时是**直接拒绝并说明原因**（`✗ 本机没有 nginx:1.25.4 镜像（契约锁定的基线 tag，我不换）`），而不是悄悄换个别的 web server 顶一个数出来——这正是契约 8.2 禁令一在脚本层该有的样子。
 
 ## 6. 文件系统位置（会影响数据的一条）
 
