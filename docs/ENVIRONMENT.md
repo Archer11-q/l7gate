@@ -46,7 +46,7 @@ git config user.name; git config user.email   # 提交前置检查
 | perf | 未锁 | 7.0.14 | ⚠️ 待验证，见第 4 节 |
 | vCPU | SLO #3 写死 16 | 16 | ✅ |
 | 内存 | 未锁 | ≈11 GB（WSL 分配上限） | ✅ 100k 长连接目标够用 |
-| Docker CLI | 必需 | **可用**：Docker 29.4.3（build 055a478）、Docker Compose v5.1.3、`docker info` 引擎侧 Server 29.4.3 / storage driver `overlayfs`，WSL Integration 已由用户开启（2026-10-26 实测） | ⚠️ 半开：**引擎可用，但拉不到镜像**——配置里的 registry mirror `docker.mirrors.ustc.edu.cn` 域名已不存在（`getent hosts` 报 no such host），而 `registry-1.docker.io` 直连 HTTPS 返回 `000`（DNS 能解析、连接不通）。阻塞的是 SLO #3 的 Nginx 基线，见第 5 节 |
+| Docker CLI | 必需 | **可用且基线镜像已就位**：Docker 29.4.3（build 055a478）、Docker Compose v5.1.3、引擎侧 Server 29.4.3 / storage driver `overlayfs` / `NCPU=16` / `MemTotal=12407373824`（与本机 `nproc=16`、`MemTotal=12116576 kB` 同一台机器同一上限，**不是另起一台小 VM**）；`nginx:1.25.4` 已 pull 成功，id/digest `sha256:9ff236ed47fe39cf1f0acf349d0e5137f8b8a6fd0b46e5117a401010e56222e1`，容器内 `nginx -v` = **nginx/1.25.4**（契约 9.1 锁定的 tag 字面命中） | ✅ 已解锁（2026-10-26 由用户换掉失效 mirror 之后） |
 | GitHub SSH | 必需 | 认证成功（`ssh -T git@github.com` 返回 `Hi <user>!`） | ✅ |
 | git | 必需 | 2.53.0，`user.name` / `user.email` 已配置 | ✅ |
 
@@ -135,7 +135,22 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 
 所以形状很清楚：**网络是通的，坏的是"指定了一个已经死掉的 mirror，而直连官方源又被拦"**。这不是我能靠改配置修好的——registry-mirrors 在 Docker Desktop 那一侧（`Settings → Docker Engine` 的 JSON），属于用户的机器与共享环境，按契约 10.1 那条"环境类阻塞先停先报"的精神，我停在这里请示，给了三个候选（换 mirror / 允许经第三方镜像站 pull 后 tag 成 `nginx:1.25.4` 并把来源不可核验记进口径 / #3 留账后补）。
 
-**这条直接决定 SLO #3 能不能判定**：#3 的判定式是 `QPS_网关 / QPS_nginx ≥ 60%`，而 `nginx:1.25.4` 是契约 9.3 锁定的基线镜像 tag——中途换 tag 会让历史数据断代，所以我不动 tag，也不接受"换个别的 web server 顶一下"那种替代（那等于换一个分母）。S1 门禁第 1 条里的 **#3 在 Nginx 基线跑起来之前仍然只有自测 QPS**（经网关 21,582.93 / 直连 57,170.55，B-004），这条已按项目所有人 2026-10-26 的裁决记为「S1 不合格，等镜像源解决后补测」，见 `docs/ROADMAP.md` 的待裁决清单。
+**这条直接决定 SLO #3 能不能判定**：#3 的判定式是 `QPS_网关 / QPS_nginx ≥ 60%`，而 `nginx:1.25.4` 是契约 9.3 锁定的基线镜像 tag——中途换 tag 会让历史数据断代，所以我不动 tag，也不接受"换个别的 web server 顶一下"那种替代（那等于换一个分母）。S1 门禁第 1 条里的 **#3 在当时那一轮只有自测 QPS**（经网关 21,582.93 / 直连 57,170.55，B-004），按项目所有人的裁决记为「不合格，等镜像源解决后补测」——**这一条已经在同日 5.1 之后补到位**（B-005 有 nginx 三档 + 网关 + 直连天花板五档读数），但补到之后我仍把 #3 记成「有读数、判定暂缓」，理由全写在 B-005，不在这里重复。
+
+### 5.1 mirror 已由用户换掉，基线跑通了（同日）；但容器拓扑给 #3 留了一条不可忽略的偏差
+
+用户在 Docker Desktop 里换掉失效 mirror 之后，`docker pull nginx:1.25.4` 成功，`scripts/bench/s2-qps-vs-nginx.sh` 五档全部跑通（基线记录见 `docs/BENCHMARK.md` B-005）。**镜像身份的核验有一条缺口，照记**：本机直连 `registry-1.docker.io` 与 `hub.docker.com` 都建不起连接（`000`），所以我**无法把这个本地 digest 与官方仓库的 digest 比对**；本地能看到的事实是 tag = `1.25.4`、容器内 `nginx -v` = `nginx/1.25.4`、`image id = sha256:9ff236ed47fe…`，来自换好之后配的那个 mirror。这一条不影响 nginx 自己报告的行为，但意味着"基线来源可信度"依赖那个 mirror  faithfully 镜像了 Docker Hub——我没有办法在这台机器上证明它，所以写在这里而不是假装核验过。
+
+**容器的网络可达性是实测出来的，不是猜的**（这直接决定 #3 的测量条件能不能成立）：
+
+| 探测 | 结果 | 结论 |
+|---|---|---|
+| `docker run --network host` 后从 WSL 看 `ss -ltn` / `curl 127.0.0.1:80` | 监听表里没有 `:80`，curl `000` | **`--network host` 不共享本发行版的网络命名空间**——容器那条路走不通，别指望它绕开 NAT |
+| WSL → 容器 bridge IP（`172.17.0.2:80`） | `000` | bridge IP 从 WSL 侧不可路由 |
+| WSL → `127.0.0.1:发布端口`（`-p`） | **200** | 唯一可测的入口就是端口发布 |
+| 容器 → `$(WSL eth0 IP):上游端口` | **200 + 1024 字节** | 出向要走容器→WSL 那一跳；上游因此必须绑 `0.0.0.0`（绑 `127.0.0.1` 容器够不到） |
+
+于是 **#3 的「同机、同参数」在网络这一维上做不齐**：nginx 的客户端 leg 多一次端口发布（DNAT/userland proxy）、上游 leg 多一次容器出向，而网关两侧都是原生回环。方向上这是**拖累 nginx**，所以拿它算出来的 `QPS_网关/QPS_nginx` 对**我**偏乐观——B-005 的比值和结论都带着这条声明，#3 是否算"达标"由项目所有人裁，我不给自己发这张证明。另外两条同场记下的不齐项：nginx 容器用的是它自己镜像的 libc/分配器（契约要求「同一分配器记录」，这一条没满足）；镜像默认 `worker_processes auto` = 16 worker，而 S1 按 ADR-03 就是单 Reactor（多线程是 S2 的内容）——所以 B-005 额外跑了「关 access_log」与「单 worker」两个**只差一个变量的对照组**，用来把"日志写盘"和"并发分摊"这两维从差值里拆出来。
 
 ## 6. 文件系统位置（会影响数据的一条）
 
