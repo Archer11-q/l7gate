@@ -52,6 +52,13 @@ class Reactor {
     // 唯一需要提前想清楚的闸门（rlimit 侧的 NoFile 检查归 S2）。
     std::size_t max_connections = 4096;
 
+    // S2-02（ADR-15）：本 worker 的上游连接池里最多留多少条**空闲**热上游。
+    // 归还时池已满就直接关掉而不是放回——这是每连接内存（SLO #2）的硬上界。
+    // 它和 max_connections 的关系：在飞配对的上游 + 池里空闲的上游 + 下游都算进
+    // connections_，所以 pool_max_idle 要显著小于 max_connections，否则池会把 fd
+    // 预算吃光、导致下游在 ensure_upstream 那里被拒。
+    std::size_t pool_max_idle = 64;
+
     Connection::Config connection;
 
     // > 0 时：解析满这么多个请求就自动 stop()。压测和验收需要"跑固定轮数后
@@ -132,6 +139,10 @@ class Reactor {
   std::size_t request_filter_count() const noexcept { return request_filters_.size(); }
 
   std::size_t live_connection_count() const noexcept { return connections_.size(); }
+
+  // S2-02（ADR-15）：当前池里的空闲热上游数。**非原子观测**，和 live_connection_count()
+  // 同一类——只能在循环线程停下之后读（stats.h 第 25 行那条纪律）。
+  std::size_t pool_idle_count() const noexcept { return upstream_pool_.size(); }
 
   // --- S1-07 的「epoll 侧可断言」------------------------------------------
   // 验收句要的是"能观测到网关不再消费下游可读事件"，那话的主语是**注册表里的兴趣
@@ -250,9 +261,26 @@ class Reactor {
   // 理由同 pump_response_body：本体有七个 return 点，逐个补一句等于第七份抄本。
   ForwardOutcome forward_pending_requests_body(const std::shared_ptr<Connection>& downstream);
 
-  // 确保这条下游连接已经有配对的上游；没有就发起异步 connect 并配对。
+  // 确保这条下游连接已经有配对的上游；没有就**先从本 worker 的池里借**一条热上游
+  // （ADR-15），池空才发起异步 connect 新建并配对。借出的上游在这条下游的整个存活期
+  // 与它 1:1 配对（S1 的 keep-alive 复用不变）；下游关闭时上游归还进池而不是级联销毁。
   // 返回 nullptr 表示暂时还没有（正在 connect）或已达 fd 预算上限。
   std::shared_ptr<Connection> ensure_upstream(const std::shared_ptr<Connection>& downstream);
+
+  // --- 上游连接池（S2-02，ADR-15）：借 / 还 / 淘汰 --------------------------
+  // 池是**每 worker 一份**、只被本循环线程碰，所以全程无锁（ADR-14 的单线程拥有）。
+  // 从池里取一条仍可用的空闲热上游（跳过陈旧的）；池空返回 nullptr。计 pool_borrows。
+  std::shared_ptr<Connection> take_pooled_upstream();
+  // 这条上游现在能不能安全归还进池复用：kOpen、非隧道、非一次性配对、出向空、
+  // 响应跟踪停在干净边界（上一条响应已完整完结并复位）。任一不满足就淘汰而不是归还。
+  bool upstream_reusable(const Connection& upstream) const noexcept;
+  // 下游关闭时调用：可复用且池未满 → 解配、复位、重新只挂 EPOLLIN（监控对端 EOF）、
+  // 放回池，计 pool_returns；池满 → 关闭并计 pool_evictions_full。
+  void recycle_upstream(const std::shared_ptr<Connection>& upstream);
+  // 把这条上游从池的空闲表里摘掉（若不在池里是 no-op），返回它是否确实在池里。
+  bool evict_pooled(const std::shared_ptr<Connection>& upstream);
+  // 循环退出时排空池：停掉的 worker 不该留着热连接。关闭全部空闲上游并清表。
+  void drain_upstream_pool();
 
   // 关闭的**前置判断**：出向缓冲里还有没刷出去的字节时不能直接 close(fd)。
   // 那不是"少发一个响应"的语义问题，是我自己把已经接受的字节丢掉了：
@@ -291,6 +319,11 @@ class Reactor {
 
   std::unordered_map<int, std::shared_ptr<Connection>> connections_;
   std::vector<std::shared_ptr<Connection>> retiring_;
+
+  // 上游连接池（S2-02，ADR-15）：本 worker 的空闲热上游。它们**同时**在 connections_
+  // 里（仍注册在本 worker 的 epoll 上、监控对端 EOF），这里只是"哪些是空闲可借"的子集。
+  // 借出时从本表移除并配对；归还时放回本表并解配。每 worker 一份、只被循环线程碰，无锁。
+  std::vector<std::shared_ptr<Connection>> upstream_pool_;
 
   // 待探测读的连接（S1-07 的恢复路径）。持 shared_ptr 和 retiring_ 同一个理由：
   // 排队期间这条连接可能正好被关掉，出队时必须靠注册表反查认人，不能信手里的裸指针。

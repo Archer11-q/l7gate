@@ -626,17 +626,23 @@ TEST(S1_04_Reactor, TenThousandSequentialRequestsLeaveNothingAlive) {
                       .count();
 
   // 收尾从半关闭开始：我只发 FIN，然后看网关把这侧连接关掉（read() 返回 0）——
-  // 这是内核给的第一手证据，live_connections 归零只是它的副产品。
+  // 这是内核给的第一手证据。
   client.shutdown_write();
   ASSERT_TRUE(client.wait_for_eof(&why))
       << "客户端只发了 FIN，网关没有把这侧连接关掉：" << why;
   ReactorStats& stats = harness.reactor()->stats();
-  // 这里的顺序是刻意的：live_connections 是"已构造 - 已析构"，它在延后析构下
-  // 会短暂停在 2（fd 已关、对象还挂在 retiring_ 里）。所以等的不是"有没有关"，
-  // 而是同一批事件处理里那最后一步收尾 —— 关掉这件事我已经用 wait_for_eof
-  // 从内核那里看到证据了。
-  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
-      << "客户端已经关闭，但还有连接对象没析构：关闭路径漏了某一步，或两个对象互相抱着";
+  // **S2-02（ADR-15）改了这条用例的期望，改的是行为不是 bug**：下游关闭后，它配对的
+  // 上游不再级联销毁，而是**归还进池**、活得比下游久（等下一条下游来借）。所以客户端
+  // 关闭这一刻 live==1（池里那条热上游），不再是 0。先确认回收发生（pool_returns==1），
+  // 再 stop_loop 排空池——排空之后才有 live==0 / constructed==destructed。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 5000))
+      << "下游关闭后上游没有归还进池（ADR-15 的回收没发生）";
+  EXPECT_EQ(stats.load(stats.live_connections), 1u) << "回收后池里应当正好留着那 1 条热上游";
+  EXPECT_EQ(stats.load(stats.pool_borrows), 0u) << "单条下游全程独占它的上游，从没借过池";
+
+  harness.stop_loop();  // 排空池 + join；之后才允许读非原子的 epoll 计数
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 1000))
+      << "stop 排空池后仍有连接对象没析构：关闭路径漏了某一步，或两个对象互相抱着";
 
   // 所有计数在这一行之后就被复制成局部变量：后面的 shutdown_all() 会销毁 Reactor，
   // `stats` 这个引用届时悬空，拿它做断言就是读到什么算什么。
@@ -652,13 +658,11 @@ TEST(S1_04_Reactor, TenThousandSequentialRequestsLeaveNothingAlive) {
   EXPECT_EQ(parsed, static_cast<std::uint64_t>(kRequests));
   EXPECT_EQ(served, static_cast<std::uint64_t>(kRequests)) << "上游实际处理的条数也要是 10000";
   EXPECT_EQ(accepted, 1u) << "全程一条下游连接";
-  EXPECT_EQ(opened, 1u) << "全程一条回源连接，没有每请求新建";
+  EXPECT_EQ(opened, 1u) << "全程一条回源连接，没有每请求新建（池空时才建了这一次）";
   EXPECT_EQ(constructed, 2u) << "下游 1 + 上游 1";
-  EXPECT_EQ(destructed, 2u) << "两个都析构了：shared_ptr 引用计数确实归零";
+  EXPECT_EQ(destructed, 2u) << "两个都析构了：上游在 stop 排空池时析构，shared_ptr 引用计数归零";
   EXPECT_EQ(live, 0u);
   EXPECT_EQ(closed, 2u);
-
-  harness.stop_loop();  // join 之后才允许读非原子的 epoll 计数
   const std::uint64_t registrations = harness.reactor()->epoll_registrations();
   const std::uint64_t unregistrations = harness.reactor()->epoll_unregistrations();
   const std::uint64_t modifications = harness.reactor()->epoll_modifications();
@@ -832,7 +836,9 @@ TEST(S1_04_Reactor, IdleConnectionDoesNotSpinOnEpollOut) {
   client.shutdown_write();
   ASSERT_TRUE(client.wait_for_eof(&why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
-  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  // S2-02（ADR-15）：下游关闭后上游归还进池、live==1（不再是 0）。这条用例真正要断的
+  // 是下面那句"空闲期不自旋"，生命周期只是收尾核对——确认回收发生后 stop_loop 排空池。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 5000));
   harness.stop_loop();
 
   std::printf("[S1-04 idle] 3 请求 + 400ms 空闲：事件批次=%llu（wait_timeout_ms=50，"
@@ -2150,8 +2156,15 @@ TEST(S2_01_MultiReactor, TenThousandRequestsAcrossWorkersLeaveNothingAlive) {
     ASSERT_TRUE(c.wait_for_eof(&why)) << "客户端发了 FIN，网关没把这侧连接关掉：" << why;
   }
   ReactorStats& stats = harness.group()->stats();
-  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
-      << "客户端全关后仍有连接对象没析构";
+  // S2-02（ADR-15）：每条下游关闭后它的上游**归还进池**、活得比下游久，所以 8 条上游
+  // 此刻都在池里（live==8），不再是 0。先确认 8 次回收都发生，再 stop_loop 排空池。
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.pool_returns) == static_cast<std::uint64_t>(kConns); }, 5000))
+      << "8 条下游关闭后上游没有全部归还进池";
+
+  harness.stop_loop();  // 排空池 + join；之后才允许读非原子的聚合 epoll 计数
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 1000))
+      << "stop 排空池后仍有连接对象没析构";
 
   // 复制成局部量再用：shutdown_all() 会销毁 group_，stats 引用届时悬空。
   const std::uint64_t parsed = stats.load(stats.requests_parsed);
@@ -2169,10 +2182,12 @@ TEST(S2_01_MultiReactor, TenThousandRequestsAcrossWorkersLeaveNothingAlive) {
   EXPECT_EQ(accepted, static_cast<std::uint64_t>(kConns));
   EXPECT_EQ(opened, static_cast<std::uint64_t>(kConns)) << "keep-alive 下每条下游只开一条上游";
   EXPECT_EQ(constructed, 2u * static_cast<std::uint64_t>(kConns)) << "8 下游 + 8 上游 = 16";
-  EXPECT_EQ(constructed, destructed) << "构造与析构逐项相等（延后析构在批末兑现）";
+  EXPECT_EQ(constructed, destructed) << "构造与析构逐项相等（上游在 stop 排空池时析构）";
   EXPECT_EQ(closed, 2u * static_cast<std::uint64_t>(kConns));
+  // 池的证据：顺序驱动、每条下游全程独占它的上游（无并发借还）→ borrows=0、returns=8。
+  EXPECT_EQ(stats.load(stats.pool_borrows), 0u);
+  EXPECT_EQ(stats.load(stats.pool_returns), static_cast<std::uint64_t>(kConns));
 
-  harness.stop_loop();  // join 之后才允许读非原子的聚合 epoll 计数
   const std::uint64_t reg = harness.group()->epoll_registrations();
   const std::uint64_t unreg = harness.group()->epoll_unregistrations();
   // 聚合注册数 = N 个 worker 各自的常驻 wake_fd（各 1，~Reactor 才注销）+ 16 条连接；
@@ -2245,15 +2260,22 @@ TEST(S2_01_MultiReactor, ConcurrentLoadAcrossWorkersIsRaceFreeAndCorrect) {
   EXPECT_EQ(bad_responses.load(std::memory_order_relaxed), 0) << "有响应串号或截断";
 
   ReactorStats& stats = harness.group()->stats();
-  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
-      << "并发负载收尾后仍有连接活着";
+  // S2-02（ADR-15）：16 条下游关闭后各自的上游**归还进池**（live==16），不再是 0；
+  // 并发下晚启动的线程还可能借走早结束线程归还的热上游（pool_borrows>0），所以新建数
+  // 不确定，但"16 次回收"与"最终全部析构"这两条不变。先确认回收，再 stop_loop 排空池。
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.pool_returns) >= static_cast<std::uint64_t>(kThreads); }, 5000))
+      << "并发收尾后 16 条上游没有全部归还进池";
   const std::uint64_t parsed = stats.load(stats.requests_parsed);
   const std::uint64_t completed = stats.load(stats.responses_completed);
-  const std::uint64_t constructed = stats.load(stats.connections_constructed);
-  const std::uint64_t destructed = stats.load(stats.connections_destructed);
   EXPECT_EQ(parsed, static_cast<std::uint64_t>(kThreads) * kReqsPerThread);
   EXPECT_EQ(completed, parsed);
-  EXPECT_EQ(constructed, destructed);
+
+  harness.stop_loop();  // 排空池 → 全部上游析构
+  const std::uint64_t constructed = stats.load(stats.connections_constructed);
+  const std::uint64_t destructed = stats.load(stats.connections_destructed);
+  EXPECT_EQ(constructed, destructed) << "排空池后构造与析构逐项相等";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u) << "并发负载收尾后仍有连接活着";
   std::printf("[S2-01 concurrent] %d 线程 × %d 请求穿过 %d worker：parsed=%llu 收尾干净\n",
               kThreads, kReqsPerThread, kWorkers, static_cast<unsigned long long>(parsed));
 
@@ -2328,6 +2350,149 @@ TEST(S2_01_MultiReactor, HandoffConnectionWithImmediateRequestIsServed) {
   ReactorStats& stats = harness.group()->stats();
   EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kIterations));
   EXPECT_EQ(stats.load(stats.downstream_accepted), static_cast<std::uint64_t>(kIterations));
+  harness.shutdown_all();
+}
+
+// ===========================================================================
+// S2-02：per-worker 上游连接池（ADR-15）
+// ===========================================================================
+//
+// 池把上游连接数与下游**生命周期**解耦：下游关闭时它的上游归还进池、被下一条下游
+// 借走复用，而不是随之销毁。这三条各钉一面：
+//   一、核心价值——N 条短命下游只新建 1 条上游，其余全靠借池（churn 场景省握手）；
+//   二、ADR-15 点名的边界——空闲池内上游被对端关闭是**正常回收**，绝不许误计成
+//       upstream_truncated_before_head、也不许给一条没有下游的空闲上游发 502；
+//   三、pool_max_idle 的硬上界——池满时归还改成直接关闭（每连接内存的闸门，SLO #2）。
+// 池是 per-worker 的，多 worker 下的复用已由 S2_01 的 88/89 两条覆盖（它们现在也断
+// pool_returns），所以这里用单 Reactor 把池机制本身测清楚。
+
+// 一、N 条短命下游复用同一条热上游：这是池存在的意义。
+TEST(S2_02_UpstreamPool, ShortLivedDownstreamsReuseOnePooledUpstream) {
+  constexpr int kIterations = 20;
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  for (int i = 1; i <= kIterations; ++i) {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << "第 " << i << " 条连接：" << why;
+    ASSERT_TRUE(client.write_all(request_text(static_cast<std::size_t>(i))));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条：" << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    // 借来的热上游必须把请求/响应原样带过去：body 逐条精确比对（seq 是上游的全局计数，
+    // 顺序驱动下第 i 条请求就是第 i 个被服务的）。
+    ASSERT_EQ(body, expected_body(static_cast<std::size_t>(i))) << "第 " << i << " 条响应串号";
+    // 关闭下游 → 网关看到 EOF → 下游关闭 → 上游归还进池。
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << "第 " << i << " 条：" << why;
+    ASSERT_TRUE(wait_until(
+        [&] { return stats.load(stats.pool_returns) == static_cast<std::uint64_t>(i); }, 3000))
+        << "第 " << i << " 条下游关闭后上游没归还进池";
+  }
+
+  // 20 条短命下游，只新建了 1 条上游（第一条），第 2..20 条各借了一次池。
+  EXPECT_EQ(stats.load(stats.downstream_accepted), static_cast<std::uint64_t>(kIterations));
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u)
+      << "池复用失效：N 条短命下游本该只新建 1 条上游，实际新建了更多";
+  EXPECT_EQ(stats.load(stats.pool_borrows), static_cast<std::uint64_t>(kIterations - 1))
+      << "第 2..N 条下游各借一次池";
+  EXPECT_EQ(stats.load(stats.pool_returns), static_cast<std::uint64_t>(kIterations));
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kIterations));
+  std::printf("[S2-02 churn] %d 条短命下游复用 upstream_opened=%llu pool_borrows=%llu\n",
+              kIterations, static_cast<unsigned long long>(stats.load(stats.upstream_opened)),
+              static_cast<unsigned long long>(stats.load(stats.pool_borrows)));
+
+  harness.stop_loop();  // 排空池 → 那条热上游析构
+  // N 条下游对象 + 1 条上游对象 = N+1 构造，全部析构。
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  harness.shutdown_all();
+}
+
+// 二、空闲池内上游被对端关闭 = 正常回收，不是截断（ADR-15 点名的边界）。
+TEST(S2_02_UpstreamPool, IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 一条下游：请求 → 响应 → 关闭，上游被回收进池（此刻它空闲、未配对）。
+  {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(client.write_all(request_text(1)));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  }
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 3000))
+      << "上游没归还进池";
+  ASSERT_EQ(stats.load(stats.upstream_truncated_before_head), 0u);
+
+  // 让上游对端关掉这条**空闲**连接：停掉测试上游（它会关掉所有客户端 fd）。
+  harness.upstream().stop_and_join();
+  // 网关 worker 读到空闲池内上游的 EOF → 淘汰（pool_evictions_eof），而不是截断表态。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_evictions_eof) == 1u; }, 3000))
+      << "空闲池内上游被对端关闭，没走淘汰路径";
+
+  EXPECT_EQ(stats.load(stats.upstream_truncated_before_head), 0u)
+      << "空闲池内上游的正常关闭被误计成截断（ADR-15 点名禁止的边界）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u)
+      << "给一条没有配对下游的空闲上游发了 502（它没有下游可表态）";
+
+  harness.stop_loop();
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+}
+
+// 三、pool_max_idle 硬上界：池满时归还改成直接关闭。
+TEST(S2_02_UpstreamPool, PoolFullClosesExcessInsteadOfReturning) {
+  constexpr int kConns = 3;    // 3 > pool_max_idle=2
+  Harness harness;
+  std::string why;
+  Harness::Options options;
+  options.config = base_config();
+  options.config.pool_max_idle = 2;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 3 条下游**同时**在飞（各建各的上游，池此刻是空的），全部拿到响应后再一起关。
+  std::vector<Client> clients(static_cast<std::size_t>(kConns));
+  for (int i = 0; i < kConns; ++i) {
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].write_all(
+        request_text(static_cast<std::size_t>(i) + 1)));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].read_response(&status, &body, &why)) << why;
+  }
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upstream_opened) == kConns; }, 3000))
+      << "3 条并发下游本该各建一条上游";
+
+  // 一起关：前 2 条的上游归还进池，第 3 条撞上 pool_max_idle → 直接关闭。
+  for (auto& c : clients) c.shutdown_write();
+  for (auto& c : clients) {
+    ASSERT_TRUE(c.wait_for_eof(&why)) << "下游没被网关关闭";
+  }
+  ASSERT_TRUE(wait_until(
+      [&] {
+        return stats.load(stats.pool_returns) == 2u && stats.load(stats.pool_evictions_full) == 1u;
+      },
+      3000))
+      << "池满时第 3 条上游没走 evictions_full（pool_max_idle 的上界没生效）";
+  EXPECT_EQ(stats.load(stats.pool_returns), 2u);
+  EXPECT_EQ(stats.load(stats.pool_evictions_full), 1u);
+
+  for (auto& c : clients) c.close();
+  harness.stop_loop();  // 排空池（那 2 条）
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
   harness.shutdown_all();
 }
 

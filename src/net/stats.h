@@ -120,6 +120,24 @@ struct ReactorStats {
   // 惰性分配到底省下了多少，只有把"创建了几个"和"每个多大"分开记才算得出来。
   std::atomic<std::uint64_t> outbound_buffers_created{0};
   std::atomic<std::uint64_t> scratches_created{0};
+
+  // --- S2-02：per-worker 上游连接池（ADR-15）的观测面 ----------------------
+  // 池把上游连接数与下游**生命周期**解耦：一条上游在它的下游关闭后归还进池、
+  // 被下一条下游借走复用，而不是随下游一起销毁。下面四个数就是这条回收链的证据，
+  // 缺一个就说不清"到底复用了没有"：
+  //   pool_borrows        —— 从池里借出热上游的次数（复用发生了）。
+  //   pool_returns        —— 下游关闭时上游被归还进池的次数（回收发生了）。
+  //   pool_evictions_eof  —— 空闲池内上游被对端关闭而淘汰的次数（正常回收，
+  //                          **绝不许**误计成 upstream_truncated_before_head，见 ADR-15）。
+  //   pool_evictions_full —— 池满时归还改成直接关闭的次数（pool_max_idle 的硬上界生效）。
+  // 新建上游仍计在既有的 upstream_opened 上（池空才新建），所以
+  // 「N 条短命下游只开 M 条上游」= upstream_opened(=M) ≪ downstream_accepted(=N)，
+  // 差额由 pool_borrows 补上。当前空闲数是**非原子**观测（Reactor::pool_idle_count()），
+  // 只能在循环停下后读，和 live_connection_count() 同一类。
+  std::atomic<std::uint64_t> pool_borrows{0};
+  std::atomic<std::uint64_t> pool_returns{0};
+  std::atomic<std::uint64_t> pool_evictions_eof{0};
+  std::atomic<std::uint64_t> pool_evictions_full{0};
 };
 
 }  // namespace l7gate::net

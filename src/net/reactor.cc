@@ -126,6 +126,9 @@ Reactor::~Reactor() {
   }
   connections_.clear();
   retiring_.clear();
+  // 池里的空闲上游也在 connections_ 里（上面已 close_fd），这里释放池表持有的那份
+  // shared_ptr，让引用计数归零、对象析构（constructed==destructed 的最终兑现点）。
+  upstream_pool_.clear();
 
   if (listener_.valid()) {
     int error = 0;
@@ -253,6 +256,10 @@ std::uint64_t Reactor::run() {
       break;
     }
   }
+
+  // S2-02（ADR-15）：循环退出时排空上游池——停掉的 worker 不该留着热连接，
+  // 也让"stop 之后 constructed==destructed"这条生命周期断言成立（不必等 ~Reactor）。
+  drain_upstream_pool();
 
   running_.store(false, std::memory_order_relaxed);
   return batches;
@@ -555,6 +562,15 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   if (config_.upstream_port == 0) {
     return nullptr;  // 没配上游：S1-04 的 serve 模式一定配了，这里只是不把空端口当合法值
   }
+  // S2-02（ADR-15）：先从本 worker 的池里借一条热上游。借出**不新增连接**（它本来就在
+  // connections_ 里），所以不受 fd 预算约束；池空才落到下面新建那条受预算约束的路径。
+  if (auto pooled = take_pooled_upstream()) {
+    pooled->set_peer_fd(downstream->fd());
+    downstream->set_peer_fd(pooled->fd());
+    // 借出时它已注册、只挂着 EPOLLIN（空闲监控态）。请求字节随后由 forward_request
+    // 排进它的出向缓冲并 arm_write 补上 EPOLLOUT，所以这里不必再 apply_events。
+    return pooled;
+  }
   if (connections_.size() >= config_.max_connections) {
     stats_.downstream_rejected_over_capacity.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
@@ -589,6 +605,80 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   }
   connections_.emplace(upstream->fd(), upstream);
   return upstream;
+}
+
+// --- 上游连接池（S2-02，ADR-15）------------------------------------------
+//
+// 池是每 worker 一份、只被本循环线程碰的空闲热上游表，所以全程无锁（ADR-14 的
+// 单线程拥有原样成立，这也是 ADR-15 选 per-worker 而不是 shared 的决定性理由）。
+// 三条边界必须分清，混一条就是 bug：
+//   借出（take_pooled_upstream）——从空闲表移除、配对给某条下游；
+//   归还（recycle_upstream）——下游关闭时，干净的上游解配、复位、放回空闲表；
+//   淘汰（evict_pooled + close）——空闲上游被对端 EOF、或池满、或不干净时关闭。
+// 归还只发生在「下游关闭」这个干净边界上，不按单个请求（理由见 ADR-15「为什么」：
+// 按请求借还会和 pipelining 的响应 FIFO 冲突，那是 S2-04 的配对模型）。
+
+std::shared_ptr<Connection> Reactor::take_pooled_upstream() {
+  while (!upstream_pool_.empty()) {
+    std::shared_ptr<Connection> upstream = upstream_pool_.back();
+    upstream_pool_.pop_back();
+    // 防御性核验：池里的上游应当一直 kOpen 且仍在本 worker 的注册表里。不满足就是
+    // 陈旧条目（理论上不该发生，但"从池里拿出来的东西"必须验，和批内反查同一条纪律）。
+    if (upstream->fd() == kInvalidFd || upstream->state() != State::kOpen) continue;
+    auto it = connections_.find(upstream->fd());
+    if (it == connections_.end() || it->second.get() != upstream.get()) continue;
+    stats_.pool_borrows.fetch_add(1, std::memory_order_relaxed);
+    return upstream;
+  }
+  return nullptr;
+}
+
+bool Reactor::upstream_reusable(const Connection& upstream) const noexcept {
+  // 全部满足才值得留：kOpen（没在收尾/没死）、非隧道（隧道是专用双向流，无法共享）、
+  // 非一次性配对（close_after_response 的语义就是不复用）、出向空（没有在飞请求字节）、
+  // 响应跟踪停在 kHead（上一条响应已完整完结并复位，没有半条响应挂在游标上）。
+  return upstream.role() == Role::kUpstream && upstream.state() == State::kOpen &&
+         !upstream.tunneling() && !upstream.close_after_response() &&
+         upstream.outbound_pending() == 0 &&
+         upstream.response_tracking().phase == Connection::ResponsePhase::kHead;
+}
+
+void Reactor::recycle_upstream(const std::shared_ptr<Connection>& upstream) {
+  // 调用方（close_connection 的下游分支）已经把这条上游解配（peer_fd 置 kInvalidFd）。
+  if (upstream_pool_.size() >= config_.pool_max_idle) {
+    // 池满：给每连接内存一个硬上界（SLO #2），多出来的直接关，不留。
+    stats_.pool_evictions_full.fetch_add(1, std::memory_order_relaxed);
+    close_connection(upstream);
+    return;
+  }
+  upstream->reset_response_tracking();  // 干净起点：下一条借它的下游从 kHead 开始
+  // 重新只挂 EPOLLIN：空闲上游要能被对端的 EOF 叫醒（好淘汰它），但出向已空，
+  // 绝不能留着 EPOLLOUT 对着"随时可写"的 fd 自旋（那会吃掉 SLO #2 的空闲 CPU）。
+  apply_events(upstream);
+  upstream_pool_.push_back(upstream);
+  stats_.pool_returns.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Reactor::evict_pooled(const std::shared_ptr<Connection>& upstream) {
+  for (auto it = upstream_pool_.begin(); it != upstream_pool_.end(); ++it) {
+    if (*it == upstream) {
+      upstream_pool_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+void Reactor::drain_upstream_pool() {
+  // 循环退出时排空：停掉的 worker 不该留着热连接（否则 constructed==destructed 要等
+  // ~Reactor 才成立，而生命周期断言读的是 stop 之后、析构之前那一刻）。
+  // 逐条 close_connection 会把它们从 connections_ 摘掉并推进 retiring_，最后统一兑现析构。
+  std::vector<std::shared_ptr<Connection>> idle;
+  idle.swap(upstream_pool_);
+  for (const std::shared_ptr<Connection>& upstream : idle) {
+    if (upstream->fd() != kInvalidFd) close_connection(upstream);
+  }
+  retire_closed();
 }
 
 void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
@@ -1109,6 +1199,18 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
   }
 
   if ((revents & (EPOLLIN | EPOLLHUP)) != 0) {
+    // S2-02（ADR-15）：空闲池内上游（未配对，peer_fd 无效）被对端关闭、或来了字节。
+    // 它没有配对下游、没有在飞请求，所以这是一次**正常的空闲连接回收**——绝不能走下面
+    // 的截断表态（那会把它误计成 upstream_truncated_before_head，而它压根没有下游可表态），
+    // 也不级联任何下游。on_upstream_event 里上游 peer_fd 无效只可能是"空闲在池里"这一种
+    // 情形（新建即配对、fail_pair 拆对后立刻关且已摘 epoll），所以这个判据是可靠的。
+    if (conn->peer_fd() == kInvalidFd) {
+      if (evict_pooled(conn)) {
+        stats_.pool_evictions_eof.fetch_add(1, std::memory_order_relaxed);
+      }
+      close_connection(conn);
+      return;
+    }
     if (conn->tunneling()) {
       // 隧道（ADR-09）：双向都是不透明字节，方向只由角色决定。
       const Buffer::ReadResult read = conn->read_raw();
@@ -1241,6 +1343,10 @@ void Reactor::arm_write(const std::shared_ptr<Connection>& conn) noexcept {
 void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy why) noexcept {
   const int fd = conn->fd();
   if (fd == kInvalidFd) return;  // 幂等：重复关闭不重复计数
+  // 在改动 conn 之前记下它的角色：下面第 4 步之后 conn 已 kClosed，而"这条被关的是
+  // 下游还是上游"决定了它的对端该被回收（下游关 → 上游进池）还是级联关闭（上游死 →
+  // 下游跟着关，S1-06）。role_ 本身不随关闭改变，但提前存一份读起来更清楚。
+  const bool conn_is_downstream = (conn->role() == Role::kDownstream);
 
   if (why == CloseWhy::kFlushThenClose && conn->outbound_pending() > 0) {
     // 第 0 步：货还没发完。这里关掉 fd 就等于把已经接受的字节丢在原地，
@@ -1281,7 +1387,18 @@ void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy
   stats_.connections_closed.fetch_add(1, std::memory_order_relaxed);
 
   if (peer_to_close) {
-    close_connection(peer_to_close, why);
+    // S2-02（ADR-15）：只有「下游干净关闭」才把配对上游归还进池——上游因此活得比
+    // 它的下游久，被下一条下游借走复用。两个守卫缺一不可：
+    //   conn_is_downstream —— 上游死掉时它的对端是下游，那条下游要按 S1-06 级联关闭
+    //                          （502/截断表态），绝不能"回收"一条下游；
+    //   kFlushThenClose + upstream_reusable —— 丢弃式关闭（写坏了）或上游不干净
+    //                          （隧道/一次性/出向还有货/响应没走完）都淘汰而不是归还。
+    if (conn_is_downstream && why == CloseWhy::kFlushThenClose &&
+        upstream_reusable(*peer_to_close)) {
+      recycle_upstream(peer_to_close);
+    } else {
+      close_connection(peer_to_close, why);
+    }
   }
 }
 

@@ -62,7 +62,7 @@ l7gate/
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**。
 
 ### 1.1 `core/build_info`
 
@@ -313,6 +313,22 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 
 已知边界，照记不藏：**accept 单点**（所有连接过主线程一个 accept 循环）是 ADR-03 列的延迟观察项，S2-01 不提前优化（不做 SO_REUSEPORT 多 acceptor），等 S2-07 压测拿出"主线程 accept 排队"的证据再立项；**每 worker 的 fd 预算独立**（总容量 = N × `max_connections_per_worker`），全局 fd 闸门与 100k 口径归 S2-06；**异步销毁的 harder 情形还没到**——S2-01 里连接的 `shared_ptr` 全在 owner worker 线程内（注册表/`retiring_`/`pending_probes_`），析构必然发生在 owner 线程，六步关闭与 S1 完全一致；S2-02 的连接池会让一条上游连接被非 owner 线程持有，那时"最后一个引用在哪个线程释放"才不确定，S2-03 定稿销毁协议（ADR-14 已预留那一章）。
 
+### 1.18 上游连接池（S2-02）：per-worker、借还按下游生命周期、以及"空闲上游的 EOF 不是截断"
+
+池落在 `Reactor` 里（`upstream_pool_`，每 worker 一份），不是新模块——因为它必须和转发泵、六步关闭、背压共用同一套连接状态，拆出去就要把这些状态跨对象共享，那正是 ADR-14 要消灭的东西。per-worker + 只被循环线程碰，所以**全程无锁**（ADR-15 选 per-worker 而不是 shared 的决定性理由）。
+
+**借还按下游连接的生命周期，不按单个请求**（这条是被现有转发核逼出来的，不是我图省事，理由写在 ADR-15「为什么」）：一条下游第一次要回源时 `ensure_upstream` 先 `take_pooled_upstream()` 从池里借一条热上游、池空才新建；这条下游在它**整个存活期**独占这条上游（S1 的 keep-alive 复用、pipelining、响应 FIFO 全部原样保留）；下游关闭时 `close_connection` 的级联那一步改成——上游若「干净可复用」就 `recycle_upstream()` 归还进池，而不是跟着销毁。**所以池化后上游活得比它的下游久**，这是它推翻的那条 S1 隐含契约（「下游关 → 上游级联关 → `constructed==destructed`」）。
+
+「干净可复用」的判据（`upstream_reusable`）是五条与：`kOpen`、非隧道、非一次性配对（`close_after_response`）、出向空、响应跟踪停在 `kHead`（上一条响应已完整完结并复位）。任一不满足就淘汰而不是归还——隧道态上游是专用双向流无法共享，写坏了/半条响应的上游留着就是给下一条下游埋雷。归还时 `reset_response_tracking()` + `apply_events()` 把它重新只挂 `EPOLLIN`（出向已空，绝不能留着 `EPOLLOUT` 对着"随时可写"的 fd 自旋，那会吃掉 SLO #2 的空闲 CPU）。
+
+**最容易被后来人改错、也最值得单独记的一处边界：空闲池内上游被对端关闭，是一次正常回收，不是截断。** `on_upstream_event` 的 EOF 分支原本假设"上游总有配对下游"，于是一条 EOF 会走 S1-06 的截断分类（`upstream_truncated_before_head++` + 给下游发 502）。但池里的空闲上游 `peer_fd` 是无效的、根本没有下游——若不拦住，上游正常关一条空闲 keep-alive 连接就会被误计成"上游在头之前截断"、还会朝一条不存在的下游发 502。所以 EOF 分支开头加了一道 `peer_fd == kInvalidFd` 的短路：`evict_pooled()` + `close_connection()` + `pool_evictions_eof++`，**不碰任何截断计数**。这条边界由 `S2_02_UpstreamPool.IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation` 钉住（停掉测试上游让空闲连接被对端关，断言 `pool_evictions_eof==1` 且 `upstream_truncated_before_head==0`、`gateway_replies_sent==0`）。
+
+**停止语义**：`run()` 退出时 `drain_upstream_pool()` 排空池（停掉的 worker 不该留热连接），这让"`stop` 之后 `constructed==destructed`"这条生命周期断言仍然成立、不必等 `~Reactor`；S1 的三个冒烟脚本因此**一条没改**就继续绿（它们 SIGTERM 网关 → 池排空 → 最终账不变，只是多了 `pool_returns>0` 这个回收发生的可见证据）。
+
+**一条诚实的性能边界**（ADR-15 后果段原样搬来，免得日后拿池邀功）：wrk 是闭环模型，稳态下每条常驻下游几乎总有一个在飞请求、全程独占它的上游，所以池**在这个基准里不减少上游连接数**。池的价值在 churn：生产路径实测 `--serve --workers 4` + 20 条短命 curl（每条独立连接）→ **`upstream_opened=4`（每 worker 1 条）而不是 20、`pool_borrows=16`、`pool_returns=20`**——20 条下游只用了 4 条上游连接，省掉 16 次对上游的 TCP 握手。ctest 侧 `ShortLivedDownstreamsReuseOnePooledUpstream` 是它的单 Reactor 版（20 条短命下游 → `upstream_opened=1`、`pool_borrows=19`）。S2-07 的闭环压测不会显示池的收益，我不声称它有。
+
+实测：本任务新增 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / `pool_max_idle` 满则关），总数 117→**120**；三 preset 各 **120/120**、非 gtest 警告 **0 条**、**tsan 零 data race**（池 per-worker 无新增跨线程面，共享的只有那几个原子计数）、asan/ubsan/LSan 零报告零泄漏。`sizeof(Connection)` 不变（**520**，池挂在 Reactor 上）。**改了 4 条既有生命周期用例的期望值**（`S1_04_Reactor` 的 TenThousand / IdleConnectionDoesNotSpinOnEpollOut、`S2_01_MultiReactor` 的 TenThousand / ConcurrentLoad）：它们原先断"下游关后 `live==0`"，池化后改成"下游关后上游进池（`pool_returns` 计数）、`stop` 排空池后才 `live==0`/`constructed==destructed`"——改的是对新合法行为的期望，每条旁边都写了为什么，不是为了绿。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -337,7 +353,8 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 - **S1-07 的背压：已实现，记录在 1.15。** 这里只留口径给后来的人：判据是"这条连接的入向可读区相对它自己的停读线在哪"，**不含**对端出向缓冲的饱满度；恢复必须带一次主动探测读（边沿触发不为已经在里的字节负责）；`Connection::armed_events()` 是 epoll_ctl 的**回执**而不是意图，任何别的地方都不许写它。TASKS 里"S1-08 之后如果要加主动流控，接口形状应当是过滤器链而不是 reactor 分支"这条约束仍然成立。
 - **转发语义（S1-06）**：已实现，记录在 1.14。`on_downstream_readable` 里 `round.reject` 那一行现在按 `reply_status_for_parse_error` 的映射表回自产响应；响应侧认状态码、认框架、判截断。留给 S1-07 的那条缺口（撞水位之后摘掉 EPOLLIN 压回对端）已在 1.15 闭合。
 - **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
-- **多 Reactor（S2-01）：已实现，记录在 1.17。** 一个 acceptor + N 个 worker、round-robin 派发、连接单线程拥有、跨线程只传 fd（ADR-03 + ADR-14）。`ReactorStats` 全原子从 S1 起就是给这一刻留的基线，现在它被全 worker 共享一份；六步关闭 + `retiring_` 与 S1 完全一致（连接的 `shared_ptr` 全在 owner worker 内，析构必然在 owner 线程）。**上游连接池（S2-02）仍未实现**：`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方（池化后上游 EOF 改成"淘汰这条上游连接"而不是级联关下游）；池会打破"连接只被 owner 持有"的前提（一条上游连接可能被非 owner 线程借出/归还/淘汰），跨线程异步销毁的 harder 情形归 S2-03 定稿（ADR-14 已预留那一章）。
+- **多 Reactor（S2-01）：已实现，记录在 1.17。** 一个 acceptor + N 个 worker、round-robin 派发、连接单线程拥有、跨线程只传 fd（ADR-03 + ADR-14）。`ReactorStats` 全原子从 S1 起就是给这一刻留的基线，现在它被全 worker 共享一份；六步关闭 + `retiring_` 与 S1 完全一致（连接的 `shared_ptr` 全在 owner worker 内，析构必然在 owner 线程）。
+- **上游连接池（S2-02）：已实现，记录在 1.18（ADR-15）。** per-worker、借还按下游生命周期、隧道不入池、`pool_max_idle` 硬上界、空闲 EOF 淘汰（不误计截断）。**关键：选 per-worker 让池没有打破 ADR-14 的单线程拥有**——上游连接始终归它的 owner worker 独占，所以"一条上游被非 owner 线程借出/归还/淘汰"那批跨线程异步销毁的 harder 情形**没有出现**。这直接把 S2-03 的担子减轻了：它现在主要验"停 stop 时的收尾竞态 + 把已实现的无竞争性质钉成 TSan 断言"，而不是从零处理一个 shared 池的跨线程销毁。若 S3/S4 之后有证据要换 shared 池，那批 harder 情形才会真正到来（届时新写 ADR + 补 ADR-14 的销毁协议章）。
 - **`filter/chain`（S1-08）**：已落地，记录在 1.16。当年那句验收——「新增 filter 不修改转发主路径的任何一行代码」——现在有可执行形式了：空链与两条放行 filter 的链，同一套流量的响应内容与七项计数逐项相等（`PassThroughFiltersChangeNothingInTheForwardingPath`）。留给后面的两笔返工也写在 1.16 末尾：路由要一个"目标上游"字段、响应方向要一个钩子，两者今天都没有读者，所以我不预先造字段。
 - **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。
 
@@ -377,6 +394,7 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | 大头部被逐字节 dribble 时重扫 7,474,911 字节（1956×） | 解析器无"已扫描游标"可用（纯函数不能存状态） | `S1_04_Connection.HeaderDribbleScanIsLinearNotQuadratic`（ARCH 1.4/1.6） |
 | view 在下一次读之后被继续引用 | `consume`/扩容使 view 作废，而调用方不知道 | `ConsumeInvalidatesParsedViews`、`ReleaseScratchInvalidatesViews`、`InvalidatedViewsAreReparsedNotDropped`、`RepeatedParseDoesNotDoubleCountRequests` |
 | 级联关闭把刚排进配对的 502 当残留字节丢掉 | `kDiscardOutbound` 的传染性；`close_connection` 的"同一种 why"会传给对端 | `fail_pair_with_reply` 先手工解链再分别关；`S1_06_Reactor.UpstreamDyingBeforeAnyResponseGetsDefined502`（ARCH 1.14） |
+| 空闲池内上游被对端正常关闭，却被计成 `upstream_truncated_before_head` 还朝不存在的下游发 502 | `on_upstream_event` 的 EOF 分支默认"上游总有配对下游"；池化后空闲上游 `peer_fd` 无效、没有下游可表态 | EOF 分支开头 `peer_fd==kInvalidFd` 短路成"淘汰"；`S2_02_UpstreamPool.IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation`（ARCH 1.18） |
 
 ### 测试自己写的错，比实现的错更难发现
 

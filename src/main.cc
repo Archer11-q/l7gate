@@ -193,6 +193,12 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   put("upstream_truncated_in_body",
       static_cast<long long>(stats.load(stats.upstream_truncated_in_body)));
   put("responses_completed", static_cast<long long>(stats.load(stats.responses_completed)));
+  // S2-02（ADR-15）上游连接池：借出/归还/两类淘汰。多 Reactor 下这是共享 stats 的
+  // 自动聚合（全原子）。"复用了没有"看 borrows>0；"上游活得比下游久"看 returns>0。
+  put("pool_borrows", static_cast<long long>(stats.load(stats.pool_borrows)));
+  put("pool_returns", static_cast<long long>(stats.load(stats.pool_returns)));
+  put("pool_evictions_eof", static_cast<long long>(stats.load(stats.pool_evictions_eof)));
+  put("pool_evictions_full", static_cast<long long>(stats.load(stats.pool_evictions_full)));
   put("epoll_registrations", static_cast<long long>(epoll_registrations));
   put("epoll_unregistrations", static_cast<long long>(epoll_unregistrations));
   put("epoll_modifications", static_cast<long long>(epoll_modifications));
