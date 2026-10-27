@@ -62,7 +62,7 @@ l7gate/
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**，S2-03 加 **3** 条 `S2_03_CrossThreadDestruction`（负载活跃时 stop / handoff fd 注册前被对端关 / 连接风暴）→ **123**。
 
 ### 1.1 `core/build_info`
 
@@ -354,7 +354,7 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 - **转发语义（S1-06）**：已实现，记录在 1.14。`on_downstream_readable` 里 `round.reject` 那一行现在按 `reply_status_for_parse_error` 的映射表回自产响应；响应侧认状态码、认框架、判截断。留给 S1-07 的那条缺口（撞水位之后摘掉 EPOLLIN 压回对端）已在 1.15 闭合。
 - **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
 - **多 Reactor（S2-01）：已实现，记录在 1.17。** 一个 acceptor + N 个 worker、round-robin 派发、连接单线程拥有、跨线程只传 fd（ADR-03 + ADR-14）。`ReactorStats` 全原子从 S1 起就是给这一刻留的基线，现在它被全 worker 共享一份；六步关闭 + `retiring_` 与 S1 完全一致（连接的 `shared_ptr` 全在 owner worker 内，析构必然在 owner 线程）。
-- **上游连接池（S2-02）：已实现，记录在 1.18（ADR-15）。** per-worker、借还按下游生命周期、隧道不入池、`pool_max_idle` 硬上界、空闲 EOF 淘汰（不误计截断）。**关键：选 per-worker 让池没有打破 ADR-14 的单线程拥有**——上游连接始终归它的 owner worker 独占，所以"一条上游被非 owner 线程借出/归还/淘汰"那批跨线程异步销毁的 harder 情形**没有出现**。这直接把 S2-03 的担子减轻了：它现在主要验"停 stop 时的收尾竞态 + 把已实现的无竞争性质钉成 TSan 断言"，而不是从零处理一个 shared 池的跨线程销毁。若 S3/S4 之后有证据要换 shared 池，那批 harder 情形才会真正到来（届时新写 ADR + 补 ADR-14 的销毁协议章）。
+- **上游连接池（S2-02）：已实现，记录在 1.18（ADR-15）。** per-worker、借还按下游生命周期、隧道不入池、`pool_max_idle` 硬上界、空闲 EOF 淘汰（不误计截断）。**关键：选 per-worker 让池没有打破 ADR-14 的单线程拥有**——上游连接始终归它的 owner worker 独占，所以"一条上游被非 owner 线程借出/归还/淘汰"那批跨线程异步销毁的 harder 情形**没有出现**。这直接把 S2-03 的担子减轻了：它现在主要验"停 stop 时的收尾竞态 + 把已实现的无竞争性质钉成 TSan 断言"，而不是从零处理一个 shared 池的跨线程销毁。**S2-03 已用红队用例（`S2_03_CrossThreadDestruction` 三条）+ 摘锁阳性验证定稿了 ADR-14 的销毁协议章**：per-worker 下连接的 `shared_ptr` 持有者全在 owner 线程内、析构永远在 owner 线程，跨线程只流动裸 fd；那次"摘掉 handoff 锁 → TSan 报 14 处 race → 还原"的反证记在 FAULT-INJECTION §3。若 S3/S4 之后有证据要换 shared 池，那批 harder 情形才会真正到来（届时新写 ADR + 回 ADR-14 追加跨线程 retire 投递那套机制）。
 - **`filter/chain`（S1-08）**：已落地，记录在 1.16。当年那句验收——「新增 filter 不修改转发主路径的任何一行代码」——现在有可执行形式了：空链与两条放行 filter 的链，同一套流量的响应内容与七项计数逐项相等（`PassThroughFiltersChangeNothingInTheForwardingPath`）。留给后面的两笔返工也写在 1.16 末尾：路由要一个"目标上游"字段、响应方向要一个钩子，两者今天都没有读者，所以我不预先造字段。
 - **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。
 

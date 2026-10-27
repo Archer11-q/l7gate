@@ -36,7 +36,11 @@
 
 ## 后果与约束
 
-- **异步销毁的 harder 情形留给 S2-02/S2-03。** 本 ADR 在 S2-01 兑现的是"连接只被 owner 线程持有"这一半——此时 `shared_ptr<Connection>` 的所有持有者（注册表、`retiring_`、`pending_probes_`）都在同一个 worker 线程内，六步关闭 + 批末析构与 S1 完全一致，析构必然发生在 owner 线程。**S2-02 的上游连接池会打破这个前提**：池是共享状态，一条上游连接可能被非 owner 线程持有 `shared_ptr`（借出/归还/淘汰），那时"最后一个引用在哪个线程释放"就不再确定。S2-03 要正面处理这批竞态并定稿销毁协议（候选形状：跨线程 retire 投递回 owner，保证析构永远在 owner 线程），本 ADR 届时追加那一章。
+- **异步销毁协议（S2-03 定稿）。** S2-01 写下这条时我预留了"更难的跨线程销毁留给 S2-02/S2-03"，并猜想要做"跨线程 retire 投递回 owner"。**S2-03 定稿时那套机制并没有出现，原因是 ADR-15 选了 per-worker 池**：一条上游连接的 `shared_ptr` 持有者——注册表 `connections_`、`retiring_`、探测队列 `pending_probes_`、上游池 `upstream_pool_`——**全部在同一个 owner worker 线程内**，没有任何非 owner 线程持有连接的 `shared_ptr`。于是销毁协议就是 S1 那套原样不变：**六步关闭 + 批末 `retire_closed()` 兑现析构，析构必然发生在 owner 线程**，"最后一个引用在哪个线程释放"根本不成问题（只有一个线程持有）。
+  - **唯一跨线程的对象是 handoff 队列里的裸 fd**（`UniqueFd`），不是连接对象。它的关闭责任也是确定的：worker 取出了就由 worker 构造连接、之后按六步关闭；没被取走（stop 之后残留）就由 `~Reactor` 随 `handoff_fds_` 析构关掉。两种情况都不跨线程。
+  - **stop 时序消除了"worker 退出后还有 handoff 进来"的窗口**：`ReactorGroup::run()` 的 accept 循环先退出（不再 dispatch），**然后**才 `stop_workers_and_join()`；每个 worker 在被 stop 时会先被 eventfd 唤醒、在退出前 `drain_handoff()` 把队列取干净，再 `drain_upstream_pool()` 排空池。所以既不会丢 fd，也不会有"acceptor 往一个已退出的 worker 塞 fd"。
+  - **这套协议的可证伪形式就是 TSan + 红队用例（S2-03）**：`S2_03_CrossThreadDestruction` 三条专攻仍然存在的两个跨线程面——(a) 负载活跃时 stop（acceptor 正 dispatch、worker 正处理、客户端正连）、(c) handoff 的 fd 在 worker 注册前对端就关了。它们在 `tsan` 下零 data race、`asan`/LSan 下零 UAF 零泄漏。**并做了阳性验证**：临时摘掉 handoff 的 mutex 后，stop-under-load churn 用例当场被 TSan 报出 **14 处 data race**——所以"零 race"这个绿是能红的，不是自述（与 S2-01 那次摘锁验证同一条纪律，只是这次用的负载更狠）。
+  - **如果将来换成 shared 池**（S3/S4 有证据时，见 ADR-15「我放弃什么」），上面"所有持有者都在 owner 线程内"这个前提就破了，届时才真的需要"跨线程 retire 投递回 owner"那套机制，并回到本 ADR 追加。今天不预支它（契约 3.2：无证据不加机制）。
 - **`l7gate_core` 从此链 `Threads::Threads`。** ARCHITECTURE §2 当初刻意不让库本体链线程（"提前链上等于给'我已经线程安全了'发一张空头证明"）——S2-01 就是那个"到期"的时刻：`ReactorGroup` 真的持有 `std::thread`。这不是新依赖（pthread 是平台线程原语，不是第三方库，不触发禁令三），是那条注释预告过的 S2 动作，随本任务同步更新 §2 的措辞。
 - **`--serve` 默认仍是单 Reactor（`--workers 1`）。** S1 的三个冒烟脚本断言的是单 Reactor 的精确 epoll 计数（`epoll_registrations=4` = 监听 + eventfd + 1 下游 + 1 上游）。多 Reactor 下 acceptor 与每个 worker 各有自己的 epoll，这些计数会变。为了不作废 S1 的门禁证据，多 Reactor 走显式的 `--workers N`（N≥2）开关，默认路径逐字节不变；S2-07 重测 SLO 时再决定是否翻默认值。
 - **可证伪性。** 本模型的失败形态是"某个非 owner 线程碰了连接对象或某 worker 的循环内状态"，而它的检测器就是 TSan：S2-01 的验收要求含多 worker 的套件在 `tsan` preset 下零 data race。如果哪天有人把连接对象塞进跨线程的容器、或让两个 worker 共享一个注册表，TSan 会红——这条 ADR 的正确性由门禁持续复查，不靠我记得。

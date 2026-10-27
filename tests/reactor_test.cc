@@ -2496,6 +2496,160 @@ TEST(S2_02_UpstreamPool, PoolFullClosesExcessInsteadOfReturning) {
   harness.shutdown_all();
 }
 
+// ===========================================================================
+// S2-03：跨线程传递与异步销毁的正确性 —— TSan 门禁正面攻坚（ADR-14 销毁协议定稿）
+// ===========================================================================
+//
+// per-worker 池（ADR-15）让"连接被非 owner 线程持有"这类 harder 竞态**没有出现**（所有
+// shared_ptr 持有者——注册表/retiring_/探测队列/上游池——都在同一个 worker 线程内，跨
+// 线程只流动裸 fd）。所以这里攻的是**仍然存在的两个跨线程面**：
+//   (a) stop 与活跃负载并发：acceptor 正在 dispatch、worker 正在处理、客户端正在连时停；
+//   (c) handoff 队列里的 fd 在 worker 取出注册之前，对端就已经关了。
+// 断言的是**不变量**（fd 回基线、不挂死、sanitizer 干净），不是精确计数（churn 下计数本就抖）。
+// 每条用例的真正门禁在 tsan/asan preset：race 让 tsan 红、UAF/泄漏让 asan/LSan 红——而
+// "连接只在 owner worker 的 retire 点析构"这条 ADR-14 断言，可证伪的形式就是它们在 churn
+// 下零报告（若非 owner 线程碰了连接或它的析构，tsan 当场抓）。
+
+// (a) 负载活跃时停网关：连接在 acceptor→handoff→worker→转发→EOF→关闭 全链路上被并发创建销毁。
+TEST(S2_03_CrossThreadDestruction, StopDuringActiveChurnShutsDownCleanly) {
+  constexpr int kWorkers = 4;
+  constexpr int kClientThreads = 12;
+  const std::size_t fd_before = count_open_fds();
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::atomic<bool> client_stop{false};
+  std::atomic<long> churn{0};
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(kClientThreads));
+  for (int t = 0; t < kClientThreads; ++t) {
+    threads.emplace_back([&, t] {
+      while (!client_stop.load(std::memory_order_relaxed)) {
+        Client client;
+        std::string w;
+        if (!client.connect_to(harness.port(), &w)) break;  // 网关停了、listener 关了 → 连不上 → 收工
+        // 发一条就立刻关（**不读响应**）：制造快速 churn，且客户端永不阻塞在 read 上，
+        // 停止时收尾快（不撞 SO_RCVTIMEO 的 5s）。网关这侧照样走完 accept→handoff→注册→
+        // 探测读→转发→（客户端已关）写失败→关闭 的全链路。
+        (void)client.write_all(request_text(static_cast<std::size_t>(t) + 1));
+        client.close();
+        churn.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  harness.group()->stop();  // **负载活跃时**停网关：这就是 (a) 的竞态窗口
+  client_stop.store(true, std::memory_order_relaxed);
+  for (auto& th : threads) th.join();
+  harness.stop_loop();  // join run 线程（accept 循环退出 → stop+join 全部 4 worker）
+
+  ReactorStats& stats = harness.group()->stats();
+  const std::uint64_t accepted = stats.load(stats.downstream_accepted);
+  const std::uint64_t constructed = stats.load(stats.connections_constructed);
+  EXPECT_GT(accepted, 0u) << "churn 期间一条连接都没接进来，这条用例没测到东西";
+  EXPECT_GT(churn.load(), 0L);
+  std::printf("[S2-03 stop-under-load] churn=%ld 次连接、accepted=%llu、constructed=%llu，停止未挂死\n",
+              churn.load(), static_cast<unsigned long long>(accepted),
+              static_cast<unsigned long long>(constructed));
+
+  // 在飞连接按 S1 停止语义不排水（排水归 S2-05），它们由 ~Reactor 关闭；所以这里查的是
+  // "析构之后 fd 回基线"——它同时证明了 handoff 队列里没被取走的 fd（UniqueFd）也关掉了。
+  harness.shutdown_all();
+  EXPECT_EQ(count_open_fds(), fd_before)
+      << "停止 + 析构后 fd 没回基线：在飞连接或 handoff 队列里的 fd 漏了";
+}
+
+// (c) handoff 队列里的 fd 在 worker 注册前对端就关了：worker 取出 → 构造 → 注册 → 探测读到
+// EOF → 干净关闭。300 次"连上立刻关"最大化撞上那个窗口（fd 还在队列里、对端已 FIN）。
+TEST(S2_03_CrossThreadDestruction, HandoffFdClosedByPeerBeforeRegistrationIsHandled) {
+  constexpr int kWorkers = 4;
+  constexpr int kIterations = 300;
+  const std::size_t fd_before = count_open_fds();
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;  // 不发请求、不需要上游；专测 handoff 后立刻 EOF 的收尾
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  for (int i = 0; i < kIterations; ++i) {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << "第 " << i << " 条：" << why;
+    client.close();  // 立刻关：fd 很可能还在 handoff 队列里、worker 还没注册，对端就 FIN 了
+  }
+  ReactorStats& stats = harness.group()->stats();
+  // worker 把队列里的 fd 取出、注册、探测读到 EOF、关闭——最终全部析构。等的不是"有没有关"
+  // （客户端 close 是内核级证据），而是每条被接受连接的收尾有没有走完。
+  ASSERT_TRUE(wait_until(
+      [&] {
+        return stats.load(stats.connections_constructed) == stats.load(stats.connections_destructed);
+      },
+      5000))
+      << "立刻关闭的连接没被干净析构：handoff 后 EOF 的收尾路径漏了某一步";
+  EXPECT_GT(stats.load(stats.downstream_accepted), 0u);
+
+  harness.stop_loop();
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  harness.shutdown_all();
+  EXPECT_EQ(count_open_fds(), fd_before) << "fd 没回基线";
+}
+
+// 连接风暴（有序收尾）：16 线程各做 30 轮"连→发→收→半关→等 EOF→关"，跨 4 worker。
+// 与 (a) 的区别是这条**不在负载中停**，所以能断精确的收尾不变量（constructed==destructed、
+// fd 回基线）；churn 的并发面由它和 (a) 一起压，race 由 tsan preset 兜。
+TEST(S2_03_CrossThreadDestruction, ConnectDisconnectStormIsRaceFreeAndLeavesNothingAlive) {
+  constexpr int kWorkers = 4;
+  constexpr int kThreads = 16;
+  constexpr int kPerThread = 30;
+  const std::size_t fd_before = count_open_fds();
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(kThreads));
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      for (int j = 0; j < kPerThread; ++j) {
+        Client client;
+        std::string w;
+        if (!client.connect_to(harness.port(), &w)) continue;
+        if (!client.write_all(request_text(static_cast<std::size_t>(j) + 1))) {
+          client.close();
+          continue;
+        }
+        std::string status;
+        std::string body;
+        if (client.read_response(&status, &body, &w) && status == "HTTP/1.1 200 OK") {
+          ok.fetch_add(1, std::memory_order_relaxed);
+        }
+        client.shutdown_write();
+        (void)client.wait_for_eof(&w);  // 让网关把这侧关掉（触发上游回收）再走
+        client.close();
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+
+  ReactorStats& stats = harness.group()->stats();
+  EXPECT_EQ(ok.load(std::memory_order_relaxed), kThreads * kPerThread) << "有请求没拿到 200";
+
+  harness.stop_loop();  // 排空池 → 全部上游析构
+  EXPECT_EQ(stats.load(stats.live_connections), 0u) << "风暴收尾后仍有连接活着";
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed))
+      << "构造与析构不逐项相等：churn 下有连接对象漏析构";
+  EXPECT_GT(stats.load(stats.pool_borrows), 0u) << "16 线程churn 下池一次都没被借过（复用没发生）";
+  harness.shutdown_all();
+  EXPECT_EQ(count_open_fds(), fd_before) << "fd 没回基线";
+}
+
 }  // namespace
 }  // namespace l7gate::net
 
