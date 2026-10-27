@@ -327,7 +327,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 | clang 21 对 `gtest-printers.h` 报 `-Wcharacter-conversion` | 已把 gtest 头按 `-isystem` 处理并**在 flags.make 里确认生效**，警告仍然逃逸——clang 21 这条新警告不受系统头抑制 | 每个 clang preset 固定 1 条第三方噪声。我**不加** `-Wno-character-conversion`：那会同时关掉我自己代码里的同一警告，用消噪换 blindness 不划算 |
 | ASan 堆栈无符号化 | 缺 `llvm-21-tools`（提供 `llvm-symbolizer`），报告退化成裸地址 + BuildId | 门禁要求"ASan 干净"不受影响；一旦真出问题，定位要手动 addr2line。已记 `ENVIRONMENT.md` 2.2 |
 | `build/` 下每个 preset 各自下载一次 googletest | 三个 preset 三次 FetchContent | 构建耗时 15–20s 里含下载。可接受；共享 `_deps` 会引入 preset 间状态耦合，不值得 |
-| WSL 里 `ulimit -n` = 10240 | S1-04 的用例最多同时用 265 个 fd，撞不到；`max_connections` 默认 4096 也够不到 | S2 的 100k 长连接场景必须先解决 rlimit（`docs/ENVIRONMENT.md` 记了当前值），否则那条 SLO 测出来的第一行会是 `accept_errors` |
+| WSL 里 `ulimit -n` soft = 10240 | S1-04 的用例最多同时用 265 个 fd，撞不到；`max_connections` 默认 4096 也够不到 | ~~S2 的 100k 长连接场景必须先解决 rlimit~~ **2026-10-27 实测推翻**：hard=1048576，`bash -c 'ulimit -n 300000'` 当场成功，**抬 soft 不需要 root 也不需要改机器配置**，所以它不是环境阻塞项。100k 的真前置是**临时端口只有 28,232 个**（`ip_local_port_range` 32768–60999）——见 `docs/ENVIRONMENT.md` 第 7 节，方案随 S2 的 `c100k.sh` 定 |
 | 冒烟脚本的 fd 采样是 0.2 s 一轮的外部观测 | 它能证"曲线不爬升"，证不了"每个瞬间都不爬升" | 所以 fd 归零那条判定以**网关自报的 `fd_start`/`fd_end`** 为准（同一个进程、同一次 `getrlimit` 视野），外部采样只做旁证 |
 ## 5. 踩坑索引（postmortem 索引）
 
@@ -383,6 +383,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 | 从 Windows 侧编辑过的脚本跑不了 / `unexpected condition` | UNC 编辑丢执行位、带进 CRLF；`sed -i` 还会新建文件把 `chmod +x` 抹掉 | 提交固化 100755 + `file x.sh` 查 CRLF（`bash -n` 验不出行尾）：TASKS 交接段纪律二 |
 | 仓库搬家后 7 个脚本全部 `exit 1`，`env-snapshot` 的 ext4 证据行读的是死路径 | 脚本开头硬编码 `cd /home/archer/l7gate`，`findmnt -T` 也写死了同一个绝对路径 | **结构上消除**：改成由脚本自身位置推导（`cd "$(dirname "$(readlink -f "$0")")/.."`）、`findmnt -T .`。这一条的**第三条缺**——没有任何断言管"仓库能不能换位置"，只有搬家当天的一次全量复跑（三 preset 112/112 + 三个冒烟全绿）证明它当时成立 |
 | 一档测出 3,148.41 QPS（正常值的三分之一），只因为它是"对照组"就看着无害 | Docker Desktop 的 WSL Integration 当天掉过两次线，引擎正在退出时 wrk 照样能发完 60 s 并交出一个**语法完全合法**的读数 | 作废轮留档不进表、比值异常先查**被测方那一轮的绝对值**（B-005 附 第二条）；`s2-qps-vs-nginx.sh` 只在镜像缺失时拒绝。**这一条的第三条只有一半**——脚本能证明"基线容器起来了"，证不了"这台机器的容器路径此刻没有退化"；补法要么在每档前断言 `docker info` 与引擎启动时间，要么靠取样规程的两轮复现兜住（目前选的是后者） |
+| 一条从没核验过的断言活了半天，还复制进了十处文档："`ulimit -n`=10240 是 100k 的硬前置，要环境侧解决" | 只读了 `ulimit -n` 的 **soft** 值，没读 hard、没读 `fs.file-max`、**没试过一次抬升**；`ENVIRONMENT.md` 第 2 节的快照里本来就有 `ip_local_port_range=32768–60999`，我也没把它算成端口数 | 2026-10-27 实测：`ulimit -Hn`=1048576、`bash -c 'ulimit -n 300000'` **当场成功**、`fs.file-max`=9.2e18 → soft 可自抬，**它不是环境阻塞项**；100k 的真前置是**临时端口只有 28,232 个**。十处措辞已就地更正并留删除线，取证在 `ENVIRONMENT.md` 第 7 节。**这一条的第三条缺**——没有断言管"文档里的环境断言核验过没有"；防复发的规矩：写"必须由环境侧解决"之前，必须同时给出 soft/hard 两个值和一次真实的抬升尝试结果 |
 | "ASan/TSan 干净"其实是构建没开 sanitizer，或优化把坏写入消掉了 | `-O1` 起 dead store elimination 会删掉可证明无副作用的坏写入 | preset 强制 `-O0 -g` + `S1_01_Toolchain.RequestedSanitizersAreActuallyCompiledIn` + 阳性样本（ENVIRONMENT 2.2） |
 | 一个没人引用的常量活了两个 preset 才被抓到 | gcc 的 debug 不报 `-Wunused-const-variable`，clang 才报 | `verify-all-presets.sh` 的「非 gtest 警告 = 0」门禁（FAULT-INJECTION 第 3 节反证） |
 

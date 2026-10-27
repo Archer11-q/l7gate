@@ -57,7 +57,7 @@ scripts/bench/s2-qps-vs-nginx.sh                          # SLO #3 五档（ngin
 
 **S1 门禁提出的事项已全部裁决完毕（2026-10-26），下一步是 S2 的拆解，不是等答复**。裁决内容与落点都在 `docs/ROADMAP.md` 的裁决表里，一句话版：**#3 终判推到 S5**（S1 的单 Reactor 对 16 worker 的 nginx，赢的是对照组不是实现）；**p999 由自研 C100K 客户端做 HDR 分位**（不引第三方工具，落地时随 `c100k.sh` 补一条 ADR）；**取样规程自 S2 起强制**（同机交替、每改动至少两轮、报告给极差——依据是实测散布：同 binary 复跑直连 p99 漂 11.3%、四份增量极差 27%、#3 比值三轮 158.46%/206.11%/203.74%（复现的两轮差 1.2%，异常的那轮是被测方被环境拖慢））；卡点四＝分母按「连接对」；pipeline 与 `Connection: close`＝记为已知边界、归 S2 配对模型；首次 push＝已执行（`5093ab3..4ba422b`、`4ba422b..57ef77d`、`57ef77d..f303fdb`）。**三项都不动任何目标值**（禁令二），SLO #1 的 57.540 → 36.420 → 37.890 → 29.720 ms 四份取样全部按"未达标"记着。
 
-**仍然挂起、不阻塞任何已完成工作的三项**：`llvm-21-tools`（ASan 堆栈符号化，非契约锁定项，缺失只让定位变慢）；Docker WSL Integration（S3 之前必须开，否则 Redis/MySQL/Prometheus/Grafana/Nginx 基线全不可用——**卡点三悬而未决的直接原因就是它**）；WSL `ulimit -n` = 10240（S2 的 100k 场景之前必须解决）。这三项都记在 `docs/ENVIRONMENT.md` 第 2、4、7 节，不用在这里维护第二份状态。
+**仍然挂起、不阻塞任何已完成工作的三项**：`llvm-21-tools`（ASan 堆栈符号化，非契约锁定项，缺失只让定位变慢）；Docker WSL Integration（S3 之前必须开，否则 Redis/MySQL/Prometheus/Grafana/Nginx 基线全不可用——**卡点三悬而未决的直接原因就是它**）；WSL `ulimit -n` = 10240（~~S2 的 100k 场景之前必须解决~~ **2026-10-27 实测撤销**：soft 可自抬到 hard=1048576，不是环境阻塞；真前置是临时端口 28,232 个，归 S2 的 `c100k.sh` 口径设计）。这三项都记在 `docs/ENVIRONMENT.md` 第 2、4、7 节，不用在这里维护第二份状态。
 
 **接手纪律，六条，全是我自己踩过才写下来的**：
 
@@ -112,6 +112,6 @@ scripts/bench/s2-qps-vs-nginx.sh                          # SLO #3 五档（ngin
 | 项 | 卡在哪 | 归属 |
 |---|---|---|
 | Docker Desktop 对 Ubuntu 的 WSL Integration 未开启 | 需在 Docker Desktop GUI 操作；不开则 Redis/MySQL/Prometheus/Grafana/Nginx 基线全部不可用 | S3 之前 |
-| WSL 里 `ulimit -n` = 10240 | S1-04 的用例最多同时 265 个 fd，撞不到；S2 的 100k 长连接场景必须先解决 rlimit，否则第一条实测数字会是 `accept_errors` 而不是每连接内存 | S2 开工前 |
+| WSL 里 `ulimit -n` soft = 10240 | S1-04 的用例最多同时 265 个 fd，撞不到；~~S2 的 100k 长连接场景必须先解决 rlimit~~ **2026-10-27 实测推翻**：hard=1048576，`ulimit -n 300000` 当场成功，**这不是环境阻塞项**。100k 的真前置是**临时端口只有 28,232 个**（同一目标 IP+端口开不出第 28,233 条连接），要么多目标端口/地址、要么改口径 | S2 的 `c100k.sh` 设计时定（要 ADR），取证在 `ENVIRONMENT.md` 第 7 节 |
 | `perf 7.0.14` 与内核 `6.18.40.1-microsoft-standard-WSL2` 版本不匹配，能否真采样未验证 | S5 的差值归因依赖火焰图，必须提前用最小冒烟验证 | S4 期间 |
 | libmysqlclient 8.4 客户端 ↔ `mysql:8.0.36` 服务端兼容性 | 目前只是推断，需 S3 首次连通实测取证 | S3 |
