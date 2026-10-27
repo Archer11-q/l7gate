@@ -126,6 +126,12 @@ message(STATUS "l7gate: GoogleTest ${L7GATE_GTEST_VERSION} (contract-locked v1.1
 # ---------------------------------------------------------------------------
 # 目标
 # ---------------------------------------------------------------------------
+# S2-01 起 l7gate_core 真的持有 std::thread（ReactorGroup 的 N 个 worker），
+# 所以要链 Threads::Threads。ARCHITECTURE §2 当初刻意不链（"提前链上等于给
+# '我已经线程安全了'发一张空头证明"）——S2 就是那条注释预告的到期时刻。
+# pthread 是平台线程原语、不是第三方库，不触发契约 8.2 禁令三。
+find_package(Threads REQUIRED)
+
 add_library(l7gate_core STATIC
   src/core/build_info.cc
   src/filter/chain.cc
@@ -134,13 +140,14 @@ add_library(l7gate_core STATIC
   src/net/epoll.cc
   src/net/fd.cc
   src/net/reactor.cc
+  src/net/reactor_group.cc
   src/net/socket.cc
   src/http/request_parser.cc
   src/http/response_framing.cc
   src/http/response_head.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
-target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers)
+target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers Threads::Threads)
 target_compile_definitions(l7gate_core PUBLIC
   L7GATE_VERSION="${PROJECT_VERSION}"
   L7GATE_GTEST_VERSION="${L7GATE_GTEST_VERSION}"

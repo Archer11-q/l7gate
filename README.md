@@ -4,7 +4,7 @@
 
 不是"又一个高性能 Web 服务器"，不是框架，也不是功能清单。对外形态是一个 `docker compose up` 起来、顶替 Nginx 位置的网关。
 
-**S1 完成 · S2 未开始** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 112/112 ｜ MIT
+**S1 完成 · S2 进行中（S2-01 多 Reactor 骨架已 DONE）** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 117/117 ｜ MIT
 
 ---
 
@@ -41,7 +41,7 @@
 
 ## 现在能做什么
 
-`l7gate --serve --listen <ip:port> --upstream <ip:port>` 起一个**单线程 epoll 边缘触发**循环，已经能：
+`l7gate --serve --listen <ip:port> --upstream <ip:port> [--workers N]` 起事件循环（`--workers 1` 是缺省的单线程 epoll ET；`--workers N≥2` 起 N 条 worker 循环线程，主线程 accept 后 round-robin 派发，连接对象单线程拥有，ADR-03/ADR-14），已经能：
 
 - 把下游解析出的完整请求按**原始字节**搬到上游，响应原样搬回，keep-alive 复用同一条回源连接
 - 认得一条响应在哪里结束：七种框架结论 + chunked 边界游标（只数边界、不重组 body）
@@ -50,7 +50,7 @@
 - 撞停读线就摘掉这条 fd 的 `EPOLLIN`，水位回落时带一次主动探测读挂回来（边沿触发不为已经在里的字节负责）
 - 按配置顺序过 filter 链——**链已立，今天没有业务 filter**
 
-还没有的：路由、负载均衡、连接池、限流、熔断、多线程、指标暴露。
+还没有的：路由、负载均衡、上游连接池、限流、熔断、指标暴露。（多线程 Reactor 骨架已落地——一个 acceptor + N 个 worker、连接单线程拥有、TSan 干净；上游连接池是 S2-02。）
 
 <details>
 <summary><b>逐条验收证据（点开）</b>——每个数字都来自本轮重跑，不是记忆</summary>
@@ -65,7 +65,8 @@
 | 响应语义（S1-06） | ctest 26 条 + `smoke-s1-06.sh` 八阶段真 curl：1200 B 固定体逐字节一致、`--raw` 下的 chunked、`/dies`→502（直连同上游是 curl 退出码 52 零字节）、`/dies-mid-body`→恰好 600 B 且零追加、`/bad-chunk` 不伪造内容、`/endless-head` 超预算判死、`/dev/tcp` 手写的 400/501/TRACE；口径核对 `upstream_opened == requests_parsed`（被拒的请求一条都不该回源） |
 | 背压（S1-07） | 四个方向各一条用例：请求方向 384 条 POST 平台期 2,922,610 B（载荷 3,170,580）；响应方向 1 MiB + 客户端一字节不读；隧道方向 2,742,440 B 帧字节平台期 1,898,661 B 且恢复后一字节不少；稳态 1000 请求 `epoll_modifications=3999`＝**4.00 次/请求**（与 S1-04 同口径，背压没多打一枪）。进程侧 `smoke-s1-07.sh` 四阶段，含 `--high-water-mark 4096` 下一条 100 KiB 请求**停在停读线上**（`read_disarmed_connections=1`、curl 零字节、无 5xx）。口径与被删掉的钉窗实验见 ARCHITECTURE 1.15 |
 | filter 链（S1-08） | 顺序＝添加顺序（用例故意按 c、a、b 添加）、第一个 `kStop` 之后不再调用后面的、filter 状态跨请求存活；主路径上只有一处链调用；「不改主路径」的可执行形式＝空链与两条放行 filter 下响应内容与七项计数**逐项相等**。TSan 这轮抓到的是我自己写的第一版（循环还在跑时读非原子计数器） |
-| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **112/112**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节） |
+| 多 Reactor（S2-01） | 一个 acceptor + N 个 worker、round-robin 派发、**连接单线程拥有、跨线程只传裸 fd**（ADR-14）。`DispatchIsRoundRobinBalanced`：8 连接派发到 4 worker 每个恰好 2 条；`TenThousandRequests...`：10000 请求跨 4 worker，`constructed==destructed==16`、`fd 5→5`、聚合 `epoll 注册 20（=4 wake_fd+16 连接）/注销 16`；`ConcurrentLoad...`：16 线程 × 50 请求并发穿 4 worker，**tsan preset 零 data race**（S2 门禁硬条件）。生产路径 `--serve --workers 4` + 真 curl 20/20 200、`fd 15→15` |
+| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **117/117**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节） |
 
 </details>
 
@@ -76,7 +77,7 @@
 | 阶段 | 目标 | 状态 | 门禁 |
 |---|---|---|---|
 | **S1** | 单连接转发 + 第一份 p99 | ✅ 八个任务全 DONE | 四件套：#2/#3/#4 齐，#1 的 #3 半边按裁决**推到 S5 终判**（理由见上表） |
-| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 未开始 | TSan 干净 |
+| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 🔨 进行中（S2-01 多 Reactor 骨架 DONE，TSan 117/117 零 race；S2-02…07 待做） | TSan 干净 |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 摘除安全阀 | 未开始 | 摘除耗时、误摘率、故障注入实测 |
 | **S4** | 限流 + 熔断 + 超时重试防放大 | 未开始 | 429 生效数据、熔断时间线、Redis 降级 |
 | **S5** | 热重载 + 指标 + 面板 + vs Nginx 归因 | 未开始 | 三个数字终稿、归因报告、故障注入全表 |
@@ -87,10 +88,11 @@ S1 的门禁结论、一键复现命令、以及**实测暴露出来留给 S2 �
 
 ## 架构与数据流
 
-多线程 Reactor（one loop per thread）+ epoll ET + 配置驱动的 filter 链。**当前是单个 Reactor 线程**，但连接对象从 S1-04 就按"可能被别的线程持有"设计（六步关闭 + 批末延后析构 + 全原子观测面），S2 的 TSan 基线不是从零开始猜。
+多线程 Reactor（one loop per thread）+ epoll ET + 配置驱动的 filter 链。**S2-01 起多 Reactor 骨架已落地**：一个 acceptor 线程 accept、round-robin 派发给 N 个 worker（`--workers N`），**连接对象单线程拥有、跨线程只传裸 fd**（ADR-03/ADR-14）——于是"两个线程碰同一条连接"在结构上不成立，TSan 门禁（117/117 零 race）证的就是这件事。缺省仍是单 Reactor（`--workers 1`），S1 的精确计数与冒烟证据不作废。上游连接池、跨线程异步销毁的 harder 情形归 S2-02/S2-03。
 
 ```
-client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parser
+client ──epoll ET──▶ acceptor ──round-robin──▶ N×worker Reactor ──▶ Buffer ──▶ HTTP/1.1 parser
+                       │                        （✅ S2-01：连接单线程拥有，跨线程只传 fd）
                        │              │
                        │              ├─ 原始字节 ──▶ 上游连接        ✅ S1-04/05（回源复用 + 101 后纯字节隧道）
                        │              ├─ 上游响应 ──▶ 下游            ✅ S1-06（框架判定 + 截断两条口径）
@@ -98,7 +100,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
                        │
                filter chain（配置决定顺序）   ✅ S1-08 骨架已立，业务 filter 归 S3/S4
                        │
-        路由 ──▶ 负载均衡 ──▶ 上游连接池       ⏳ S2/S3
+        路由 ──▶ 负载均衡 ──▶ 上游连接池       ⏳ S2-02 / S3
                        │
         熔断 / 限流（共享状态）                ⏳ S4
                        │
@@ -129,7 +131,7 @@ client ──epoll ET──▶ Reactor ──▶ Buffer ──▶ HTTP/1.1 parse
 
 ```bash
 cmake --preset debug && cmake --build --preset debug
-ctest --preset debug                      # 112/112（14 个套件，构成见 TASKS.md 交接段）
+ctest --preset debug                      # 117/117（15 个套件，构成见 TASKS.md 交接段）
 ./build/debug/l7gate --self-check         # version / compiler / gtest / sanitizers / build_type / malloc
 
 # 手动跑一遍透传：起上游 → 把网关架在中间 → 用真 curl 打一发
@@ -206,7 +208,7 @@ scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网�
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录：B-001…B-005 + 口径变更节，**未达标照记** |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障注入的预期 vs 实测 + sanitizer 结论（每条"干净"都带反证） |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**：S1 四件套对账、一键复现、留给 S2 的九条债、待答复事项 |
-| [docs/adr/](docs/adr/) | 13 条决策记录 |
+| [docs/adr/](docs/adr/) | 14 条决策记录（ADR-14 连接所有权与跨线程传递/异步销毁随 S2-01 新增） |
 
 ---
 

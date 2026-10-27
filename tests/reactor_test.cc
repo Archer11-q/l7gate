@@ -33,6 +33,7 @@
 #include <gtest/gtest.h>
 
 #include "net/reactor.h"
+#include "net/reactor_group.h"
 #include "test_upstream.h"
 
 namespace l7gate::net {
@@ -1974,6 +1975,359 @@ TEST(S1_08_FilterReactor, StoppedRequestNeverReachesUpstream) {
          "被网关拒绝——两者必须分得开（今天先分给『什么都不做』）";
 
   client.close();
+  harness.shutdown_all();
+}
+
+// ===========================================================================
+// S2-01：多 Reactor 骨架 + 单向派发（ADR-03 多线程 Reactor + ADR-14 所有权模型）
+// ===========================================================================
+//
+// 这一组断言的是 ADR-14 的所有权模型在结构上成立，五条各打一面：
+//   一、round-robin 派发均衡（每 worker 接到数 == ⌈/⌊M/N⌉）；
+//   二、10000 请求跨 worker 跑完，生命周期归零（live=0、constructed==destructed、
+//       fd 回基线、聚合 epoll 注册/注销逐项对得上）；
+//   三、16 线程并发压力下响应正确 + 收尾干净 —— **这条的真正门禁在 tsan preset**：
+//       断言全绿且 TSan 零 data race，才证明"连接单线程拥有"在并发下成立；
+//   四、stop() 让 accept 循环与所有 worker 都退出；
+//   五、handoff 之后补的探测读把"注册前已缓冲的请求"读了出来（ADR-14 第 5 条）。
+//
+// "连接对象只被 owner worker 碰"这件事没法用一个 EXPECT 直接断——它的可证伪形式
+// 就是 TSan：若两个线程碰了同一条连接或同一个 worker 的循环内状态，tsan 会红。
+// 所以这组用例一半价值在断言、一半在"它们在 tsan 下跑过且零报告"。
+
+class GroupHarness {
+ public:
+  struct Options {
+    ReactorGroup::Config config;
+    bool with_upstream = true;
+  };
+
+  bool start(const Options& options, std::string* why) {
+    ReactorGroup::Config config = options.config;
+    if (options.with_upstream) {
+      if (!upstream_.start(why)) return false;
+      upstream_.set_response_body_bytes(kBodyBytes);
+      config.upstream_port = upstream_.port();
+    }
+    config.listen_port = 0;  // 内核选端口：测试并行/重跑都不该撞车
+    group_ = std::make_unique<ReactorGroup>(config);
+    int error = 0;
+    if (!group_->start_listen(&error)) {
+      *why = "start_listen failed errno=" + std::to_string(error);
+      return false;
+    }
+    port_ = group_->listen_port();
+    // run() 在**这条线程**上跑 accept 循环，并在内部 spawn N 条 worker 线程；
+    // stop_loop() 里 group_->stop() 让 accept 循环退出，run() 随后 stop+join 所有
+    // worker，再 join 这条线程——所以 thread_ join 返回时，全部 1+N 条线程都已停。
+    thread_ = std::thread([this] { batches_ = group_->run(); });
+    return true;
+  }
+
+  void stop_loop() {
+    if (group_ != nullptr) group_->stop();
+    if (thread_.joinable()) thread_.join();
+  }
+  void destroy() {
+    stop_loop();
+    group_.reset();
+  }
+  void shutdown_all() {
+    destroy();
+    upstream_.stop_and_join();
+  }
+
+  ReactorGroup* group() noexcept { return group_.get(); }
+  TestUpstream& upstream() noexcept { return upstream_; }
+  std::uint64_t batches() const noexcept { return batches_; }
+  int port() const noexcept { return port_; }
+
+  ~GroupHarness() { destroy(); }
+
+ private:
+  // 声明顺序 = 销毁顺序的反面：group_（连同它的 worker 与连接）必须先于上游析构。
+  TestUpstream upstream_;
+  std::unique_ptr<ReactorGroup> group_;
+  std::thread thread_;
+  std::uint64_t batches_ = 0;
+  int port_ = -1;
+};
+
+ReactorGroup::Config group_base_config(int workers) {
+  ReactorGroup::Config config;
+  config.worker_count = workers;
+  config.wait_timeout_ms = 50;  // 测试里缩短：停循环更快，卡死暴露得更快
+  return config;
+}
+
+// 一、派发均衡。用**空闲**连接（不发请求）测，所以不触发 ensure_upstream、
+// 不碰 TestUpstream 的 32 客户端上限——本用例测的是 acceptor 的 round-robin，
+// 不是转发。8 条派发到 4 worker，每个恰好 2 条（整除，断言不留余数歧义）。
+TEST(S2_01_MultiReactor, DispatchIsRoundRobinBalanced) {
+  constexpr int kWorkers = 4;
+  constexpr int kConns = 8;
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::vector<Client> clients(static_cast<std::size_t>(kConns));
+  for (int i = 0; i < kConns; ++i) {
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].connect_to(harness.port(), &why)) << why;
+  }
+  ReactorStats& stats = harness.group()->stats();
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.downstream_accepted) == static_cast<std::uint64_t>(kConns); },
+      3000))
+      << "8 条连接没有全部被 acceptor 派发并注册";
+
+  // 停循环后才读每 worker 的注册表（非原子观测，stats.h 第 25 行那条纪律）。
+  harness.stop_loop();
+  std::size_t total = 0;
+  for (int i = 0; i < kWorkers; ++i) {
+    const std::size_t n = harness.group()->worker_live_count(i);
+    total += n;
+    EXPECT_EQ(n, static_cast<std::size_t>(kConns / kWorkers))
+        << "worker " << i << " 接到的连接数不是 round-robin 的均衡值";
+  }
+  EXPECT_EQ(total, static_cast<std::size_t>(kConns));
+  EXPECT_EQ(stats.load(stats.live_connections), static_cast<std::uint64_t>(kConns))
+      << "空闲连接此刻都该还在注册表里（stop 不排水，排水归 S2-05）";
+  std::printf("[S2-01 balance] %d 条空闲连接派发到 %d worker：每个 %zu 条\n", kConns, kWorkers,
+              static_cast<std::size_t>(kConns / kWorkers));
+
+  for (auto& c : clients) c.close();
+  harness.shutdown_all();
+}
+
+// 二、10000 请求跨 worker + 生命周期归零。顺序驱动（一条连接的 1250 条走完再走
+// 下一条），所以上游那个**全局** seq 计数器是确定的（第 k 条请求 → seq=k），
+// 响应体可以逐条精确比对——并发正确性交给用例三，这条要的是"跨 worker 的转发
+// 内容正确 + 收尾干净"。8 条连接 round-robin 落到 4 个 worker，每个 worker 2 条。
+TEST(S2_01_MultiReactor, TenThousandRequestsAcrossWorkersLeaveNothingAlive) {
+  constexpr int kWorkers = 4;
+  constexpr int kConns = 8;       // 8 下游 + 8 上游 = 16 ≤ TestUpstream 的 32 上限
+  constexpr int kPerConn = 1250;  // 8 × 1250 = 10000
+  constexpr std::uint64_t kRequests = static_cast<std::uint64_t>(kConns) * kPerConn;
+
+  const std::size_t fd_before = count_open_fds();
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::vector<Client> clients(static_cast<std::size_t>(kConns));
+  for (int i = 0; i < kConns; ++i) {
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].connect_to(harness.port(), &why)) << why;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  std::size_t global_seq = 0;
+  for (int i = 0; i < kConns; ++i) {
+    for (int j = 0; j < kPerConn; ++j) {
+      ++global_seq;
+      Client& c = clients[static_cast<std::size_t>(i)];
+      ASSERT_TRUE(c.write_all(request_text(global_seq))) << "conn " << i << " 第 " << global_seq;
+      std::string status;
+      std::string body;
+      ASSERT_TRUE(c.read_response(&status, &body, &why)) << "conn " << i << "：" << why;
+      ASSERT_EQ(status, "HTTP/1.1 200 OK");
+      ASSERT_EQ(body, expected_body(global_seq))
+          << "第 " << global_seq << " 条响应串号了：多 worker 下响应被安到了别的请求上";
+    }
+  }
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                            started)
+          .count();
+
+  // 收尾：先半关闭拿内核级证据（read() 返回 0），再等 live_connections 归零。
+  for (auto& c : clients) c.shutdown_write();
+  for (auto& c : clients) {
+    ASSERT_TRUE(c.wait_for_eof(&why)) << "客户端发了 FIN，网关没把这侧连接关掉：" << why;
+  }
+  ReactorStats& stats = harness.group()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
+      << "客户端全关后仍有连接对象没析构";
+
+  // 复制成局部量再用：shutdown_all() 会销毁 group_，stats 引用届时悬空。
+  const std::uint64_t parsed = stats.load(stats.requests_parsed);
+  const std::uint64_t completed = stats.load(stats.responses_completed);
+  const std::uint64_t accepted = stats.load(stats.downstream_accepted);
+  const std::uint64_t opened = stats.load(stats.upstream_opened);
+  const std::uint64_t constructed = stats.load(stats.connections_constructed);
+  const std::uint64_t destructed = stats.load(stats.connections_destructed);
+  const std::uint64_t closed = stats.load(stats.connections_closed);
+  const std::uint64_t served = harness.upstream().requests_served();
+
+  EXPECT_EQ(parsed, kRequests);
+  EXPECT_EQ(completed, kRequests);
+  EXPECT_EQ(served, kRequests) << "上游实际处理的条数也要是 10000";
+  EXPECT_EQ(accepted, static_cast<std::uint64_t>(kConns));
+  EXPECT_EQ(opened, static_cast<std::uint64_t>(kConns)) << "keep-alive 下每条下游只开一条上游";
+  EXPECT_EQ(constructed, 2u * static_cast<std::uint64_t>(kConns)) << "8 下游 + 8 上游 = 16";
+  EXPECT_EQ(constructed, destructed) << "构造与析构逐项相等（延后析构在批末兑现）";
+  EXPECT_EQ(closed, 2u * static_cast<std::uint64_t>(kConns));
+
+  harness.stop_loop();  // join 之后才允许读非原子的聚合 epoll 计数
+  const std::uint64_t reg = harness.group()->epoll_registrations();
+  const std::uint64_t unreg = harness.group()->epoll_unregistrations();
+  // 聚合注册数 = N 个 worker 各自的常驻 wake_fd（各 1，~Reactor 才注销）+ 16 条连接；
+  // 注销数 = 16（连接关闭时注销）。acceptor 侧的 epoll 不计入（epoll_* 只汇总 worker）。
+  EXPECT_EQ(reg, static_cast<std::uint64_t>(kWorkers) + accepted + opened);
+  EXPECT_EQ(unreg, closed) << "注销数少于关闭数 = 有 fd 还挂在某个 worker 的 interest list 上";
+  EXPECT_EQ(harness.group()->live_connection_count(), 0u);
+
+  for (auto& c : clients) c.close();
+  harness.shutdown_all();
+  const std::size_t fd_after = count_open_fds();
+  std::printf("[S2-01 10000] %d worker 串行往返=%llu 耗时=%lldms fd: 起=%zu 终=%zu "
+              "epoll 注册=%llu 注销=%llu\n",
+              kWorkers, static_cast<unsigned long long>(kRequests), static_cast<long long>(ms),
+              fd_before, fd_after, static_cast<unsigned long long>(reg),
+              static_cast<unsigned long long>(unreg));
+  EXPECT_EQ(fd_after, fd_before) << "10000 请求之后 fd 没回到基线：有连接没被真正关掉";
+}
+
+// 三、并发压力 + TSan 门禁。16 条线程各开一条连接、各发 50 条请求（16 下游 +
+// 16 上游 = 16 ≤ 32 上限），真正并发地穿过 accept→handoff→转发→收尾。并发下上游
+// 的全局 seq 不可预测，所以只断"200 + 体长 + seq= 前缀"（证明响应没串号/没截断），
+// 精确比对交给用例二。**这条的价值在 tsan preset 下零 data race 报告。**
+TEST(S2_01_MultiReactor, ConcurrentLoadAcrossWorkersIsRaceFreeAndCorrect) {
+  constexpr int kWorkers = 4;
+  constexpr int kThreads = 16;
+  constexpr int kReqsPerThread = 50;
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::atomic<int> failures{0};
+  std::atomic<int> bad_responses{0};
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(kThreads));
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      Client client;
+      std::string w;
+      if (!client.connect_to(harness.port(), &w)) {
+        failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      for (int j = 0; j < kReqsPerThread; ++j) {
+        const std::size_t seq = static_cast<std::size_t>(t * kReqsPerThread + j);
+        if (!client.write_all(request_text(seq))) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        std::string status;
+        std::string body;
+        if (!client.read_response(&status, &body, &w)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        if (status != "HTTP/1.1 200 OK" || body.size() != kBodyBytes ||
+            body.rfind("seq=", 0) != 0) {
+          bad_responses.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      client.shutdown_write();
+      (void)client.wait_for_eof(&w);  // 内核级证据：网关把这侧关了
+    });
+  }
+  for (auto& th : threads) th.join();
+
+  EXPECT_EQ(failures.load(std::memory_order_relaxed), 0) << "有客户端连接/读写失败";
+  EXPECT_EQ(bad_responses.load(std::memory_order_relaxed), 0) << "有响应串号或截断";
+
+  ReactorStats& stats = harness.group()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000))
+      << "并发负载收尾后仍有连接活着";
+  const std::uint64_t parsed = stats.load(stats.requests_parsed);
+  const std::uint64_t completed = stats.load(stats.responses_completed);
+  const std::uint64_t constructed = stats.load(stats.connections_constructed);
+  const std::uint64_t destructed = stats.load(stats.connections_destructed);
+  EXPECT_EQ(parsed, static_cast<std::uint64_t>(kThreads) * kReqsPerThread);
+  EXPECT_EQ(completed, parsed);
+  EXPECT_EQ(constructed, destructed);
+  std::printf("[S2-01 concurrent] %d 线程 × %d 请求穿过 %d worker：parsed=%llu 收尾干净\n",
+              kThreads, kReqsPerThread, kWorkers, static_cast<unsigned long long>(parsed));
+
+  harness.shutdown_all();
+}
+
+// 四、stop() 让 accept 循环与所有 worker 都退出，且靠 eventfd 自唤醒而不是等超时。
+TEST(S2_01_MultiReactor, StopEndsAcceptLoopAndAllWorkers) {
+  constexpr int kWorkers = 4;
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  // 先把循环"用起来"再停：一条连接被派发注册，证明 accept 循环与至少一个 worker
+  // 确实在跑（否则测的是空循环，stop 延迟再好看也没意义）。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ReactorStats& stats = harness.group()->stats();
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.downstream_accepted) == 1u; }, 3000))
+      << "连接没被派发注册，worker 循环可能没起来";
+
+  const auto started = std::chrono::steady_clock::now();
+  harness.group()->stop();
+  harness.stop_loop();  // join 返回 = accept 循环 + N worker 全部退出
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                            started)
+          .count();
+  EXPECT_LT(ms, 1000) << "stop 到全部线程退出超过 1s：eventfd 自唤醒没起作用，靠超时兜的";
+  EXPECT_FALSE(harness.group()->running());
+  EXPECT_TRUE(harness.group()->stop_requested());
+  std::printf("[S2-01 stop] %d worker：stop() 到全部退出 %lld ms（wait_timeout_ms=50）\n",
+              kWorkers, static_cast<long long>(ms));
+
+  client.close();
+  harness.shutdown_all();
+}
+
+// 五、handoff 探测读（ADR-14 第 5 条）的回归。ET 不为"注册之前已缓冲的字节"负责：
+// fd 从 acceptor accept、排队、到 worker 注册这段窗口里，客户端可能已经把请求写进了
+// 内核接收缓冲，而注册那一刻没有新跳变。worker 注册完补一次探测读把已缓冲的字节读
+// 干净——少了它，"连上就立刻发"的连接会睡死到客户端再写一次为止。这里用 100 条
+// "连接后立即发一条请求"最大化撞上那个窗口；若哪天探测被删掉且内核不在注册时投边，
+// 其中若干条会读超时（红在 timeout 上，不是红在计数上）。
+TEST(S2_01_MultiReactor, HandoffConnectionWithImmediateRequestIsServed) {
+  constexpr int kWorkers = 4;
+  constexpr int kIterations = 100;
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  for (int i = 0; i < kIterations; ++i) {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << "第 " << i << " 条连接：" << why;
+    // 连接成功后**立刻**整条写出：字节很可能在 worker 注册这条 fd 之前就到达内核。
+    ASSERT_TRUE(client.write_all(request_text(static_cast<std::size_t>(i) + 1)))
+        << "第 " << i << " 条写不出去";
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why))
+        << "第 " << i << " 条没拿到响应（探测读没把注册前已缓冲的请求读出来？）：" << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK") << "第 " << i;
+    ASSERT_EQ(body.size(), kBodyBytes) << "第 " << i;
+    client.close();
+  }
+
+  ReactorStats& stats = harness.group()->stats();
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kIterations));
+  EXPECT_EQ(stats.load(stats.downstream_accepted), static_cast<std::uint64_t>(kIterations));
   harness.shutdown_all();
 }
 

@@ -18,6 +18,7 @@
 
 #include "core/build_info.h"
 #include "net/reactor.h"
+#include "net/reactor_group.h"
 
 namespace {
 
@@ -27,13 +28,15 @@ void usage(std::FILE* out) {
       "用法: l7gate --self-check\n"
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>\n"
       "               [--serve-requests N] [--max-connections N]\n"
-      "               [--high-water-mark BYTES]\n"
+      "               [--high-water-mark BYTES] [--workers N]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
       "upgrade + Upgrade 的请求在拿到完整 101 响应头后切纯透传（ADR-09，不解析帧），\n"
       "Connection: close 的请求按语义收尾配对连接。它不做状态码映射、不改写响应\n"
       "（S1-06），畸形请求只关连接不回 400。\n"
+      "--workers N（S2-01）：N=1（缺省）走单 Reactor；N≥2 起 N 条 worker 循环线程，\n"
+      "主线程 accept 后 round-robin 派发，连接对象单线程拥有（ADR-03/ADR-14）。\n"
       "N 为正整数。--serve-requests 是「解析满 N 条就停循环」，它可能在最后一条响应\n"
       "送达之前就 break —— 要「把 N 条全部送完再停」就用信号，冒烟脚本就是这么做的。\n"
       "--high-water-mark 把**两个方向**的停读线钉到 BYTES（4096..1048576，默认 256 KiB）。\n"
@@ -86,11 +89,18 @@ std::int64_t current_rss_kib() {
 // 一条 mov。没有锁、没有分配、没有 stdio。连续两个 SIGTERM 时第二个可能打断
 // 第一个的 write，最坏结果是 eventfd 计数变 2、循环多醒一次，不是坏状态。
 std::atomic<l7gate::net::Reactor*> g_reactor_for_signal{nullptr};
+// S2-01：多 Reactor 路径用 ReactorGroup。两个全局二选一非空——单 Reactor 模式设
+// g_reactor_for_signal，多 Reactor 模式设 g_group_for_signal。handler 各判一次空。
+std::atomic<l7gate::net::ReactorGroup*> g_group_for_signal{nullptr};
 
 void on_stop_signal(int) {
   l7gate::net::Reactor* reactor = g_reactor_for_signal.load(std::memory_order_relaxed);
   if (reactor != nullptr) {
     reactor->stop();
+  }
+  l7gate::net::ReactorGroup* group = g_group_for_signal.load(std::memory_order_relaxed);
+  if (group != nullptr) {
+    group->stop();
   }
 }
 
@@ -122,9 +132,14 @@ bool parse_number(const char* text, long long* out) {
 
 // 只在循环退出之后调用：ReactorStats 全原子，但这份快照要的是"这一次运行的最终账"，
 // 在循环还在跑的时候打印会得到一个中间态，那种数字最容易被当成结论抄进文档。
-void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int64_t rss_start,
-                  long long elapsed_ms) {
-  l7gate::net::ReactorStats& stats = reactor.stats();
+// S2-01 起它接收**显式的聚合量**而不是 Reactor&：单 Reactor 传自己的、ReactorGroup
+// 传跨 worker 求和的，两条路复用同一份 [serve] key=value 输出（冒烟脚本 grep 的键
+// 因此不必区分单/多 Reactor）。epoll 三计数与 read_disarmed 都是非原子观测，
+// 调用方保证只在循环停下后取。
+void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registrations,
+                  std::uint64_t epoll_unregistrations, std::uint64_t epoll_modifications,
+                  std::size_t read_disarmed_connections, std::int64_t fd_start,
+                  std::int64_t rss_start, long long elapsed_ms) {
   const std::int64_t fd_now = count_open_fds();
   const std::int64_t rss_now = current_rss_kib();
   // 一行一个 key=value，键名用 ASCII。理由不是审美：这份输出是冒烟脚本的输入，
@@ -178,14 +193,13 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
   put("upstream_truncated_in_body",
       static_cast<long long>(stats.load(stats.upstream_truncated_in_body)));
   put("responses_completed", static_cast<long long>(stats.load(stats.responses_completed)));
-  put("epoll_registrations", static_cast<long long>(reactor.epoll_registrations()));
-  put("epoll_unregistrations", static_cast<long long>(reactor.epoll_unregistrations()));
-  put("epoll_modifications", static_cast<long long>(reactor.epoll_modifications()));
+  put("epoll_registrations", static_cast<long long>(epoll_registrations));
+  put("epoll_unregistrations", static_cast<long long>(epoll_unregistrations));
+  put("epoll_modifications", static_cast<long long>(epoll_modifications));
   // 「网关不再消费下游可读事件」这条验收在进程侧的直读证据：循环已经停下，
   // 剩下的每一个存活连接如果还带着没挂 EPOLLIN 的掩码，就是被背压按住的那一个。
   // 非原子观测，所以只在这个时刻读。
-  put("read_disarmed_connections",
-      static_cast<long long>(reactor.connections_with_read_disarmed()));
+  put("read_disarmed_connections", static_cast<long long>(read_disarmed_connections));
   // fd 这里含本进程自己打开的 stdout 之类，所以看的是**增量**，不是绝对值；
   // 而且这个数在 Reactor 析构之前读，监听 fd/epoll/eventfd 三个常驻项两边都在。
   put("fd_start", static_cast<long long>(fd_start));
@@ -197,6 +211,9 @@ void report_stats(l7gate::net::Reactor& reactor, std::int64_t fd_start, std::int
 int serve(int argc, char** argv) {
   l7gate::net::Reactor::Config config;
   std::size_t stop_after_requests = 0;
+  // S2-01：worker 线程数。缺省 1 = 单 Reactor（S1 路径逐字节不变，冒烟脚本断言的
+  // epoll_registrations=4 等精确计数因此不作废）；≥2 走 ReactorGroup（ADR-14 后果段）。
+  int workers = 1;
   bool have_listen = false;
   bool have_upstream = false;
 
@@ -247,6 +264,17 @@ int serve(int argc, char** argv) {
       config.connection.inbound.high_water_mark = static_cast<std::size_t>(n);
       config.connection.outbound.high_water_mark = static_cast<std::size_t>(n);
       ++i;
+    } else if (flag == "--workers" && value != nullptr) {
+      // S2-01 的多 Reactor 开关。1 = 单 Reactor（S1 路径），≥2 = ReactorGroup。
+      // 上限不设死：真正的闸门是 fd 预算与临时端口（S2-06 的 c100k 口径），
+      // 这里只挡掉明显非法的值（<1 或大到 int 溢出）。
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 1 || n > 4096) {
+        std::fprintf(stderr, "参数错误: --workers 要的是 1..4096，收到 %s\n", value);
+        return 2;
+      }
+      workers = static_cast<int>(n);
+      ++i;
     } else {
       std::fprintf(stderr, "参数错误: 无法识别的选项 %s\n", std::string(flag).c_str());
       usage(stderr);
@@ -262,6 +290,59 @@ int serve(int argc, char** argv) {
   if (!have_listen || !have_upstream) {
     std::fprintf(stderr, "参数错误: --serve 需要同时给 --listen 和 --upstream\n");
     return 2;
+  }
+
+  // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
+  if (workers >= 2) {
+    l7gate::net::ReactorGroup::Config gconfig;
+    gconfig.listen_address = config.listen_address;
+    gconfig.listen_port = config.listen_port;
+    gconfig.upstream_address = config.upstream_address;
+    gconfig.upstream_port = config.upstream_port;
+    gconfig.listen_backlog = config.listen_backlog;
+    gconfig.worker_count = workers;
+    gconfig.max_connections_per_worker = config.max_connections;
+    gconfig.connection = config.connection;
+    gconfig.stop_after_requests = stop_after_requests;
+    gconfig.wait_timeout_ms = config.wait_timeout_ms;
+
+    l7gate::net::ReactorGroup group(gconfig);
+    int error = 0;
+    if (!group.start_listen(&error)) {
+      std::fprintf(stderr, "监听 %s:%u 失败: errno=%d (%s)\n", gconfig.listen_address.c_str(),
+                   gconfig.listen_port, error, std::strerror(error));
+      return 1;
+    }
+    g_group_for_signal.store(&group, std::memory_order_relaxed);
+    std::signal(SIGINT, on_stop_signal);
+    std::signal(SIGTERM, on_stop_signal);
+
+    // fd_start 在 start_listen 之后量：此刻监听 fd + accept 侧 epoll/eventfd +
+    // N×(worker epoll/eventfd) 都已打开，与 fd_end（析构之前量）同一视野，
+    // 所以"首尾相等"判的仍然是"连接 fd 有没有漏"，常驻项两边都抵消。
+    const std::int64_t fd_start = count_open_fds();
+    const std::int64_t rss_start = current_rss_kib();
+    std::printf("[serve] 监听 %s:%d（workers=%d backlog=%d max_connections_per_worker=%zu "
+                "upstream=%s:%u stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu）\n",
+                gconfig.listen_address.c_str(), group.listen_port(), workers, gconfig.listen_backlog,
+                gconfig.max_connections_per_worker, gconfig.upstream_address.c_str(),
+                gconfig.upstream_port, stop_after_requests, gconfig.wait_timeout_ms,
+                gconfig.connection.inbound.high_water_mark);
+    std::fflush(stdout);
+
+    const auto started = std::chrono::steady_clock::now();
+    const std::uint64_t batches = group.run();
+    g_group_for_signal.store(nullptr, std::memory_order_relaxed);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+
+    report_stats(group.stats(), group.epoll_registrations(), group.epoll_unregistrations(),
+                 group.epoll_modifications(), group.connections_with_read_disarmed(), fd_start,
+                 rss_start, static_cast<long long>(elapsed_ms));
+    std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
+    std::printf("[serve] workers=%d\n", workers);
+    return 0;
   }
 
   l7gate::net::Reactor reactor(config);
@@ -295,7 +376,9 @@ int serve(int argc, char** argv) {
 
   // 这里还没析构 Reactor，所以"存活连接数"是这次运行真正的终局读数：
   // 循环已经不再处理事件，剩下的每一个都是没人管的。
-  report_stats(reactor, fd_start, rss_start, static_cast<long long>(elapsed_ms));
+  report_stats(reactor.stats(), reactor.epoll_registrations(), reactor.epoll_unregistrations(),
+               reactor.epoll_modifications(), reactor.connections_with_read_disarmed(), fd_start,
+               rss_start, static_cast<long long>(elapsed_ms));
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   return 0;
 }

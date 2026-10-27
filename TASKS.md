@@ -6,7 +6,7 @@
 
 ## 当前进度
 
-阶段 **S1**，**S1-01～S1-06 已完成**，**S1-07（背压雏形：缓冲高水位与 fd 暂停读）待认领**，其后是 S1-08（filter 链骨架）与 S1 阶段门禁四件套。SLO #1 的首份数字已经拿到并**未达标**（1000 并发闭环下增量 p99 = 57.540 ms，目标 ≤ 1.0 ms；归因与口径问题见 `docs/BENCHMARK.md` B-001），这是 S1-07 之后所有性能工作的对照起点。工具链前置条件全部已用到实处：`clang 21.1.8` + `libclang-rt-21-dev`、`wrk 4.1.0`、`hey 0.1.4`、`curl 8.18.0` 就位，三个 sanitizer 我用故意写坏的样本做过阳性验证（ASan 报 UAF、LSan 报 5 处泄漏、UBSan 报 signed overflow、TSan 报 data race），证据在 `docs/ENVIRONMENT.md` 第 2.2 节。
+阶段 **S1 已关门**（八个任务全 DONE、门禁四件套齐、已 push，逐条对账见下面「交接」段与 `docs/ROADMAP.md`），**S2 拆解已确认、S2-01（多 Reactor 骨架 + 单向派发）已 DONE**（三 preset 各 117/117、TSan 零 data race、新增 ADR-14；见下面「## S2」段），**S2-02（上游连接池）待认领**。SLO #1 的首份数字已经拿到并**未达标**（1000 并发闭环下增量 p99 = 57.540 ms，目标 ≤ 1.0 ms；归因与口径问题见 `docs/BENCHMARK.md` B-001），这是 S1-07 之后所有性能工作的对照起点。工具链前置条件全部已用到实处：`clang 21.1.8` + `libclang-rt-21-dev`、`wrk 4.1.0`、`hey 0.1.4`、`curl 8.18.0` 就位，三个 sanitizer 我用故意写坏的样本做过阳性验证（ASan 报 UAF、LSan 报 5 处泄漏、UBSan 报 signed overflow、TSan 报 data race），证据在 `docs/ENVIRONMENT.md` 第 2.2 节。
 
 **S1-04 认领时的四处核对**（开工前对契约/TASKS/SLO 做交叉一致性检查的结果，逐条记状态，改了的和没改的都写在这里）：
 
@@ -96,13 +96,53 @@ scripts/bench/s2-qps-vs-nginx.sh                          # SLO #3 五档（ngin
 3. 文档按契约第 7 节矩阵同步（`ARCHITECTURE.md`、`README.md` 架构段）
 4. 提交记录：一个任务一次提交，提交信息带当次自测数字
 
+## S2 —— 多 Reactor + 上游连接池 + 连接对象跨线程传递与异步销毁
+
+> **状态：拆解已于 2026-10-27 经项目所有人确认；S2-01 已 DONE，S2-02（上游连接池）待认领**（契约 8.2 禁令一：功能必须在 TASKS.md 里才允许实现；确认前不动代码）。本段按 S1 门禁收尾时 `docs/ROADMAP.md`「S1 留给 S2 的九条债」与 ADR-03 拆出：七个任务、预计 3 条新 ADR（ADR-14/15/16，编号与合并在起草时定）。
+
+**本阶段要解决的真问题**：S1 的单 Reactor 把 1000 并发的排队放大成增量 p99 30–38 ms（B-001…B-004：`延迟 ≈ 连接数/QPS` 两组贴合到 1.4–3.6%，而 50 并发对照下每请求成本只有 ≈36 µs）——瓶颈是**并发分摊**，不是加工成本。S2 用多 Reactor 分摊并发、用上游连接池摊薄回源，把这条排队打下来。与此同时，多线程第一次让「连接对象跨线程传递与异步销毁」从设计意图变成真实风险（ADR-03 点名它是本项目最容易写出 use-after-free 的地方），所以 **TSan 干净是本阶段唯一的核心门禁**，三个数字是它的副产品而不是目标——这和 S1「先让转发链成为可断言命题、p99 未达标照记」是同一个优先级。
+
+**依赖顺序**（契约 6：一次会话只推进一个任务，认领即置 `RUNNING`）：
+
+S2-01（多 Reactor 骨架 + 单向派发）→ S2-02（上游连接池）→ S2-03（跨线程传递与异步销毁正确性 + TSan 攻坚）→ S2-04（请求-响应配对模型 + pipeline/close 语义）→ S2-05（优雅停止：排水 + 超时兜底）→ S2-06（C100K 客户端 + `c100k.sh` + 多目标地址 + HDR 分位）→ S2-07（SLO 重测 + 门禁四件套）。
+
+耦合点先写明，免得认领时踩：S2-04 的配对模型决定 S2-02 池化的上游连接如何接力 pipelined 请求——两者要么同期设计，要么 S2-02 先按「一条上游连接同一时刻只服务一个在飞请求」的保守口径落地、S2-04 再放宽；S2-06 依赖 S2-01（多 Reactor 才扛得住 100k）与 S2-05（100k 连接的清理要靠排水停止）。
+
+**取样规程自本阶段强制**（2026-10-26 裁决，落在 `SLO.md` 测量条件与 `BENCHMARK.md` 规矩四）：任何「某次改动有没有改善数字」的判断必须**同机交替、每个改动至少两轮、报告给极差**。依据是 S1 收尾量到的散布——同一份 binary 复跑直连 p99 自己漂 11.3%、四份增量极差 27%、#3 比值两轮差 1.2%。**S2 的多 Reactor 改动若不按这条跑，会产出一堆无法证伪的「成功」，而基于它们做的后续决策会一路错下去。** 这条纪律的可执行形式在 S2-07 的验收里。
+
+| ID | 任务 | 验收标准（可断言） | 状态 | 实测数字 |
+|---|---|---|---|---|
+| S2-01 | 多 Reactor 骨架：主线程 accept + N 个 worker 事件循环 + 连接单向派发 | N 个 worker 线程各跑一个独立 epoll ET 循环（N 可配，默认取 `nproc`=16）；主线程只 accept、不碰连接 IO；accept 到的 fd 经 handoff 队列（mutex + 每 worker 一个 eventfd）交给 round-robin 选中的 worker，worker 在自己的循环里把 fd 注册进**自己的** epoll；**一条连接从 accept 到关闭全程只被它的 owner worker 线程碰**（读/写/关闭/析构都在 owner——这条所有权模型是 S2-03 要正面钉死的，S2-01 先落地「单向 handoff」这一半）；派发均衡可断言（M 条连接派发到 N worker，每 worker 接到数落在 ⌊M/N⌋…⌈M/N⌉）；多 worker 下 10000 请求跑完 `live_connections=0`、`constructed==destructed`、fd 回基线、**每个 worker 各自的** epoll 注册/注销逐项对得上；**TSan 在含多 worker 的套件下零 data race**（门禁硬条件第一次正面验收）。上游仍按 S1 的 1:1 配对（池归 S2-02），配对两侧同属一个 owner worker。**不做**：不引池、不做路由（单 upstream）、stop 仍是 S1 语义（排水归 S2-05） | **DONE** | **三 preset 各 117/117**（debug / asan-ubsan / tsan，`verify-all-presets.sh` 重跑），非 gtest 警告 **0 条**；本任务新增 **5** 条 `S2_01_MultiReactor`（112→117）。**门禁硬条件 TSan 干净：tsan preset 117/117 零 data race**（TSan 检测到 race 会以退出码 66 判失败，全过即无 race；并发用例 16 线程穿 4 worker 在 tsan 下干净，这是 ADR-14「连接单线程拥有」的正面验收）。**验收逐条对上：**「round-robin 派发均衡」→ `DispatchIsRoundRobinBalanced`：8 条空闲连接派发到 4 worker，`worker_live_count(i)` 每个恰 **2** 条、合计 8、`live_connections=8`（空闲连接不触发 `ensure_upstream`，绕开 TestUpstream 的 32 客户端上限）。「多 worker 下 10000 请求生命周期归零」→ `TenThousandRequestsAcrossWorkersLeaveNothingAlive`：8 连接（2/worker）顺序驱动 8×1250=**10000** 请求，`requests_parsed==responses_completed==10000`、上游 `requests_served==10000`、响应体逐条精确比对（全局 seq 确定）、`constructed==destructed==16`（8 下游+8 上游）、`live_connections=0`、`fd 5→5`、聚合 `epoll_registrations=20 == N(4) wake_fd + 16 连接`、`epoll_unregistrations=16`（`reg − N == unreg`）、耗时 2492 ms（debug）。「TSan 零 race」→ `ConcurrentLoadAcrossWorkersIsRaceFreeAndCorrect`：16 线程 × 50 = **800** 请求并发穿过 4 worker，`failures=0`、`bad_responses=0`（并发下全局 seq 不可预测，只断 200+体长+`seq=` 前缀）、`parsed==completed==800`、`constructed==destructed`、收尾 `live=0`。「stop 让所有 worker 退出」→ `StopEndsAcceptLoopAndAllWorkers`：`stop()` 到 accept 循环 + 4 worker 全退出 **0 ms**（eventfd 自唤醒，非超时兜底）、`running()==false`。「handoff 探测读」→ `HandoffConnectionWithImmediateRequestIsServed`：100 条「连上立即发」全部拿到响应（ADR-14 第 5 条：ET 不为注册前已缓冲的字节负责，探测读补齐）。**生产进程路径另验**（ctest 用进程内 ReactorGroup，不覆盖 CLI/信号/聚合报告）：`l7gate --serve --workers 4` + 真 curl 20 条 → **20/20 200**、`fd_start==fd_end==15`、`constructed==destructed==40`、`live_connections=0`、`epoll_registrations=44（=4 wake_fd+40 连接）/unregistrations=40`、`workers=4`。**S1 回归**：三个冒烟脚本 `smoke-s1-04/06/07` 全过（exit=0、`✗`=0），单 Reactor 路径（`--workers` 缺省=1）逐字节不变——S1 冒烟断言的 `epoll_registrations=4` 等精确计数未作废（ADR-14 后果段）。**结构变更**：`Reactor` 加 worker 模式（共享 stats 构造 + `start_worker` + `handoff`/`drain_handoff`，`ReactorStats stats_` 改成 `owned_stats_` 指针 + `stats_` 引用，单 Reactor 路径行为不变）；新增 `net/reactor_group.h/.cc`（acceptor + N worker + round-robin）；`main.cc` 加 `--workers N`（N≥2 走 ReactorGroup）+ `report_stats` 改收显式聚合量；**`l7gate_core` 从此链 `Threads::Threads`**（ARCHITECTURE §2 预告的"S2 才需要"到期，pthread 非第三方库不触发禁令三）；`sizeof(Connection)` 不变（**520**）。新增 ADR-14（连接所有权与跨线程传递/异步销毁模型） |
+| S2-02 | 上游连接池：借/还/淘汰，摊薄回源开销 | 上游连接可复用——keep-alive 下 N 个下游请求只开 M 条上游连接，`M < N` 且 `M ≤ 池上限`（可断言）；池的借/还/淘汰在并发下 TSan 干净；上游被对端关闭时从池淘汰、不 UAF、在飞请求不受影响（淘汰后该下游重新借或新开一条）；池上限可配、达上限时行为可断言（借不到则新开 or 排队等，按 ADR-15 定）；ARCHITECTURE 第 3 节点名的那处「`on_upstream_event` 里上游 EOF 就跟着关下游」按池语义改掉（上游 EOF 不再直接级联关下游，而是淘汰该上游连接）；每 worker 的池计数可观测（借出/归还/淘汰/峰值）。**ADR-15 决策池归属（per-worker vs shared）与复用/淘汰策略**——这是不可逆决策且直接决定 TSan 复杂度与 SLO #2 的池摊销。**不做**：空闲连接超时回收（归 S4）、多上游路由/负载均衡（归 S3） | PENDING | — |
+| S2-03 | 连接对象跨线程传递与异步销毁的正确性 —— TSan 门禁正面攻坚 | 一组专门制造跨线程销毁竞态的红队用例，每种情形 TSan 零 data race、ASan/LSan 零 UAF 零泄漏——(a) 连接正在 owner worker 处理时主线程触发 stop；(b) 池淘汰一条上游连接的同时 owner 正在用它；(c) handoff 队列里一条 fd 在 worker 取出前对端就关了；(d) 一条连接的 `shared_ptr` 被非 owner 线程（统计/池）持有时 owner 关闭它；异步销毁协议可断言：连接只在 owner worker 的 retire 点析构，非 owner 持有的 `shared_ptr` 只延长生命周期、不改变操作权（用析构线程 id 断言 + 多线程压力下 `constructed==destructed` 逐项相等）；**本任务是 S2 门禁硬条件「TSan 干净」的正面验收点**，ADR-14 的销毁协议章节在此定稿（若 S2-01 未定全） | PENDING | — |
+| S2-04 | 请求-响应配对模型 + pipeline/`Connection: close` 语义（ADR-16） | 一条下游连接上的多个在飞请求与上游响应按 FIFO 配对（可断言：pipelined 3 条请求各自拿到对应响应，顺序与内容逐项对）；`Connection: close` 在**它所在那条请求的响应**完结后兑现、不是第一条（修掉 S1-07 记的债：400 条批次只兑现 1 条响应 → 现在按配对模型给出**定义行为**，字节账仍相等）；若 ADR 决定不支持 pipeline，则有可断言的降级/拒绝行为（不是未定义）；close 语义在池化上游下正确（一次性配对不进池，或按 ADR-16）；配对模型在并发下 TSan 干净。**ADR-16 由项目所有人点名 + 2026-10-26 裁决要求**（「随请求-响应配对模型一起定义，要写 ADR」） | PENDING | — |
+| S2-05 | 优雅停止：排水在飞连接 + 超时兜底（多 worker 协调） | stop/SIGTERM 后主线程通知所有 worker 停止接受新连接并**排水**在飞连接；在飞连接的响应送达后再退出（可断言：stop 时有一条在飞请求，退出前它的响应完整送达、`responses_completed` 计入）；排水带超时兜底（超时后强制关，超时值可配——**这是「停止排水」的超时，不是请求超时，后者归 S4**）；退出时 `live_connections=0`、`constructed==destructed`、fd 回基线、所有 worker join；stop 的跨线程通知与 worker 退出 TSan 干净；修掉 ROADMAP 债「优雅停止不排水在飞连接」（S1-07 冒烟阶段三故意留 `live=1` 的那条，现在排水后归零） | PENDING | — |
+| S2-06 | C100K 自研长连接客户端 + `c100k.sh` + 多目标地址 + HDR 分位（ADR-16/17） | 自研 C100K 长连接客户端（契约 1.3 唯一允许自研压测客户端的场景）能开 100k 条长连接——跨 **4 个目标地址**（127.0.0.1/.2/.3/.4，每地址 ≤ 28,232 条，绕过临时端口上限；**目标地址数写进方案与报告**）；客户端握手后进入空闲（不发业务帧，SLO #2 口径）；`c100k.sh` 输出：连接数、`VmRSS`、空进程基线 RSS、每连接内存（**连接对**口径）、空闲 CPU%、**HDR 分位（p50/p99/p999）**；fd soft limit 自抬（脚本 `ulimit -n` 或进程 `setrlimit` 到 ≥ 需要值，ENVIRONMENT 第 7 节已验 soft 可自抬、hard=1048576）；**HDR 分位是 p999 的取数手段**（修掉 SLO #1 的 p999「无法判定」）。**ADR（随 `c100k.sh` 补，裁决已定）：自研客户端 + 多目标地址口径 + HDR 分位属测量手段变更**。依赖 S2-01/05 | PENDING | — |
+| S2-07 | SLO 重测（按取样规程）+ 门禁四件套收尾 | **SLO #1**：多 Reactor 后按取样规程重测（同机交替、每改动 ≥2 轮、报极差）增量 p99，与 S1 的 30–38 ms 对照，结论按「未达标照记 + 归因」——多 Reactor 有没有把排队打下来用两轮以上的极差说话，**不用单轮讲变好的故事**；**SLO #2**：100k 空闲长连接稳态实测每连接内存（连接对口径），**构成表每一项都有数**（入向 buffer / 出向 buffer / scratch / `Connection` 对象 / 池摊销 / 分配器取整），顺手归掉那 0.50 KiB 未归因差额（归不掉则明确标注「仍无法归因 + 量级」）；空闲 CPU < 5% 实测；**SLO #3**：QPS 多 Reactor 后重测有 `canonic` 读数，但判定按裁决推到 S5（不在 S2 判）；p999 半边靠 S2-06 的 HDR 分位第一次可判定（出数或明确标注仍取不到）。**门禁四件套**：三个数字快照进 `BENCHMARK.md`、TSan 干净进 `FAULT-INJECTION.md`、文档按矩阵同步、提交记录带数字 | PENDING | — |
+
+**预计新增 ADR**（编号与合并在起草时定，契约 8.2：先 ADR → 更新 TASKS → 才动手）：
+
+- **ADR-14**（S2-01 起草、S2-03 定稿）：连接所有权与跨线程传递/异步销毁模型。ADR-03 定了「多线程 Reactor 而非多进程」，但没定连接对象的具体所有权协议——单线程拥有 + handoff + retire 投递回 owner 是不可逆决策，且是「最容易 UAF 的地方」，值得独立记录。
+- **ADR-15**（S2-02）：上游连接池的线程归属（per-worker vs shared）与复用/淘汰策略。直接决定 TSan 复杂度与 SLO #2 的池摊销。
+- **ADR-16**（S2-04）：请求-响应配对模型与 pipeline/`Connection: close` 语义。用户点名 + 裁决已定。
+- **ADR-17**（S2-06）：C100K 自研客户端、多目标地址口径与 HDR 分位。裁决已定「随 `c100k.sh` 补一条 ADR」，属测量手段变更。（ADR-14 与 15 若发现是同一个不可逆决策的两面，起草时可合并为一条，届时在本段注明。）
+
+**S2 门禁硬条件（契约 4.1，缺一不进 S3）**：
+
+1. **TSan 干净**——全套件（含多 worker、池、跨线程销毁红队用例、排水停止）在 `tsan` preset 下零 data race。这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的显式对账，也是必须先装 Clang 的原因。
+2. 三个数字快照进 `BENCHMARK.md`：#1 按取样规程至少两轮 + 极差；#2 100k 实测 + 构成表无空项；#3 QPS 有读数、判定按裁决推 S5。
+3. ASan/UBSan/LSan 干净（多 worker 压力下零 UAF、零泄漏，带反证）。
+4. 文档按契约第 7 节矩阵同步；一个任务一次提交、提交信息带当次实测数字。
+
+**明确不在 S2 做（防止范围扩张，契约 8.2 禁令一）**：路由/负载均衡/健康检查（S3）、限流/熔断/请求级超时（S4）、池的空闲连接超时回收（S4，S2 的池只做「用完归还 + 上游断开淘汰」）、配置热重载/Prometheus/Grafana（S5）、io_uring（延迟决策，无火焰图证据不立项）。**每连接内存的第二条观测线**（ARCHITECTURE 1.10 的预警：TSan 下每连接 20.81 KiB 已超 20 KB 预算，若 S2 的线程模型给每条连接多挂一把 mutex 或一份 per-thread 缓存，预算会真的紧张）在 S2-02/S2-07 盯着，不等 S3 才发现。
+
 ## S2–S5 —— 进入阶段时再拆
 
 按契约 8.2，功能必须在 TASKS.md 里才允许实现，但**过细的提前拆解会写成幻想中的任务表**。我在每个阶段门禁通过时才拆下一阶段，因为 S2 之后的任务内容取决于 S1 实测暴露的缺陷——这正是契约第 4 节设计原则里「被逼出来的问题」的含义。
 
 | 阶段 | 一句话目标 | 门禁硬条件 | 拆解状态 |
 |---|---|---|---|
-| S2 | 多 Reactor + 上游连接池 + 连接对象跨线程传递与异步销毁 | **TSan 干净**（这也是必须先装 Clang 的原因） | 未拆 |
+| S2 | 多 Reactor + 上游连接池 + 连接对象跨线程传递与异步销毁 | **TSan 干净**（这也是必须先装 Clang 的原因） | **已拆 → 见上「## S2」段（S2-01 DONE，S2-02…S2-07 PENDING）** |
 | S3 | 路由（前缀/正则）+ 负载均衡（轮询/最少连接/一致性哈希）+ 主动与被动健康检查 + 最多摘除比例安全阀 | 摘除耗时实测、误摘率实测、故障注入结果 | 未拆 |
 | S4 | 限流（本地令牌桶 + Redis 分布式计数与降级）、熔断（三态机 + 半开）、超时与重试防放大 | 429 真实生效数据、熔断恢复时间线、Redis 降级验证 | 未拆 |
 | S5 | 双 buffer 配置热重载（引用计数延迟释放）、Prometheus 指标、**Grafana「网关总览」面板（六格：吞吐 / p99·p999 / 活跃连接 / 熔断状态 / 上游健康度 / 状态码分布）**、**WebSocket 调试页（地址栏 + 消息流 + 输入框，限流时直接显示 `429 rate limited`）**、`tc netem` 注入延迟丢包的现场验证、vs Nginx 压测与差值归因 | 三个数字终稿、vs Nginx 归因报告、故障注入全表，**外加一条可验收的观感判据：面板与调试页上能亲眼看到限流返回 429、熔断把后端摘掉**（`netem` 在 6.18 WSL2 内核上未验证可用，不通则按 8.2 先 ADR 再换手段；p999 那一格能否出数取决于取数手段的裁决） | 未拆 |

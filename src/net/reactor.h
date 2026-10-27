@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -64,13 +65,31 @@ class Reactor {
   };
 
   explicit Reactor(Config config);
+  // worker 模式构造（S2-01，ADR-14）：多个 Reactor 共享**同一份** ReactorStats。
+  // 它全原子，所以并发 fetch_add 安全、聚合计数自动成立（stats.h 从 S1 起就是
+  // 为这一刻写的）。用这个构造的 Reactor 不拥有 stats，生命周期由调用方
+  // （ReactorGroup）保证长于所有 worker。
+  Reactor(Config config, ReactorStats& shared_stats);
   ~Reactor();
 
   Reactor(const Reactor&) = delete;
   Reactor& operator=(const Reactor&) = delete;
 
   // 绑定监听 socket 并注册进 epoll。失败返回 false，errno 由 *error 带出。
+  // 单 Reactor 模式（S1）用它：这个 Reactor 自己 accept、自己拥有连接。
   bool start_listen(int* error) noexcept;
+
+  // worker 模式（S2-01，ADR-14）：**不**绑定监听 socket，只注册自唤醒 eventfd。
+  // 连接由 acceptor 线程经 handoff() 送进来，owner worker 在自己的循环里构造。
+  // 失败返回 false，errno 由 *error 带出。
+  bool start_worker(int* error) noexcept;
+
+  // acceptor 线程调用（跨线程）：把一个刚 accept 到的 fd 交给本 worker。
+  // 只做两件跨线程的事——塞进 mutex 保护的队列、写 eventfd 叫醒循环——
+  // 和 stop() 同一个纪律：不碰任何循环内部状态。fd 用 UniqueFd 承载，
+  // 没被取走就在本对象析构时关掉，不漏。连接对象由 owner worker 构造，
+  // acceptor 从不碰 Connection（ADR-14 第 1 条）。
+  void handoff(UniqueFd fd) noexcept;
 
   // 阻塞直到 stop() 被调用（或 stop_after_requests 达成）。
   // 返回本次循环处理的事件批次数；正常退出路径之外没有别的返回值语义。
@@ -128,6 +147,11 @@ class Reactor {
   void handle_events(const std::vector<Epoll::Event>& events);
   void accept_all();
   void wake_up();
+  // worker 模式：把 handoff 队列里的 fd 取出来，逐个构造 Connection 并注册进
+  // **自己的** epoll，然后补一次探测读（ADR-14 第 5 条：ET 不为注册前已缓冲的
+  // 字节负责）。只在循环线程调用（wake 分支里），所以碰 connections_ 无需加锁；
+  // 与 acceptor 线程的唯一接触面是 handoff_fds_ 那个 swap，在 mutex 下完成。
+  void drain_handoff();
 
   // 注册一个连接对象的 fd。events 由调用方给（EPOLLIN / EPOLLOUT 的组合）。
   // 成功时把这份掩码记在连接上（`Connection::set_armed_events`）——它是 S1-07
@@ -251,7 +275,12 @@ class Reactor {
   void arm_write(const std::shared_ptr<Connection>& conn) noexcept;
 
   Config config_;
-  ReactorStats stats_;
+  // worker 模式（S2-01，ADR-14）下多个 Reactor 共享一份 ReactorStats；单 Reactor
+  // 模式自己拥有一份。owned_stats_ 非空即"自持"，stats_ 恒绑定到生效的那一份
+  // （*owned_stats_ 或外部共享的）。**声明顺序要紧**：owned_stats_ 必须在 stats_
+  // 之前，因为 stats_(*owned_stats_) 要解引用它，成员按声明序初始化。
+  std::unique_ptr<ReactorStats> owned_stats_;
+  ReactorStats& stats_;
   // 请求方向的 filter 链（S1-08）。按值持有而不是 unique_ptr 成员：空链必须是
   // "没有 filter"这个常态，主路径上不该为了它多一次判空分支。
   filter::FilterChain request_filters_;
@@ -279,6 +308,14 @@ class Reactor {
   // store(true) 就会把在那之前送达的 stop() 抹掉，循环再也不停。
   std::atomic<bool> stop_requested_{false};
   std::vector<Epoll::Event> events_;
+
+  // --- worker 模式的 handoff 队列（S2-01，ADR-14）--------------------------
+  // 这是本类**唯一**的跨线程接触面：acceptor 线程 handoff() 里 lock+push+写 eventfd，
+  // 循环线程 drain_handoff() 里 lock+swap 取走。除此之外 connections_/retiring_/
+  // pending_probes_/epoll_ 全部只被 owner worker 的循环线程碰，天然无竞争。
+  // 用 UniqueFd 承载：没被取走的 fd（例如 stop 之后残留的）在析构时自动关掉，不漏。
+  std::mutex handoff_mutex_;
+  std::vector<UniqueFd> handoff_fds_;
 };
 
 }  // namespace l7gate::net

@@ -32,7 +32,9 @@ l7gate/
 │   │   ├── connection.h    Connection：一条 fd + 入向/出向 Buffer + 解析游标 + view 生命周期 + 隧道态
 │   │   ├── connection.cc   已扫描游标推进 / 惰性分配 / generation 作废判定 / 101 检测 / 收尾释放
 │   │   ├── reactor.h       Reactor + Config：六步关闭、ET accept、延后析构的接口与理由
-│   │   └── reactor.cc      事件循环、上下游配对、双向 pump、隧道 pump、背压挂起点的形状
+│   │   ├── reactor.cc      事件循环、上下游配对、双向 pump、隧道 pump、背压挂起点的形状
+│   │   ├── reactor_group.h  ReactorGroup（S2-01）：acceptor + N worker + round-robin 派发的接口与所有权理由
+│   │   └── reactor_group.cc 监听 fd、accept 循环、handoff 派发、聚合观测（每 worker 各一份的非原子量求和）
 │   └── http/
 │       ├── request_parser.h    三态返回 + 22 个错误码 + ParsedRequest 的字段口径
 │       ├── request_parser.cc   请求行 / 头部区 / CL 与 chunked 框架的校验与定位
@@ -60,7 +62,7 @@ l7gate/
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环）。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**。
 
 ### 1.1 `core/build_info`
 
@@ -292,6 +294,25 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 
 实测：新增 **8** 条（6 条 `S1_08_FilterChain` 纯链 + 2 条 `S1_08_FilterReactor` 真循环），总数 104→**112**，四 preset 全绿（见本任务收尾的 `verify-all-presets`），非 gtest 警告 **0 条**，`sizeof(Connection)` 不变（**520**，链挂在 reactor 上）。
 
+### 1.17 `net/ReactorGroup`：S2-01 的多 Reactor 骨架，和"跨线程只传 fd"这条所有权红线
+
+S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pump、关闭。S2-01 把它拆成 **一个 acceptor + N 个 worker**，落地 ADR-03（多线程 Reactor）与 ADR-14（连接所有权）。**`Reactor` 本身几乎没动**——它加了 worker 模式（共享 stats 的构造、`start_worker()` 只注册自唤醒 eventfd 不绑监听、`handoff()`/`drain_handoff()`），单 Reactor 路径（`start_listen()` + 自己 accept）逐字节不变，所以 S1 的 112 条用例与三个冒烟脚本一条没改、精确计数（`epoll_registrations=4` 那类）也没作废。
+
+**所有权模型是这个任务的全部价值，写成一句话：一条连接从生到死只被一个 worker 线程碰过。** 它的可执行形式不是某条 `EXPECT`，是 TSan——如果两个线程碰了同一条连接或同一个 worker 的循环内状态，`tsan` preset 会红。具体形状（ADR-14）：
+
+- **跨线程只传裸 fd，不传连接对象。** acceptor 线程 `accept()` 得到 fd，塞进目标 worker 的 handoff 队列（`std::mutex` 保护），写该 worker 的 eventfd 叫醒它；**`Connection` 由 owner worker 在自己的循环线程里构造**。于是跨线程边界上流动的只有一个 `int`（用 `UniqueFd` 承载，没被取走就在析构时关掉），acceptor 从不碰任何 `Connection`。这比"在 acceptor 线程构造对象再交出去"省掉一整个失败面：那种写法下构造（写 stats、分配 buffer）与后续操作分属两线程，每处都要 mutex/eventfd 建立 happens-before，而"忘了同步"的表现是偶发 race 不是报错。
+- **循环内那几坨非原子状态（`connections_`/`retiring_`/`pending_probes_`/`epoll_`）每个 worker 各一份、互不共享。** 它们只被该 worker 的循环线程碰，所以"跨线程访问注册表"这一整类 race 从设计里被删掉，而不是靠加锁去堵。`ReactorStats` 反过来是**全 worker 共享一份**（全原子，`stats.h` 从 S1 起就是为这一刻写的）：聚合计数免费成立，不用在 30+ 个计数器上逐项求和（那种"同一口径两个抄本"正是 S1 反复栽的坑）。
+- **派发是 round-robin**（`rr_counter_` 原子自增 mod N），不是最少连接。理由：最少连接要跨 worker 读实时连接数（共享状态，违背"把共享面收到最小"），且负载均衡是 S3 的显式任务。round-robin 确定性、可断言（`DispatchIsRoundRobinBalanced`：8 条派发到 4 worker，每个恰好 2 条）。
+- **handoff 之后补一次探测读**（`drain_handoff()` 末尾 `schedule_probe()`）。这是 ET 的旧账在新位置复发：边沿触发不为"注册之前已缓冲的字节"负责，而 fd 从 acceptor accept、排队、到 worker 注册这段跨线程窗口，比单 Reactor 里 accept 紧邻注册大得多，客户端很可能已经把请求写进了内核接收缓冲。复用的是 S1-07 背压恢复那套「挂回 EPOLLIN 后主动读一次」的机器（`schedule_probe`/`drain_probes`/`probe_read`），不另写路径。单 Reactor 的 `accept_all()` 不补这次探测——它 accept 与注册在同一线程紧邻发生，窗口小到 S1 全套从未撞到。
+
+**线程账**：`run()` 在**调用它的线程**上跑 accept 循环（生产里是主线程），另外 spawn N 条 worker 线程，总数 1 + N，与 ADR-03「主线程 accept + N 个 Reactor 线程」逐字对上。停止沿用 S1 语义（停止接受 + 退出循环，**不排水在飞连接**）：`stop()` 只置标志 + 写 accept 侧 eventfd，accept 循环退出后 `run()` 再 stop + join 所有 worker——真正的排水 + 超时兜底是 S2-05。析构顺序有两处硬约束（都写在 `reactor_group.h` 的成员注释里）：`stats_` 必须先于 `workers_` 声明（worker 持 `ReactorStats&`，不能比它先死）；析构函数体先 join 所有线程，再让成员逆序 unwind（joinable 的 `std::thread` 被析构会 `std::terminate`）。
+
+**`--serve` 默认仍是单 Reactor（`--workers 1`）**，多 Reactor 走显式 `--workers N`（N≥2）。这不是保守，是不作废 S1 的门禁证据：S1 三个冒烟脚本断言的是单 Reactor 的精确 epoll 计数，多 Reactor 下 acceptor 与每个 worker 各有自己的 epoll，那些数会变（ADR-14 后果段）。`report_stats` 因此改成接收**显式聚合量**而不是 `Reactor&`，单/多两条路复用同一份 `[serve] key=value` 输出，冒烟脚本 grep 的键不必区分。
+
+实测（全部本任务重跑取数）：三 preset 各 **117/117**、非 gtest 警告 **0 条**；**门禁硬条件 TSan 干净：`tsan` preset 117/117 零 data race**（并发用例 16 线程 × 50 请求穿 4 worker）。`TenThousandRequestsAcrossWorkersLeaveNothingAlive`：8 连接（2/worker）顺序驱动 10000 请求，`constructed==destructed==16`、`fd 5→5`、聚合 `epoll_registrations=20 == N(4) 常驻 wake_fd + 16 连接`、`unregistrations=16`（`reg − N == unreg`）。生产进程路径另验（ctest 用进程内 ReactorGroup，不覆盖 CLI/信号/聚合报告）：`l7gate --serve --workers 4` + 真 curl 20 条 → 20/20 200、`fd 15→15`、`constructed==destructed==40`、`epoll_registrations=44（=4+40）/unregistrations=40`。`sizeof(Connection)` 不变（**520**，多 Reactor 的状态全在 `ReactorGroup`/`Reactor` 上，没往连接对象里塞东西——这一点 SLO #2 的每连接内存记账要盯着，见 1.10 的预警）。
+
+已知边界，照记不藏：**accept 单点**（所有连接过主线程一个 accept 循环）是 ADR-03 列的延迟观察项，S2-01 不提前优化（不做 SO_REUSEPORT 多 acceptor），等 S2-07 压测拿出"主线程 accept 排队"的证据再立项；**每 worker 的 fd 预算独立**（总容量 = N × `max_connections_per_worker`），全局 fd 闸门与 100k 口径归 S2-06；**异步销毁的 harder 情形还没到**——S2-01 里连接的 `shared_ptr` 全在 owner worker 线程内（注册表/`retiring_`/`pending_probes_`），析构必然发生在 owner 线程，六步关闭与 S1 完全一致；S2-02 的连接池会让一条上游连接被非 owner 线程持有，那时"最后一个引用在哪个线程释放"才不确定，S2-03 定稿销毁协议（ADR-14 已预留那一章）。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -305,7 +326,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 - **sanitizer 用字符串而不是逐个开关**（`L7GATE_SANITIZERS="address,undefined"`）：S1 门禁要求的是**组合**，而 address 与 thread 互斥，用一堆 bool option 表达互斥关系比用字符串更绕且更容易配错。
 - **sanitizer preset 强制 Debug（`-O0 -g`）**：实测发现 `-O1` 起会把"可被证明无副作用的坏写入"优化掉，ASan 于是什么都不报（详见 `ENVIRONMENT.md` 2.2）。所以在优化构建上跑 sanitizer 得出的"干净"结论是假的。
 - **`release` preset 是 `BENCHMARK.md` 唯一允许的构建**：sanitizer 构建测出来的尾延迟是检查开销的延迟，不是网关的延迟。
-- **测试目标显式链 `Threads::Threads`（`find_package(Threads REQUIRED)`）**：S1-04 的测试把 reactor 跑在别的线程里、也要从别的线程停它。`tsan` preset 自带 `-pthread`，但 `debug`/`release` 不带——少了线程支持时 `std::thread` 在 GCC 上**能编译**、运行时才炸，那是最糟的一类"构建通过、测试诡异"。库本体 `l7gate_core` 不链线程：单线程 reactor 到 S2 才需要，提前链上等于给"我已经线程安全了"发一张空头证明。
+- **测试目标显式链 `Threads::Threads`（`find_package(Threads REQUIRED)`）**：S1-04 的测试把 reactor 跑在别的线程里、也要从别的线程停它。`tsan` preset 自带 `-pthread`，但 `debug`/`release` 不带——少了线程支持时 `std::thread` 在 GCC 上**能编译**、运行时才炸，那是最糟的一类"构建通过、测试诡异"。**库本体 `l7gate_core` 在 S1 刻意不链线程**（"单线程 reactor 到 S2 才需要，提前链上等于给'我已经线程安全了'发一张空头证明"）——**S2-01 就是那条注释预告的到期时刻**：`ReactorGroup` 真的持有 `std::thread`（N 个 worker），所以 `l7gate_core` 现在 `PUBLIC` 链 `Threads::Threads`。pthread 是平台线程原语、不是第三方库，不触发契约 8.2 禁令三；而"我已经线程安全了"这张证明现在由 TSan 门禁背书（117/117 零 race），不再是空头。
 - **`l7gate_test_upstream` 是被构建出来的、不是被测试出来的**：它复用 `TestUpstream` 那个类，编译成独立可执行文件给冒烟脚本当上游，所以它链 `l7gate_core` 和线程，但**不链 gtest、不注册进 ctest**。同一个类同时服务单测和外测，"上游的行为"就只有一份定义。
 - **警告集的代价在 S1-04 复核过一次，仍然划算**：`-Wconversion`/`-Wsign-conversion` 在 `net/` 这五个新文件（全是 `size_t` 偏移、`ssize_t` 返回值、`static_cast` 夹取）里我方警告 **0 条**；`-Wshadow` 抓到过一次真实的遮蔽：给 `TestUpstream::start()` 加端口参数时，函数里的局部 `const int port` 把参数盖掉了。`-Werror` 默认关（第 3 条），所以它没有让构建失败——是 `verify-all-presets.sh` 里那句「非 gtest 警告 = 0」把它当场暴露出来的，我因此把名字改成 `requested_port`/`bound_port`。**这正好说明警告不该升级成错误、但计数必须升级成门禁**：前者拦住了工具链升级，后者一次遮蔽都没放过。这三条警告在这个任务里的性价比是实测的，不是信仰。
 
@@ -316,7 +337,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 - **S1-07 的背压：已实现，记录在 1.15。** 这里只留口径给后来的人：判据是"这条连接的入向可读区相对它自己的停读线在哪"，**不含**对端出向缓冲的饱满度；恢复必须带一次主动探测读（边沿触发不为已经在里的字节负责）；`Connection::armed_events()` 是 epoll_ctl 的**回执**而不是意图，任何别的地方都不许写它。TASKS 里"S1-08 之后如果要加主动流控，接口形状应当是过滤器链而不是 reactor 分支"这条约束仍然成立。
 - **转发语义（S1-06）**：已实现，记录在 1.14。`on_downstream_readable` 里 `round.reject` 那一行现在按 `reply_status_for_parse_error` 的映射表回自产响应；响应侧认状态码、认框架、判截断。留给 S1-07 的那条缺口（撞水位之后摘掉 EPOLLIN 压回对端）已在 1.15 闭合。
 - **Upgrade 透传（S1-05）**：已实现，记录在 1.13。这里只留一条给 S1-06 的边界：`mark_close_after_response()` 只固化意图，「响应完结」的精确字节边界判定归 S1-06，本任务刻意不预支。
-- **多 Reactor + 上游连接池（S2）**：连接对象的销毁路径从 S1 就按"可能被别的线程持有"设计（六步关闭 + `retiring_`），`ReactorStats` 全原子也是给 TSan 留的基线——这是 ADR-03 那笔「线程共享地址空间、代价是并发正确性」的具体支出。`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方。
+- **多 Reactor（S2-01）：已实现，记录在 1.17。** 一个 acceptor + N 个 worker、round-robin 派发、连接单线程拥有、跨线程只传 fd（ADR-03 + ADR-14）。`ReactorStats` 全原子从 S1 起就是给这一刻留的基线，现在它被全 worker 共享一份；六步关闭 + `retiring_` 与 S1 完全一致（连接的 `shared_ptr` 全在 owner worker 内，析构必然在 owner 线程）。**上游连接池（S2-02）仍未实现**：`on_upstream_event` 里"上游 EOF 就跟着关下游"那一处，是建池之后唯一要改的地方（池化后上游 EOF 改成"淘汰这条上游连接"而不是级联关下游）；池会打破"连接只被 owner 持有"的前提（一条上游连接可能被非 owner 线程借出/归还/淘汰），跨线程异步销毁的 harder 情形归 S2-03 定稿（ADR-14 已预留那一章）。
 - **`filter/chain`（S1-08）**：已落地，记录在 1.16。当年那句验收——「新增 filter 不修改转发主路径的任何一行代码」——现在有可执行形式了：空链与两条放行 filter 的链，同一套流量的响应内容与七项计数逐项相等（`PassThroughFiltersChangeNothingInTheForwardingPath`）。留给后面的两笔返工也写在 1.16 末尾：路由要一个"目标上游"字段、响应方向要一个钩子，两者今天都没有读者，所以我不预先造字段。
 - **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。
 

@@ -88,10 +88,26 @@ bool is_close_request(const http::ParsedRequest& req) {
 
 }  // namespace
 
-Reactor::Reactor(Config config) : config_(std::move(config)) {
+Reactor::Reactor(Config config)
+    : config_(std::move(config)),
+      owned_stats_(std::make_unique<ReactorStats>()),
+      stats_(*owned_stats_) {
   // 自唤醒通道。stop() 从别的线程调用时只做一件事：往这个 fd 写 8 字节。
   // 不用 atomic 标志 + 依赖超时轮询的原因：那样最坏要等一个 wait_timeout_ms
   // 才停得下来，而"停不下来"在压测里表现为脚本挂住，在测试里表现为 TIMEOUT 失败。
+  // worker 模式下这个 fd 还兼作 handoff 的唤醒信号（见 handoff()）。
+  int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (fd < 0) {
+    throw std::system_error(errno, std::system_category(), "eventfd");
+  }
+  wake_fd_ = UniqueFd{fd};
+}
+
+Reactor::Reactor(Config config, ReactorStats& shared_stats)
+    : config_(std::move(config)),
+      owned_stats_(nullptr),
+      stats_(shared_stats) {
+  // 与上面同一个自唤醒通道；区别只是 stats_ 绑定到外部共享的那一份（ADR-14 第 4 条）。
   int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   if (fd < 0) {
     throw std::system_error(errno, std::system_category(), "eventfd");
@@ -153,6 +169,63 @@ bool Reactor::start_listen(int* error) noexcept {
   }
   *error = 0;
   return true;
+}
+
+bool Reactor::start_worker(int* error) noexcept {
+  // worker 模式（ADR-14）：不绑监听 socket，只把自唤醒 eventfd 注册进 epoll。
+  // 连接由 acceptor 线程经 handoff() 送进来，所以这里没有 listener_tag 那一档。
+  // listen_port_ 保持 -1：worker 不监听，任何读它端口的代码都是错的。
+  if (!epoll_.add(wake_fd_.get(), kPersistentReadEvents, wake_tag(), error)) {
+    return false;
+  }
+  *error = 0;
+  return true;
+}
+
+void Reactor::handoff(UniqueFd fd) noexcept {
+  if (!fd.valid()) return;
+  {
+    std::lock_guard<std::mutex> lock(handoff_mutex_);
+    handoff_fds_.push_back(std::move(fd));
+  }
+  // 叫醒 owner worker 的循环。和 stop() 同一个机制、同一条纪律：跨线程只写 eventfd，
+  // 不碰循环内部状态。写失败只有 EAGAIN（计数大到写不进），那种情况循环必然已被
+  // 唤醒，所以忽略返回值是安全的。
+  const std::uint64_t one = 1;
+  ssize_t rc = ::write(wake_fd_.get(), &one, sizeof(one));
+  (void)rc;
+}
+
+void Reactor::drain_handoff() {
+  std::vector<UniqueFd> fds;
+  {
+    std::lock_guard<std::mutex> lock(handoff_mutex_);
+    fds.swap(handoff_fds_);
+  }
+  for (UniqueFd& fd : fds) {
+    if (!fd.valid()) continue;
+    if (connections_.size() >= config_.max_connections) {
+      // 与 accept_all 同一口径：超预算就拒，fd 随 UniqueFd 析构关掉。
+      // 注意这是**每 worker** 的预算，总容量 = N × max_connections（ADR-14 后果段）。
+      stats_.downstream_rejected_over_capacity.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    auto conn = std::make_shared<Connection>(std::move(fd), Role::kDownstream,
+                                             config_.connection, stats_);
+    stats_.downstream_accepted.fetch_add(1, std::memory_order_relaxed);
+    int error = 0;
+    (void)set_tcp_nodelay(conn->fd(), &error);
+    if (!register_connection(*conn, desired_events(*conn))) {
+      close_connection(conn);
+      continue;
+    }
+    connections_.emplace(conn->fd(), conn);
+    // ADR-14 第 5 条：ET 不为"注册之前已经缓冲的字节"负责。fd 从 acceptor 线程
+    // accept、排队、到这里注册，窗口比单 Reactor 的 accept_all 大得多，客户端很可能
+    // 已经把请求写进了内核接收缓冲而注册那一刻没有新跳变。补一次探测读把已缓冲的
+    // 字节读干净——复用 S1-07 背压恢复那套机器，不另写路径。
+    schedule_probe(conn);
+  }
 }
 
 std::uint64_t Reactor::run() {
@@ -233,6 +306,9 @@ void Reactor::handle_events(const std::vector<Epoll::Event>& events) {
   for (const auto& ev : events) {
     if (ev.user_data == wake_tag()) {
       wake_up();
+      // worker 模式：自唤醒 eventfd 兼作 handoff 信号（ADR-14）。单 Reactor 模式下
+      // handoff_fds_ 恒空，这一句是 no-op，所以无条件调用是安全的。
+      drain_handoff();
       continue;
     }
     if (ev.user_data == listener_tag()) {
