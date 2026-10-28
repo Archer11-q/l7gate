@@ -4,7 +4,7 @@
 
 不是"又一个高性能 Web 服务器"，不是框架，也不是功能清单。对外形态是一个 `docker compose up` 起来、顶替 Nginx 位置的网关。
 
-**S1 完成 · S2 进行中（S2-01 多 Reactor + S2-02 上游连接池 + S2-03 跨线程销毁 + S2-04 配对模型 已 DONE）** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 126/126 ｜ MIT
+**S1 完成 · S2 进行中（S2-01 多 Reactor + S2-02 上游连接池 + S2-03 跨线程销毁 + S2-04 配对模型 + S2-05 优雅停止/排水 已 DONE）** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 132/132 ｜ MIT
 
 ---
 
@@ -63,12 +63,13 @@
 | S1-03 两笔债（S1-04 还） | 10000 请求下 `header_scan_bytes == bytes_down_to_upstream`，一次重扫都没有；无游标的 dribble 场景原本是 7,474,911 字节（1956×） |
 | Upgrade / keep-alive（S1-05） | 3 条顺序请求共用一条下游与一条回源连接；`Connection: close` 走意图传播 + EOF 级联；101 后二进制帧逐字节回显比对；`release_scratch()` 全仓唯一触发点在 101 之后 |
 | 响应语义（S1-06） | ctest 26 条 + `smoke-s1-06.sh` 八阶段真 curl：1200 B 固定体逐字节一致、`--raw` 下的 chunked、`/dies`→502（直连同上游是 curl 退出码 52 零字节）、`/dies-mid-body`→恰好 600 B 且零追加、`/bad-chunk` 不伪造内容、`/endless-head` 超预算判死、`/dev/tcp` 手写的 400/501/TRACE；口径核对 `upstream_opened == requests_parsed`（被拒的请求一条都不该回源） |
-| 背压（S1-07） | 四个方向各一条用例：请求方向 384 条 POST 平台期 2,922,610 B（载荷 3,170,580）；响应方向 1 MiB + 客户端一字节不读；隧道方向 2,742,440 B 帧字节平台期 1,898,661 B 且恢复后一字节不少；稳态 1000 请求 `epoll_modifications=3999`＝**4.00 次/请求**（与 S1-04 同口径，背压没多打一枪）。进程侧 `smoke-s1-07.sh` 四阶段，含 `--high-water-mark 4096` 下一条 100 KiB 请求**停在停读线上**（`read_disarmed_connections=1`、curl 零字节、无 5xx）。口径与被删掉的钉窗实验见 ARCHITECTURE 1.15 |
+| 背压（S1-07） | 四个方向各一条用例：请求方向 384 条 POST 平台期 2,922,610 B（载荷 3,170,580）；响应方向 1 MiB + 客户端一字节不读；隧道方向 2,742,440 B 帧字节平台期 1,898,661 B 且恢复后一字节不少；稳态 1000 请求 `epoll_modifications=3999`＝**4.00 次/请求**（与 S1-04 同口径，背压没多打一枪）。进程侧 `smoke-s1-07.sh` 四阶段，含 `--high-water-mark 4096` 下一条 100 KiB 请求**停在停读线上**（curl 零字节、无 5xx；S2-05 起这一步的"停在没有 EPOLLIN"由 `drain_read_disarmed_at_entry=1` 报出，因为排水最终会把这条卡住的连接收尾，停下之后再读必然是 0）。口径与被删掉的钉窗实验见 ARCHITECTURE 1.15 |
 | filter 链（S1-08） | 顺序＝添加顺序（用例故意按 c、a、b 添加）、第一个 `kStop` 之后不再调用后面的、filter 状态跨请求存活；主路径上只有一处链调用；「不改主路径」的可执行形式＝空链与两条放行 filter 下响应内容与七项计数**逐项相等**。TSan 这轮抓到的是我自己写的第一版（循环还在跑时读非原子计数器） |
 | 多 Reactor（S2-01） | 一个 acceptor + N 个 worker、round-robin 派发、**连接单线程拥有、跨线程只传裸 fd**（ADR-14）。`DispatchIsRoundRobinBalanced`：8 连接派发到 4 worker 每个恰好 2 条；`TenThousandRequests...`：10000 请求跨 4 worker，`constructed==destructed==16`、`fd 5→5`、聚合 `epoll 注册 20（=4 wake_fd+16 连接）/注销 16`；`ConcurrentLoad...`：16 线程 × 50 请求并发穿 4 worker，**tsan preset 零 data race**（S2 门禁硬条件）。生产路径 `--serve --workers 4` + 真 curl 20/20 200、`fd 15→15` |
 | 上游连接池（S2-02） | **per-worker**（ADR-15，项目所有人裁决）：下游关闭时干净的上游**归还进池**、被下一条下游借走复用，而不是随之销毁（上游活得比下游久）。`ShortLivedDownstreamsReuseOnePooledUpstream`：20 条短命下游 → `upstream_opened=1`、`pool_borrows=19`；生产路径 4-worker + 20 条短命真 curl → **`upstream_opened=4`（每 worker 1 条）而非 20**、省 16 次握手。ADR-15 点名的边界由 `IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation` 钉死：空闲上游被对端关是**正常回收**（`pool_evictions_eof`），绝不误计成截断、不发 502。**诚实边界**：wrk 闭环基准下池不减少上游连接数，S2-07 不声称它有收益 |
 | 配对模型（S2-04） | 支持 HTTP/1.1 pipeline：一条下游的多个在飞请求按 FIFO 回送；`Connection: close` 在**它自己那条**请求的响应后兑现（不是在第一条）——修掉 S1-07 的"400 条只回 1 条"债。靠 `Connection` 的在飞计数（转发 +1 / 响应完结 −1，close 归零才关）。`S2_04_Pairing` 三条 + 旧条件阳性验证会红（ADR-16）。`sizeof(Connection)` 520→528 |
-| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **126/126**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过两次摘锁阳性验证：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn 用例 → 报 **14 处**，还原后全绿——"TSan 干净"是能红的绿 |
+| 优雅停止／排水（S2-05） | SIGTERM/SIGINT 从"停止接受 + 退出循环"改成**按请求排水**：排水线 = `in_flight_requests_ > 0`（已转发给配对上游的才算已接受），空闲（在飞归零）立即关、在飞的逐条答完 + 刷完出向再关、半包交给 `--drain-timeout-ms`（默认 5000，**兜底不是承诺**）、**隧道只能硬关**（ADR-09 不解析帧 → 发不出 WS close 握手）。多 worker 协调：accept 循环把排水下发给每条 worker、**非阻塞地**读到"每条 worker 都自行报了停止"才 join。实测（`scripts/smoke-s2-05.sh` 五阶段）：阶段一 elapsed 里在飞那条**答完才退**（`drain_in_flight_at_entry=1`、`drain_forced_timeout=0`、76 字节=头 63+体 13 完整）；阶段二 3 条空闲连接 **0.11s** 退干净（兜底写着 60000ms，没用上）；阶段三半包 **0.81s** 走兜底（deadline 800ms，早于它关就算红）；阶段四隧道 **2189 字节 = 101 头 141 + 帧 2048 恰好相等**（不多一个伪造字节、不少一个缓冲字节）；阶段五 3 worker 各排各的（`drain_requested=3`、`in_flight_at_entry=3`、新连接被拒 1 条且 `requests_parsed` 停在 3）。五阶段生命周期三项全部归零（`live=0`、`constructed==destructed`、`fd_start==fd_end`）。一处不那么好看的取舍也写在这里而不是藏起来：**监听 fd 留到析构才关**，所以排水期间的新连接是"连上就被关"而不是 ECONNREFUSED——因为 `fd_start == fd_end` 是全项目生命周期证据的地基，而 `fd_start` 是在 `start_listen()` 之后量的（完整理由与代价见 ARCHITECTURE 1.20） |
+| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **132/132**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过三次：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn → 报 **14 处**，S2-05 把排水的跨线程标志做成普通 `bool` → 6 条排水用例里 **5 处 data race**，每次都还原后全绿——"TSan 干净"是能红的绿。排水机制另有三次逻辑阳性验证（摘守卫→3 条红、摘隧道分支→1 条红、关 accept 拒绝→1 条红），以及**一次"拆了也不红"的诚实记录**：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条 |
 | 跨线程销毁（S2-03） | per-worker 池让"连接被非 owner 线程持有"的 harder 竞态**没出现**（所有 `shared_ptr` 持有者都在同一 worker 线程内，析构必在 owner 线程，跨线程只流动裸 fd）。红队三条 `S2_03_CrossThreadDestruction`：负载活跃时 stop、handoff 的 fd 注册前被对端关、连接风暴——tsan 零 race、asan/LSan 零 UAF 零泄漏。销毁协议定稿在 ADR-14 |
 
 </details>
@@ -80,7 +81,7 @@
 | 阶段 | 目标 | 状态 | 门禁 |
 |---|---|---|---|
 | **S1** | 单连接转发 + 第一份 p99 | ✅ 八个任务全 DONE | 四件套：#2/#3/#4 齐，#1 的 #3 半边按裁决**推到 S5 终判**（理由见上表） |
-| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 🔨 进行中（S2-01 多 Reactor + S2-02 连接池 + S2-03 跨线程销毁 + S2-04 配对模型/pipeline-close DONE，TSan 126/126 零 race；S2-05…07 待做） | TSan 干净 |
+| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 🔨 进行中（S2-01 多 Reactor + S2-02 连接池 + S2-03 跨线程销毁 + S2-04 配对模型/pipeline-close + **S2-05 优雅停止/排水** DONE，TSan **132/132** 零 race；剩 S2-06 C100K 客户端 + HDR 分位、S2-07 三个数字按取样规程重测 + 门禁四件套） | TSan 干净 |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 摘除安全阀 | 未开始 | 摘除耗时、误摘率、故障注入实测 |
 | **S4** | 限流 + 熔断 + 超时重试防放大 | 未开始 | 429 生效数据、熔断时间线、Redis 降级 |
 | **S5** | 热重载 + 指标 + 面板 + vs Nginx 归因 | 未开始 | 三个数字终稿、归因报告、故障注入全表 |
@@ -136,7 +137,7 @@ client ──epoll ET──▶ acceptor ──round-robin──▶ N×worker Rea
 
 ```bash
 cmake --preset debug && cmake --build --preset debug
-ctest --preset debug                      # 126/126（18 个套件，构成见 TASKS.md 交接段）
+ctest --preset debug                      # 132/132（19 个套件，构成见 TASKS.md 交接段）
 ./build/debug/l7gate --self-check         # version / compiler / gtest / sanitizers / build_type / malloc
 
 # 手动跑一遍透传：起上游 → 把网关架在中间 → 用真 curl 打一发
@@ -160,6 +161,7 @@ bash scripts/verify-all-presets.sh        # 三 preset 构建 + ctest + 我方�
 PRESET=debug bash scripts/smoke-s1-04.sh  # 真 curl 10000：fd / 存活连接 / 字节数全绿
 PRESET=debug bash scripts/smoke-s1-06.sh  # 八阶段：逐字节一致 / chunked / 两类截断 / 坏框架 / 映射表
 PRESET=debug bash scripts/smoke-s1-07.sh  # 四阶段：慢客户端 / 慢上游 stall / 停读线之下 / 半条响应头
+PRESET=debug bash scripts/smoke-s2-05.sh  # 五阶段优雅停止：在飞答完才退 / 空闲立即关 / 半包走兜底 / 隧道硬关不伪造 / 3 worker 各排各的
 scripts/bench/s1-p99.sh                   # SLO #1 标准口径（canonic 由参数自己判，非标那轮不进文档）
 scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网关 + 直连天花板
 ```

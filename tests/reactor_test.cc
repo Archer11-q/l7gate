@@ -432,6 +432,12 @@ class Harness {
     if (reactor_ != nullptr) reactor_->stop();
     if (thread_.joinable()) thread_.join();
   }
+  // S2-05：只 join、不发硬停。排水路径的"退出"是循环自己完成的（排干了才置
+  // stop_requested_），用 stop_loop() 会把还没排完的水直接放掉——那测的是硬停，
+  // 而硬停本来就是另一条路（上面的 stop_loop 保留给既有用例）。
+  void join_loop() {
+    if (thread_.joinable()) thread_.join();
+  }
   // 停循环 + 销毁 Reactor（连带关掉监听 fd、epoll fd、eventfd）。
   // fd 复原那条断言必须在它之后才成立。
   void destroy() {
@@ -2034,6 +2040,11 @@ class GroupHarness {
     if (group_ != nullptr) group_->stop();
     if (thread_.joinable()) thread_.join();
   }
+  // S2-05：只 join。run() 里的 accept 循环会在**每个 worker 自己报"排干了"**之后才退出
+  // 并 join 它们，所以这条 join 返回 = 全部 1+N 条线程都已停。
+  void join_loop() {
+    if (thread_.joinable()) thread_.join();
+  }
   void destroy() {
     stop_loop();
     group_.reset();
@@ -2758,6 +2769,358 @@ TEST(S2_04_Pairing, PipelineWithoutCloseDeliversAllAndKeepsConnectionOpen) {
   std::string body;
   ASSERT_TRUE(client.read_response(&status, &body, &why)) << "close 之后连接被误关了：" << why;
   EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  harness.shutdown_all();
+}
+
+// ===========================================================================
+// S2-05：优雅停止（排水）。ARCHITECTURE 1.20。
+//
+// 这组用例各自钉住裁决里的一句话，而每一条的"能红"形态都写在注释里：
+//   一、在飞请求被逐条答完才退出（不是被砍掉）——用**停读上游**造出一个"请求已转发、
+//        响应还没来"的状态，然后才下排水指令；响应必须在排水里送达客户端。
+//   二、空闲连接立即关（不等兜底）——兜底给到 60s，退出却必须在几十毫秒级，
+//        时间差本身就是判据（比"等一个 100ms 看它关没关"要硬）。
+//   三、兜底强关（卡死的客户端不许无限拖住下线）——半条请求既不是空闲也没有在飞，
+//        只能等到 deadline；断言 elapsed 落在 deadline 之后，才算兜底真的在守时限。
+//   四、隧道只能硬关（ADR-09）——钉两件事：配对是被**硬关分支**收掉的（不是挂到兜底
+//        才关的：隧道的在飞计数永不为零，因为 101 不走 pump_response 的 kComplete，
+//        所以"隧道先于在飞判据"是承重结构，摘掉那条分支这两个 EXPECT 一起红），
+//        以及 EOF 之前**一个额外字节都不许收到**（收到任何东西都是网关在伪造它从没
+//        解析过的东西）。"硬关之前先刷完已缓冲字节"这句话不在本用例的可证伪范围里，
+//        归 S1-04 的 UpstreamBreakClosesBothSidesAfterFlushingResponse（那条能红）；
+//        我试过把载荷抬到 3 MiB 想把它钉住，结果正确实现也整段送不完，理由写在用例里。
+//   五、排水期间新连接不被服务（accept 层就拒），且有一份可 grep 的计数。
+//   六、多 worker 协调：每条 worker 各自排干、各自置 stop_requested_，accept 循环
+//        读到"全都在停止状态"才 join——这条测的是协调，不是单循环的收尾。
+// ===========================================================================
+
+TEST(S2_05_GracefulStop, InFlightRequestIsAnsweredAfterTheDrainStarts) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 上游一个字节都不读（S1-07 的原子开关）：请求会被网关转发出去、卡在"已接受、
+  // 没响应"那一格，这正是排水要等的那一格。
+  harness.upstream().set_stall_reads(true);
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string req = request_text(1);
+  ASSERT_TRUE(client.write_all(req)) << "请求写不出去";
+  // 先等**前置条件**成立（请求已经排进上游出向 = 已被接受）。这里不是拿计数当锁：
+  // 万一排水抢在这之前就到了，那条请求会被判成"尚未接受"而根本不该有响应，
+  // 于是下面那次 read_response 直接红——用例不会为不成立的理由通过。
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.bytes_down_to_upstream) == static_cast<std::uint64_t>(req.size()); },
+      3000))
+      << "请求没转到上游出向，前置条件不成立";
+
+  const auto started = std::chrono::steady_clock::now();
+  harness.reactor()->request_drain(60000);  // 兜底给到一分钟：走兜底就是这条用例红了
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.drain_in_flight_at_entry) == 1u; }, 3000))
+      << "排水的第一次扫描没抓到那条在飞请求";
+
+  // 放开上游。响应必须在**排水期间**送完，而不是被兜底砍掉。
+  harness.upstream().set_stall_reads(false);
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "排水期间在飞的请求没有被逐条答完（这是裁决第一条的反面）：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(body, expected_body(1));
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "答完之后连接没收尾：" << why;
+
+  harness.join_loop();  // 排水完成后 run() 自己返回
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+
+  EXPECT_EQ(stats.load(stats.drain_forced_timeout), 0u)
+      << "兜底给的是 60000ms，而 elapsed=" << elapsed_ms << "ms——真走了兜底就不该这么快";
+  EXPECT_EQ(stats.load(stats.responses_completed), 1u);
+  EXPECT_EQ(stats.load(stats.drain_closed_idle), 1u) << "答完之后它就成空闲下游，该被立即关";
+  EXPECT_EQ(stats.load(stats.drain_requested), 1u);
+  EXPECT_LT(elapsed_ms, 30000) << "elapsed=" << elapsed_ms << "ms，兜底 60000ms 没被用上才对";
+  harness.stop_loop();  // 已经退出了，这一句只是幂等兜底
+  EXPECT_EQ(harness.reactor()->live_connection_count(), 0u) << "排水退出后注册表必须是空的";
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed))
+      << "下游+配对上游（或进池的上游）没走完成六步关闭";
+  std::printf("[S2-05 in-flight] 排水期间答完 1 条在飞请求，elapsed=%lldms，兜底 0 次\n",
+              static_cast<long long>(elapsed_ms));
+  harness.shutdown_all();
+}
+
+TEST(S2_05_GracefulStop, IdleConnectionsAreClosedAtOnceNotAtTheBackstop) {
+  constexpr int kIdle = 3;
+  Harness harness;
+  std::string why;
+  Harness::Options options = default_options();
+  options.with_upstream = false;  // 空闲连接不发请求，不该需要上游
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  std::vector<Client> clients(kIdle);
+  for (int i = 0; i < kIdle; ++i) {
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].connect_to(harness.port(), &why)) << why;
+  }
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.downstream_accepted) == static_cast<std::uint64_t>(kIdle); },
+      3000))
+      << "3 条连接没全部建起来（内核级证据是 connect 已经成功）";
+
+  const auto started = std::chrono::steady_clock::now();
+  harness.reactor()->request_drain(60000);
+  for (auto& c : clients) {
+    ASSERT_TRUE(c.wait_for_eof(&why)) << "空闲连接没被立即关：" << why;
+  }
+  harness.join_loop();
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+
+  // 判据是**时间差**：兜底写着 60000ms，而三条空闲连接几十毫秒内就该走完。
+  // 拿"等 100ms 看关没关"当断言会随机器快慢变形，这个等式不会。
+  EXPECT_LT(elapsed_ms, 5000) << "空闲连接没立即关、而是等到兜底才走：elapsed=" << elapsed_ms << "ms";
+  EXPECT_EQ(stats.load(stats.drain_closed_idle), static_cast<std::uint64_t>(kIdle));
+  EXPECT_EQ(stats.load(stats.drain_closed_buffered), 0u);
+  EXPECT_EQ(stats.load(stats.drain_forced_timeout), 0u);
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->live_connection_count(), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  std::printf("[S2-05 idle] %d 条空闲连接立即关，elapsed=%lldms（兜底 60000ms 没用上）\n", kIdle,
+              static_cast<long long>(elapsed_ms));
+  harness.shutdown_all();
+}
+
+TEST(S2_05_GracefulStop, StuckHalfRequestIsForceClosedAtTheDeadline) {
+  constexpr int kDeadlineMs = 400;
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  // 半条请求：头部区没有 CRLFCRLF，永远拼不完整。它既不是空闲（缓冲里有字节）、
+  // 也没有在飞请求（没被接受过），所以按口径只能交给兜底——这条测的就是兜底。
+  const std::string half = "GET /x HTTP/1.1\r\nHost: gateway.test\r\nX: partial";
+  ASSERT_TRUE(client.write_all(half));
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.bytes_read_downstream) == static_cast<std::uint64_t>(half.size()); },
+      3000))
+      << "半条请求没被网关读进去，前置条件不成立";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 0u) << "半包不该被算成一条请求";
+
+  const auto started = std::chrono::steady_clock::now();
+  harness.reactor()->request_drain(kDeadlineMs);
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "兜底到点没把这条卡死的连接强关：" << why;
+  harness.join_loop();
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+
+  // 兜底是**时限**不是"尽快"：早于 deadline 就关，等于无声丢掉一条还在路上的连接。
+  EXPECT_GE(elapsed_ms, kDeadlineMs - 50)
+      << "比 deadline 还早就强关了：elapsed=" << elapsed_ms << "ms, deadline=" << kDeadlineMs << "ms";
+  EXPECT_LT(elapsed_ms, 5000) << "拖到 5s 才走，兜底没守住时限：elapsed=" << elapsed_ms << "ms";
+  EXPECT_EQ(stats.load(stats.drain_forced_timeout), 1u);
+  EXPECT_EQ(stats.load(stats.drain_closed_idle), 0u) << "这条不空闲（缓冲里有半包），不该落进空闲格";
+  EXPECT_EQ(stats.load(stats.drain_closed_buffered), 0u)
+      << "半包不是「一条完整的、未被接受的请求」，它走的是兜底格而不是拒绝格";
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "兜底强关不替客户端编一条错误响应";
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->live_connection_count(), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  std::printf("[S2-05 backstop] 半包连接在 deadline=%dms 之后被强关，elapsed=%lldms\n", kDeadlineMs,
+              static_cast<long long>(elapsed_ms));
+  harness.shutdown_all();
+}
+
+TEST(S2_05_GracefulStop, TunnelIsHardClosedWithoutAFabricatedCloseHandshake) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(upgrade_request_text()));
+  std::string head;
+  ASSERT_TRUE(client.read_head(&head, &why)) << "101 没有回来：" << why;
+  EXPECT_EQ(head.find("HTTP/1.1 101"), 0u);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upgrades_101) == 1u; }, 3000))
+      << "隧道没建立，这条用例测不到隧道的收尾";
+
+  // 帧一走一次完整往返（内核级证据：字节已经回到客户端手里），证明隧道是活的。
+  const std::string frame1("\x81\x83\x37\xfa\x76", 5);
+  ASSERT_TRUE(client.write_all(frame1));
+  std::string echoed1;
+  ASSERT_TRUE(client.read_exact(&echoed1, frame1.size(), &why)) << "帧一没有原样回显：" << why;
+  EXPECT_EQ(echoed1, frame1);
+
+  // 帧二刻意**不先读**：它要作为"排水那一刻手上还有货"的那一段被刷出去。
+  // 载荷取 4096 字节是有意的上限——我先试过 3 MiB（想让它一定压在网关出向里），
+  // 结果**正确实现也整段送不完**：配对开始收尾后上游侧的 EPOLLIN 已摘，还压在
+  // socket 里的那段没人再读。所以"先刷完已缓冲字节再关"这句话不在本用例的可证伪
+  // 范围里（它归 S1-04 的 UpstreamBreakClosesBothSidesAfterFlushingResponse，那条能红）；
+  // 本用例钉的是另外两件事，写在下面两条 EXPECT 上，我不给它们配大于其证据的说法。
+  std::string frame2(4096, '\x5a');
+  frame2[0] = '\x82';  // 让它一眼就不是 HTTP（二进制帧头的形状）
+  const std::uint64_t want_up =
+      static_cast<std::uint64_t>(head.size() + frame1.size() + frame2.size());
+  ASSERT_TRUE(client.write_all(frame2));
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.bytes_tunnel_up) >= want_up; }, 5000))
+      << "帧二的回显没进网关，前置条件不成立（这一条就没东西可刷）";
+
+  // 兜底给 1200ms：隧道的在飞计数**永远不会归零**（101 不走 pump_response 的
+  // kComplete，ADR-16 那个 −1 对它从不发生），所以扫描里"隧道先于在飞判据分流"是
+  // 承重的——把那条分支摘掉，这一对就只能挂到兜底，于是下面两个 EXPECT 一起变红
+  // （forced=1、hard_closed=0）。这是我给这条用例找到的可证伪形式。
+  harness.reactor()->request_drain(1200);
+
+  std::string echoed2;
+  ASSERT_TRUE(client.read_exact(&echoed2, frame2.size(), &why))
+      << "帧二没能送达：" << why;
+  EXPECT_EQ(echoed2, frame2) << "透传的字节被改写了：ADR-09 的红线";
+  // 之后**一个额外字节都不许收到**：收到任何东西（尤其"看起来像 WS close 握手"的字节）
+  // 就是网关在伪造它从来没有解析过的东西（ADR-09）。红线是伪造，不是粗糙。
+  ASSERT_TRUE(client.wait_eof_or_data(&why))
+      << "刷完之后不是干净的 socket 关闭，而是多发了字节：" << why;
+
+  harness.join_loop();
+  EXPECT_EQ(stats.load(stats.drain_tunnels_hard_closed), 1u) << "隧道配对没走硬关这条路";
+  EXPECT_EQ(stats.load(stats.drain_forced_timeout), 0u)
+      << "它是被硬关分支收掉的，不是挂到兜底才被关的（隧道的在飞永不为零，靠的就是那条分支）";
+  EXPECT_EQ(stats.load(stats.upgrades_101), 1u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u) << "帧字节一次都不该进解析器（ADR-09 复查）";
+  EXPECT_EQ(stats.load(stats.drain_closed_idle), 0u) << "隧道不是「空闲下游」，它落硬关那一格";
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->live_connection_count(), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  std::printf("[S2-05 tunnel] 硬关分支收掉配对（没走兜底），EOF 前零个伪造字节，帧二 4096 字节逐字节相同\n");
+  harness.shutdown_all();
+}
+
+TEST(S2_05_GracefulStop, NewConnectionsDuringDrainAreRefusedAndCounted) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 用一条在飞请求把排水窗口撑开（上游停读 → 响应回不来 → 循环还在排）。
+  harness.upstream().set_stall_reads(true);
+  Client first;
+  ASSERT_TRUE(first.connect_to(harness.port(), &why)) << why;
+  const std::string req = request_text(1);
+  ASSERT_TRUE(first.write_all(req));
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.bytes_down_to_upstream) == static_cast<std::uint64_t>(req.size()); },
+      3000))
+      << "第一条请求没被接受，窗口撑不起来";
+  harness.reactor()->request_drain(60000);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.drain_in_flight_at_entry) == 1u; }, 3000))
+      << "排水没进入扫描，窗口还没开";
+
+  // 窗口开着：新连接应当**被拒**，而且是"连上就被关"而不是"接进来挂着不理"。
+  // 监听 fd 按设计留到析构（ARCHITECTURE 1.20 的 fd_start==fd_end 那段），所以
+  // connect() 本身会成功——判据在服务层：一条响应都不许有，且连接被关掉。
+  Client late;
+  ASSERT_TRUE(late.connect_to(harness.port(), &why))
+      << "connect 都失败了？监听 fd 是留到析构的，这里应当能连上";
+  ASSERT_TRUE(late.write_all(request_text(2)));
+  // 被拒的形态有两种，都算"没被服务就拆掉"：FIN（read()==0）与 RST（ECONNRESET，
+  // errno 104）。RST 是**内核**对我"写了字节而对端关 socket 时那些字节还没被读走"
+  // 的回答，不是网关发的响应；把它当成失败会把一条正确的行为读成 bug。
+  // 只有"收到字节"或"一直挂着没人理"才是这条用例要红的两种形态。
+  char probe[64];
+  const ssize_t got = ::read(late.fd(), probe, sizeof(probe));
+  if (got > 0) {
+    FAIL() << "排水期间的新连接被服务了：收到 " << got << " 字节";
+  }
+  if (got < 0 && errno != ECONNRESET && errno != EAGAIN && errno != EWOULDBLOCK) {
+    FAIL() << "read errno=" << errno << "（预期 0=FIN 或 104=RST）";
+  }
+  if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    FAIL() << "读超时：这条新连接既没被拒也没被关，就是挂着没人理";
+  }
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u) << "被拒的请求不该进解析器、更不该回源";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "网关不替正在下线的自己伪造 5xx";
+
+  // 放开上游，让第一条在飞请求答完，排水才收得干净。
+  harness.upstream().set_stall_reads(false);
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(first.read_response(&status, &body, &why)) << "在飞那条没被答完：" << why;
+  harness.join_loop();
+  EXPECT_GE(stats.load(stats.drain_rejected_new_connections), 1u)
+      << "「停止接受新连接」没有可断言的形态——只剩我一句「我拒了」";
+  EXPECT_EQ(stats.load(stats.downstream_accepted), 1u) << "被拒的连接不该构造 Connection 对象";
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->live_connection_count(), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  std::printf("[S2-05 refuse] 排水期间新连接被拒 %llu 条，requests_parsed 停在 1\n",
+              static_cast<unsigned long long>(stats.load(stats.drain_rejected_new_connections)));
+  harness.shutdown_all();
+}
+
+TEST(S2_05_GracefulStop, GroupDrainQuiescesEveryWorkerAndDeliversEveryInFlightResponse) {
+  constexpr int kWorkers = 3;
+  constexpr int kClients = 6;  // 6 下游 + 6 上游 = 12 ≤ TestUpstream 的 32 客户端上限
+  GroupHarness harness;
+  std::string why;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.group()->stats();
+
+  harness.upstream().set_stall_reads(true);
+  std::vector<Client> clients(static_cast<std::size_t>(kClients));
+  for (int i = 0; i < kClients; ++i) {
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].write_all(
+        request_text(static_cast<std::size_t>(i) + 1)))
+        << "第 " << i << " 条请求写不出去";
+  }
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.requests_parsed) == static_cast<std::uint64_t>(kClients); },
+      5000))
+      << "6 条请求没有全部被接受（前置条件），用例撑不起排水";
+
+  harness.group()->request_drain(60000);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.drain_in_flight_at_entry) == static_cast<std::uint64_t>(kClients); },
+                          5000))
+      << "各 worker 的第一次扫描加起来没抓到 6 条在飞请求（跨 worker 聚合口径错了）";
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.drain_requested) == static_cast<std::uint64_t>(kWorkers); },
+                          5000))
+      << "不是每条 worker 都进入了排水";
+
+  harness.upstream().set_stall_reads(false);
+  for (int i = 0; i < kClients; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].read_response(&status, &body, &why))
+        << "worker 上的第 " << i << " 条在飞请求没被答完：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK");
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)].wait_for_eof(&why))
+        << "答完之后这条没关：" << why;
+  }
+  harness.join_loop();  // run() 在"所有 worker 都自己报了停止"之后才 join 完返回
+
+  EXPECT_EQ(stats.load(stats.responses_completed), static_cast<std::uint64_t>(kClients));
+  EXPECT_EQ(stats.load(stats.drain_closed_idle), static_cast<std::uint64_t>(kClients));
+  EXPECT_EQ(stats.load(stats.drain_forced_timeout), 0u) << "一条都没卡死，兜底不该动过一次";
+  harness.stop_loop();  // 幂等兜底
+  EXPECT_EQ(harness.group()->live_connection_count(), 0u) << "跨 worker 的注册表没排空";
+  for (int i = 0; i < kWorkers; ++i) {
+    EXPECT_EQ(harness.group()->worker_live_count(i), 0u) << "worker " << i << " 还留着连接";
+  }
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed))
+      << "某条 worker 的下游或池里上游没走完成六步关闭";
+  std::printf("[S2-05 group] %d worker 各自排干并 join，%d 条在飞请求全部答完，兜底 0 次\n", kWorkers,
+              kClients);
   harness.shutdown_all();
 }
 

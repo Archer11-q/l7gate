@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +29,7 @@ void usage(std::FILE* out) {
       "用法: l7gate --self-check\n"
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>\n"
       "               [--serve-requests N] [--max-connections N]\n"
-      "               [--high-water-mark BYTES] [--workers N]\n"
+      "               [--high-water-mark BYTES] [--workers N] [--drain-timeout-ms MS]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -43,7 +44,13 @@ void usage(std::FILE* out) {
       "它是 S1-07 的取证旋钮，不是调优入口：转发的最小单位是「整条请求 / 整个响应头」，\n"
       "线压得比一条请求还小，那条请求就永远转不出去——它会停在停读线上等人来处理，\n"
       "不是被丢弃，也不是被报错。S1 的「整块才转」边界见 ARCHITECTURE 1.15。\n"
-      "SIGINT/SIGTERM 走同一条优雅停止：事件循环停下、统计打印出来、连接按六步关闭。\n"
+      "--drain-timeout-ms 是优雅停止的**兜底**窗口（0..600000，默认 5000）：到点就把还没\n"
+      "收尾的连接强关，代价是那条连接的出向字节被丢弃、客户端看到截断。它是兜底不是承诺\n"
+      "（一条卡死的客户端不该能无限拖住一次下线），且按 ARCHITECTURE 1.20 必须 ≥ S4 的请求超时。\n"
+      "SIGINT/SIGTERM 走同一条优雅停止：摘掉监听（新连接从此拿 RST）→ 不再接受新请求 →\n"
+      "在飞请求逐条响应完 + 刷完出向 → 空闲连接立即关 → 到点兜底强关 → 退出循环、join worker。\n"
+      "带 upgrade 的隧道**只能硬关**：ADR-09 不解析帧就发不出 WS close 握手，刷完已缓冲的\n"
+      "隧道字节即关 socket，客户端断线重连到下一个实例。\n"
       "统计每行一个 [serve] key=value，给脚本读，不是给人看的漂亮表格。\n");
 }
 
@@ -83,24 +90,33 @@ std::int64_t current_rss_kib() {
 // 处置是直接终止进程，那样统计打印不出来、连接也不会走那六步关闭——而"六步关闭
 // 在真实进程里也走得通"恰恰是这一步要的证据。
 //
-// 处理函数里只做两件跨信号边界的事：读一个全局原子指针、调 Reactor::stop()。
-// stop() 内部是一次 relaxed 原子 store 加一个 ::write(eventfd)——write(2) 在
-// POSIX 的 async-signal-safe 名单上，而 lock-free 原子的 store 在 x86-64 上就是
-// 一条 mov。没有锁、没有分配、没有 stdio。连续两个 SIGTERM 时第二个可能打断
-// 第一个的 write，最坏结果是 eventfd 计数变 2、循环多醒一次，不是坏状态。
+// S2-05 起这里走的是**优雅停止**（排水）而不是硬停：handler 调 request_drain()，
+// 循环不立刻退出，而是摘掉监听、把手上在飞的请求逐条答完 + 刷完出向再关，空闲连接
+// 立即关，`--drain-timeout-ms` 到点后兜底强关（1.20）。
+//
+// 处理函数里只做两件跨信号边界的事：读两个全局原子、调 request_drain()。后者内部是
+// 一次 relaxed/release 原子 store 加一个 ::write(eventfd)——write(2) 在 POSIX 的
+// async-signal-safe 名单上，而 lock-free 原子的 store 在 x86-64 上就是一条 mov。
+// 没有锁、没有分配、没有 stdio。连续两个 SIGTERM 时第二个可能打断第一个的 write，
+// 最坏结果是 eventfd 计数变 2、循环多醒一次，不是坏状态；而排水窗口**只从第一次信号
+// 算起**（request_drain 的 exchange 守卫），所以"多敲几次铃"拖不长一次下线。
 std::atomic<l7gate::net::Reactor*> g_reactor_for_signal{nullptr};
 // S2-01：多 Reactor 路径用 ReactorGroup。两个全局二选一非空——单 Reactor 模式设
 // g_reactor_for_signal，多 Reactor 模式设 g_group_for_signal。handler 各判一次空。
 std::atomic<l7gate::net::ReactorGroup*> g_group_for_signal{nullptr};
+// 兜底窗口由命令行决定，但 handler 不能读普通变量（那是跨信号边界的非原子共享）。
+// 原子 relaxed load 是信号安全的，且这个值在装 handler 之前就已经写定。
+std::atomic<std::int64_t> g_drain_timeout_ms{5000};
 
 void on_stop_signal(int) {
+  const std::int64_t timeout_ms = g_drain_timeout_ms.load(std::memory_order_relaxed);
   l7gate::net::Reactor* reactor = g_reactor_for_signal.load(std::memory_order_relaxed);
   if (reactor != nullptr) {
-    reactor->stop();
+    reactor->request_drain(timeout_ms);
   }
   l7gate::net::ReactorGroup* group = g_group_for_signal.load(std::memory_order_relaxed);
   if (group != nullptr) {
-    group->stop();
+    group->request_drain(timeout_ms);
   }
 }
 
@@ -199,6 +215,21 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   put("pool_returns", static_cast<long long>(stats.load(stats.pool_returns)));
   put("pool_evictions_eof", static_cast<long long>(stats.load(stats.pool_evictions_eof)));
   put("pool_evictions_full", static_cast<long long>(stats.load(stats.pool_evictions_full)));
+  // S2-05（1.20）优雅停止的观测面。at_entry 那两条是**排水第一次扫描那一刻**的快照，
+  // 口径写死在 stats.h：它们是"时刻"读数不是累加。drain_forced_timeout 不为 0 就
+  // 意味着有客户端卡死到兜底才走，那是兜底生效的证据，不是正常路径。
+  put("drain_requested", static_cast<long long>(stats.load(stats.drain_requested)));
+  put("drain_in_flight_at_entry",
+      static_cast<long long>(stats.load(stats.drain_in_flight_at_entry)));
+  put("drain_closed_idle", static_cast<long long>(stats.load(stats.drain_closed_idle)));
+  put("drain_closed_buffered", static_cast<long long>(stats.load(stats.drain_closed_buffered)));
+  put("drain_tunnels_hard_closed",
+      static_cast<long long>(stats.load(stats.drain_tunnels_hard_closed)));
+  put("drain_forced_timeout", static_cast<long long>(stats.load(stats.drain_forced_timeout)));
+  put("drain_read_disarmed_at_entry",
+      static_cast<long long>(stats.load(stats.drain_read_disarmed_at_entry)));
+  put("drain_rejected_new_connections",
+      static_cast<long long>(stats.load(stats.drain_rejected_new_connections)));
   put("epoll_registrations", static_cast<long long>(epoll_registrations));
   put("epoll_unregistrations", static_cast<long long>(epoll_unregistrations));
   put("epoll_modifications", static_cast<long long>(epoll_modifications));
@@ -220,6 +251,9 @@ int serve(int argc, char** argv) {
   // S2-01：worker 线程数。缺省 1 = 单 Reactor（S1 路径逐字节不变，冒烟脚本断言的
   // epoll_registrations=4 等精确计数因此不作废）；≥2 走 ReactorGroup（ADR-14 后果段）。
   int workers = 1;
+  // S2-05：排水兜底窗口（毫秒）。默认 5000，与 ARCHITECTURE 1.20 里那条"兜底不是承诺"
+  // 一起看；它必须 ≥ S4 的请求超时，S4 没定义之前这是占位中值。
+  long long drain_timeout_ms = 5000;
   bool have_listen = false;
   bool have_upstream = false;
 
@@ -281,6 +315,18 @@ int serve(int argc, char** argv) {
       }
       workers = static_cast<int>(n);
       ++i;
+    } else if (flag == "--drain-timeout-ms" && value != nullptr) {
+      // S2-05 的兜底窗口。它是**兜底不是承诺**：一条卡死的连接不该无限拖住一次下线，
+      // 所以到点就强关（代价是那条连接的出向字节被丢弃，客户端看到截断）。
+      // 上限 600000（10 分钟）只是把荒谬值挡在门外，真正的对齐要求写在 1.20：
+      // **它必须 ≥ S4 的请求超时**，否则正常在飞的请求会先撞上排水线而不是撞上超时。
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 600000) {
+        std::fprintf(stderr, "参数错误: --drain-timeout-ms 要的是 0..600000，收到 %s\n", value);
+        return 2;
+      }
+      drain_timeout_ms = n;
+      ++i;
     } else {
       std::fprintf(stderr, "参数错误: 无法识别的选项 %s\n", std::string(flag).c_str());
       usage(stderr);
@@ -288,6 +334,10 @@ int serve(int argc, char** argv) {
     }
   }
   config.stop_after_requests = stop_after_requests;
+  // 兜底窗口先落到全局原子，**再**装 handler：反过来的话存在一个窗口——信号在装好
+  // handler 之后、这一行之前到达，handler 读到的就是默认值而不是命令行给的值。
+  // 这里给的是同一个 5000 所以后果一样，但顺序错了就是"迟早会错"的那种写法。
+  g_drain_timeout_ms.store(static_cast<std::int64_t>(drain_timeout_ms), std::memory_order_relaxed);
 
   // 没有 --idle-timeout 这一项，是我故意不加的：S1-04 还没有空闲连接回收
   // （超时策略归 S4），而现在这个 wait_timeout_ms 控制的是 epoll_wait 的醒来间隔，
@@ -329,11 +379,12 @@ int serve(int argc, char** argv) {
     const std::int64_t fd_start = count_open_fds();
     const std::int64_t rss_start = current_rss_kib();
     std::printf("[serve] 监听 %s:%d（workers=%d backlog=%d max_connections_per_worker=%zu "
-                "upstream=%s:%u stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu）\n",
+                "upstream=%s:%u stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu "
+                "drain_timeout_ms=%lld）\n",
                 gconfig.listen_address.c_str(), group.listen_port(), workers, gconfig.listen_backlog,
                 gconfig.max_connections_per_worker, gconfig.upstream_address.c_str(),
                 gconfig.upstream_port, stop_after_requests, gconfig.wait_timeout_ms,
-                gconfig.connection.inbound.high_water_mark);
+                gconfig.connection.inbound.high_water_mark, drain_timeout_ms);
     std::fflush(stdout);
 
     const auto started = std::chrono::steady_clock::now();
@@ -366,11 +417,11 @@ int serve(int argc, char** argv) {
   const std::int64_t fd_start = count_open_fds();
   const std::int64_t rss_start = current_rss_kib();
   std::printf("[serve] 监听 %s:%d（backlog=%d max_connections=%zu upstream=%s:%u "
-              "stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu）\n",
+              "stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu drain_timeout_ms=%lld）\n",
               config.listen_address.c_str(), reactor.listen_port(), config.listen_backlog,
               config.max_connections, config.upstream_address.c_str(), config.upstream_port,
               stop_after_requests, config.wait_timeout_ms,
-              config.connection.inbound.high_water_mark);
+              config.connection.inbound.high_water_mark, drain_timeout_ms);
   std::fflush(stdout);
 
   const auto started = std::chrono::steady_clock::now();

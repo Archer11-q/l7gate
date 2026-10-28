@@ -3,8 +3,10 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 #include <system_error>
@@ -21,6 +23,20 @@ namespace {
 // 每个都写 Connection::Role 会让真正的逻辑淹没在限定名里。
 using Role = Connection::Role;
 using State = Connection::State;
+
+// 单调时钟上的毫秒。排水兜底的 deadline 存的是**绝对时刻**，所以置它的一方（信号
+// handler / accept 线程）和查它的一方（循环线程）读的是同一根轴，不需要谁每轮去
+// 递减剩余量——递减的版本等于把兜底计时器做成"扫描频率的函数"。
+std::int64_t monotonic_ms() noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// 排水期间的事件等待上限。边沿触发不会替一条静止的连接再报一次事件，而"在飞归零"
+// 和"兜底到点"这两件事都只能在扫描里发现，所以排水时循环必须自己按节拍醒一次。
+// 50ms 是"最坏多等一拍"与"别把下线变成一场忙等"之间的取值。
+constexpr int kDrainTickMs = 50;
 
 // epoll 的 user_data 只能放一个 void*，而我要区分三类持有者：监听 socket、
 // 自唤醒 eventfd、连接对象。用两个**静态对象自己的地址**当标签，比
@@ -240,7 +256,13 @@ std::uint64_t Reactor::run() {
   // 生产里是启动的一瞬间收到 SIGTERM），那种情况下循环必须一次都不进。
   while (!stop_requested_.load(std::memory_order_acquire)) {
     int error = 0;
-    const int n = epoll_.wait(config_.wait_timeout_ms, &events_, &error);
+    // 排水期间把等待上限收紧到 kDrainTickMs：不收紧的话，"在飞响应到齐了"这件事
+    // 最坏要等一个 config_.wait_timeout_ms（生产 200ms）才被下一轮扫描看见，
+    // 而兜底 deadline 也是只有扫描时才检查的量。
+    const bool draining = draining_.load(std::memory_order_relaxed);
+    const int wait_ms = draining ? std::min(config_.wait_timeout_ms, kDrainTickMs)
+                                 : config_.wait_timeout_ms;
+    const int n = epoll_.wait(wait_ms, &events_, &error);
     if (n < 0) {
       // Epoll::wait 已经把 EINTR 内部重试掉了，走到这里就是 EBADF/EINVAL 这一类
       // "epoll 本身坏了"的状态。继续循环只会让后面的所有数字都不可信，所以停。
@@ -253,7 +275,21 @@ std::uint64_t Reactor::run() {
 
     if (config_.stop_after_requests > 0 &&
         stats_.requests_parsed.load(std::memory_order_relaxed) >= config_.stop_after_requests) {
+      // 这条 break **不排水**：它的语义是"解析满 N 条就停循环"，帮助文本一直明写着
+      // 它可能抢在最后一条响应送达之前退出。排水挂在信号 / request_drain() 上。
       break;
+    }
+
+    if (draining) {
+      // 顺序固定：分流 → 判完成（"不再接受新连接"那一半在 accept_all / accept_and_dispatch
+      // 里，它不关监听 fd，理由写在那两处）。
+      drain_sweep();
+      if (drain_pending_empty()) {
+        // 排干了。由**循环线程自己**置停止标志，所以 ReactorGroup 只靠读每个 worker 的
+        // stop_requested() 就知道"全部 worker 都排完了"，不需要任何完成投递——
+        // 跨线程接触面仍然是 ADR-14 那一处，没有变大。
+        stop_requested_.store(true, std::memory_order_release);
+      }
     }
   }
 
@@ -274,6 +310,21 @@ void Reactor::stop() noexcept {
   const std::uint64_t one = 1;
   // 写 eventfd 是原子的（8 字节一次），且失败只有 EAGAIN——计数已经大到写不进，
   // 那种情况下循环一定会被唤醒，所以忽略返回值在这里是安全的，不是省事。
+  ssize_t rc = ::write(wake_fd_.get(), &one, sizeof(one));
+  (void)rc;
+}
+
+void Reactor::request_drain(std::int64_t timeout_ms) noexcept {
+  if (stop_requested_.load(std::memory_order_relaxed)) return;  // 已经在退出路上，没有可排的水
+  // exchange 而不是 store：第二个 SIGTERM 会再次走到这里，那一次**不**重新设 deadline、
+  // 也不重复计 drain_requested——兜底窗口从第一次信号算起，否则"多敲几次铃"就能把
+  // 一次下线无限期延长，那正是这条兜底要防的事。
+  const bool first = !draining_.exchange(true, std::memory_order_relaxed);
+  if (first) {
+    stats_.drain_requested.fetch_add(1, std::memory_order_relaxed);
+    drain_deadline_ms_.store(monotonic_ms() + timeout_ms, std::memory_order_relaxed);
+  }
+  const std::uint64_t one = 1;
   ssize_t rc = ::write(wake_fd_.get(), &one, sizeof(one));
   (void)rc;
 }
@@ -363,6 +414,18 @@ void Reactor::handle_events(const std::vector<Epoll::Event>& events) {
 }
 
 void Reactor::accept_all() {
+  // 排水期间监听 fd **照旧订阅读**，但每一条被 accept 到的连接立刻关掉（accepted
+  // 出作用域 → UniqueFd 关 fd），不构造 Connection、不进 handoff、不进注册表。
+  //
+  // 为什么不是"直接把监听 fd 关掉"（那样客户端拿到 ECONNREFUSED，看起来更"停止接受"）：
+  // 一、全项目的生命周期不变量是 `fd_start == fd_end`，而 fd_start 是在 start_listen
+  //     **之后**量的——排水途中关掉监听 fd 会让每个既有冒烟脚本的这条断言变成 −1，
+  //     等于把 S1 的门禁证据改成"要按停止方式加分支的等式"。那种等式是迟早会算错的。
+  // 二、和 S1-04 既有的"超容量就 accept 掉再关"是同一条动作（那条也是 continue 不是
+  //     return，ET 下必须把队列排空），不是新机制。
+  // 代价照记：排水期间新建连接看到的是"连上就被关"，不是 ECONNREFUSED；后者要等进程
+  // 退出、监听 socket 真的没了才成立。
+  const bool draining = draining_.load(std::memory_order_relaxed);
   while (true) {
     AcceptOutcome accepted = accept_connection(listener_.get());
     if (!accepted.ok()) {
@@ -375,6 +438,13 @@ void Reactor::accept_all() {
       // accept_errors 这个数会替我说话。
       stats_.accept_errors.fetch_add(1, std::memory_order_relaxed);
       return;
+    }
+    if (draining) {
+      // 排水期间不接新连接：这条 fd 随 accepted 出作用域被 UniqueFd 关掉。
+      // 仍然 continue（不是 return）——ET 下监听事件只报一次，带着没排空的队列退出
+      // 就是 S1-04 记过的那类"过一会儿不接新连接了"的卡死，只不过这次卡的是收尾。
+      stats_.drain_rejected_new_connections.fetch_add(1, std::memory_order_relaxed);
+      continue;
     }
     if (connections_.size() >= config_.max_connections) {
       // 注意是 **continue 而不是 return**：accepted 出作用域就把这条新连接关掉了，
@@ -682,6 +752,157 @@ void Reactor::drain_upstream_pool() {
   retire_closed();
 }
 
+// --- 优雅停止：排水（S2-05，ARCHITECTURE 1.20）-----------------------------
+//
+// 三条规则先写死在这里，因为"排水"这两个字太容易各写一套：
+//   一、**排水粒度 = 按请求**，而"已收到的请求"的判据是 `in_flight_requests_ > 0`
+//      （就是 ADR-16 那个在飞计数：转发 +1 / 响应完结 −1）。停在下游入向缓冲里、
+//      还没转出去的完整请求属于**尚未接受**——排水期间 `forward_pending_requests_body`
+//      入口直接 kBlocked，一条都不再转出去。我不为它回 4xx：网关不替一个正在下线的
+//      自己伪造状态码，那条表态能力是 S4 第一个会停请求的 filter 才有的。
+//   二、**空闲连接立即关**（在飞归零且缓冲为空，或只剩一条没被接受的完整请求）。
+//      半条请求 / 写完就发呆的客户端落不进任何一格，只能交给兜底——这正是兜底存在
+//      的理由，不是这里没做完。
+//   三、**隧道只能硬关**（ADR-09 不解析帧 → 发不出 WS close 握手）。做法是把已缓冲的
+//      帧字节两个方向各搬一次，然后按 kFlushThenClose 收尾；客户端的表现是断线重连。
+//
+// 三条都只在循环线程上跑，碰的全是 owner worker 自己的状态（ADR-14 原样成立）。
+// 排水完成的判据也刻意留在**本线程**：循环线程自己置 stop_requested_，
+// ReactorGroup 只读那个原子量，于是"谁在推进排水"始终是同一条线程。
+//
+// 「不再接受新连接」这一半不在这里，它在 accept_all() 里。刻意**不关监听 fd**，
+// 理由与代价都写在 accept_all 的注释里——一句话版本：`fd_start == fd_end` 这条
+// 不变量是全项目生命周期证据的地基，而 fd_start 是在 start_listen 之后量的。
+
+void Reactor::drain_sweep() {
+  const std::int64_t deadline = drain_deadline_ms_.load(std::memory_order_relaxed);
+  const bool expired = deadline > 0 && monotonic_ms() >= deadline;
+
+  // 快照一份再处理：注册表会在处理过程中被 erase（六步关闭第 3 步），
+  // 拿着迭代器关连接就是给自己埋"边遍历边删"那一类雷。
+  std::vector<std::shared_ptr<Connection>> snapshot;
+  snapshot.reserve(connections_.size());
+  for (const auto& [fd, conn] : connections_) snapshot.push_back(conn);
+
+  // 一次性快照："停止那一刻手上还有几条在飞请求、还有几条停在停读线上"。只取第一次
+  // 扫描，所以它们是**时刻**的读数，不是每轮累加（累加版会把同一个等待数 N 遍，那个
+  // 数就没有任何口径可言了）。
+  // 后一个快照在这里补 S1-07 那条观测的账：排水会把卡住的连接也收尾，循环停下之后
+  // `read_disarmed_connections` 因此回 0——不在这一刻取，进程侧那份"网关不再消费下游
+  // 可读事件"的直接证据就会被 S2-05 自己抹掉。取它的是循环线程自己，注册表此刻归它
+  // 独占，所以这不违反"非原子观测只能在循环停下后读"那条纪律（stats.h 第 25 行）。
+  if (!drain_first_sweep_done_) {
+    drain_first_sweep_done_ = true;
+    std::uint64_t waiting = 0;
+    for (const std::shared_ptr<Connection>& conn : snapshot) {
+      if (conn->role() != Role::kDownstream || conn->tunneling()) continue;
+      if (conn->peer_fd() == kInvalidFd) continue;
+      auto pit = connections_.find(conn->peer_fd());
+      if (pit != connections_.end() && pit->second->in_flight_requests() > 0) ++waiting;
+    }
+    // fetch_add 而不是 store：`ReactorStats` 是**全 worker 共享一份**（ADR-14 第 4 条），
+    // store 会让最后一个跑完第一次扫描的 worker 把前面所有 worker 的快照覆盖掉——
+    // 那种写法在单 Reactor 下看起来完全正确，多 Reactor 下就是一个少报的数。
+    stats_.drain_in_flight_at_entry.fetch_add(waiting, std::memory_order_relaxed);
+    stats_.drain_read_disarmed_at_entry.fetch_add(
+        static_cast<std::uint64_t>(connections_with_read_disarmed()), std::memory_order_relaxed);
+  }
+
+  auto peer_of = [this](const Connection& conn) -> std::shared_ptr<Connection> {
+    if (conn.peer_fd() == kInvalidFd) return nullptr;
+    auto it = connections_.find(conn.peer_fd());
+    if (it == connections_.end()) return nullptr;
+    return it->second;
+  };
+
+  for (const std::shared_ptr<Connection>& conn : snapshot) {
+    if (conn->fd() == kInvalidFd) continue;
+    // 认人和批内反查同一条纪律：fd 可能已经关掉了，也可能编号已经被新连接复用。
+    auto fresh = connections_.find(conn->fd());
+    if (fresh == connections_.end() || fresh->second.get() != conn.get()) continue;
+    if (conn->state() == State::kClosed) continue;
+
+    if (expired) {
+      // 兜底到点：一律强关。kDiscardOutbound 跳过六步关闭的第 0 步，所以连"出向
+      // 永远刷不完"的收尾中连接也能走完这一步——不绕的话就是"决定强关、却因为刷
+      // 不完而永远关不掉"那条死锁形态。丢的是网关出向里没发出去的字节，客户端看到
+      // 截断；这是兜底的代价，1.20 里记着，不在这里粉饰。
+      if (conn->state() != State::kClosing) {
+        // 收尾中的连接不重复计：它是在此前某轮被按 kFlushThenClose 发起关闭的，
+        // 那时已经落进 drain_closed_idle / drain_closed_buffered 之一。
+        stats_.drain_forced_timeout.fetch_add(1, std::memory_order_relaxed);
+      }
+      close_connection(conn, CloseWhy::kDiscardOutbound);
+      continue;
+    }
+
+    // 收尾中的连接不需要我再判一次：flush_outbound 把出向刷完就会自己走完关闭。
+    if (conn->state() == State::kClosing) continue;
+
+    if (conn->tunneling()) {
+      // 隧道硬关（规则三）。**只从下游那一侧动手**：注册表按 fd 顺序扫，先扫到上游侧
+      // 的话，直接关它会级联关掉下游——配对照样收尾，但 `drain_tunnels_hard_closed`
+      // 就是 0，而那个数正是"隧道走的是硬关、不是优雅握手"这句话唯一的可断言形态。
+      // 第一版就是这么红的（用例断 1、实到 0），所以这条分支留在代码里而不是脑子里。
+      if (conn->role() == Role::kUpstream) {
+        if (peer_of(*conn) != nullptr) continue;  // 下游还在，由它驱动这一对的收尾
+        close_connection(conn);                   // 只剩上游侧（下游已走）：刷完它的出向就关
+        continue;
+      }
+      const std::shared_ptr<Connection> peer = peer_of(*conn);
+      if (peer) {
+        pump_tunnel(conn, peer);  // 客户端 → 上游：已缓冲的帧字节
+        pump_tunnel(peer, conn);  // 上游 → 客户端：已缓冲的帧字节
+      }
+      stats_.drain_tunnels_hard_closed.fetch_add(1, std::memory_order_relaxed);
+      close_connection(conn);  // 级联带走配对上游，两侧都按 kFlushThenClose 刷完出向
+      continue;
+    }
+
+    if (conn->role() == Role::kUpstream) {
+      // 空闲在池里的上游（peer 无效）不在这里关——它由循环出口的 drain_upstream_pool()
+      // 收，那是 S2-02 既有的收尾路径；两条路径各关一次就等于把同一个对象数两遍。
+      if (conn->peer_fd() == kInvalidFd) continue;
+      const std::shared_ptr<Connection> peer = peer_of(*conn);
+      const bool downstream_finished = (peer == nullptr) || (peer->state() != State::kOpen);
+      if (downstream_finished && conn->in_flight_requests() == 0) close_connection(conn);
+      continue;
+    }
+
+    // 剩下的就是"下游、非隧道、还 kOpen"——这条连接现在能不能收尾，判据只有一条：
+    // 它配对的上游还有没有在飞请求。有就等（响应到齐的那一轮扫描会来关它）。
+    const std::shared_ptr<Connection> peer = peer_of(*conn);
+    const std::size_t in_flight = (peer != nullptr) ? peer->in_flight_requests() : 0;
+    if (in_flight > 0) continue;
+    const std::size_t buffered = conn->inbound().readable_bytes();
+    if (buffered == 0 || conn->request() != nullptr) {
+      if (buffered == 0) {
+        stats_.drain_closed_idle.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        stats_.drain_closed_buffered.fetch_add(1, std::memory_order_relaxed);
+      }
+      close_connection(conn);
+    }
+  }
+}
+
+bool Reactor::drain_pending_empty() const noexcept {
+  for (const auto& [fd, conn] : connections_) {
+    if (conn->fd() == kInvalidFd || conn->state() == State::kClosed) continue;
+    // 出向还有货 = 交付没完成（含"收尾中的 kClosing"和"响应已排队但内核发送缓冲
+    // 还没腾出来"两种）。这两种都必须等，否则这条判据会在响应还没送达时报"排干了"，
+    // 而验收句要断的恰恰是"退出前它的响应完整送达"。
+    if (conn->outbound_pending() > 0) return false;
+    if (conn->role() == Role::kDownstream) {
+      if (conn->state() == State::kOpen) return false;
+    } else if (conn->state() == State::kOpen && conn->peer_fd() != kInvalidFd &&
+               conn->in_flight_requests() > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void Reactor::on_downstream_readable(const std::shared_ptr<Connection>& conn,
                                      std::uint32_t revents) {
   if (conn->state() != State::kOpen) {
@@ -769,6 +990,14 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
     // ——比如 101 之后客户端又发了一条带 Upgrade 头的请求——不该漂向更远的将来。
     (void)downstream->take_upgrade_pending();
     return ForwardOutcome::kDrained;
+  }
+  if (draining_.load(std::memory_order_relaxed)) {
+    // S2-05 规则一的后半句：**排水期间不再接受新请求**。拦在这里而不是拦在 accept，
+    // 是因为"已 accept 的连接"和"已接受的请求"是两件事——连接要留着把它在飞的请求
+    // 答完，而字节已经进网关、还没转出去的那条请求按口径属于尚未接受。
+    // 返回 kBlocked 而不是 kFailed：连接还活着，字节留在原地，由排水扫描决定它
+    // 什么时候收尾；也不回 4xx（网关不替正在下线的自己伪造状态码，见本节开头）。
+    return ForwardOutcome::kBlocked;
   }
   for (;;) {
     // close 是一次性配对的边界（S2-04，ADR-16）：转发过一条带 `Connection: close` 的请求

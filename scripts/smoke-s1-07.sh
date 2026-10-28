@@ -12,8 +12,9 @@
 #       这才是"恢复"在进程级的形状。curl 做不到这一条：它不 pipeline，
 #       一条请求必须等它的响应，压强永远堆不到停读线；
 #   三、把停读线压到比一条请求还小（4 KiB 的线 + 100 KiB 的 POST），那条请求**停在
-#       线上**：不丢、不报错、不 5xx，而且 `read_disarmed_connections=1` —— 这是
-#       "网关不再消费下游可读事件"这句话在进程侧唯一能被直接读出来的形式；
+#       线上**：不丢、不报错、不 5xx，而且 `drain_read_disarmed_at_entry=1` —— 这是
+#       "网关不再消费下游可读事件"这句话在进程侧能被直接读出来的形式（S2-05 之后
+#       排水会把这条卡住的连接也收尾，所以这个数改由排水的第一次扫描就地取）；
 #   四、上游 accept 之后**半条响应头**就关（切在中间、远不到响应头预算）——
 #       FAULT-INJECTION §5 里归属本任务的那条缺口。
 #
@@ -303,8 +304,11 @@ check_lifecycle stall-req
 # 这条**不该被当成缺陷**：转发的最小单位是"整条请求"（`queue_bytes` 的整块判断），
 # 线比一条请求还小，那条请求就永远装不进缓冲——它停在停读线上等人来处理，不丢、
 # 不报错、不 5xx。1.15 里那句话需要一个阶段让它在真实进程里发生一次。
-# 而 `read_disarmed_connections=1` 是这一步真正的收获：验收句"网关不再消费下游可读事件"
-# 在进程侧只能这样读——循环已经停下，还带着没有 EPOLLIN 的掩码的那条连接就是被按住的那个。
+# 而"网关不再消费下游可读事件"这句话在进程侧的证据，S2-05 之后换一个数：
+# `drain_read_disarmed_at_entry=1` —— 排水的**第一次扫描那一刻**由循环线程自己数的
+# （那条连接还停在没有 EPOLLIN 的状态上）。换的原因很具体：排水最终会把这条卡住的连接
+# 强关，于是循环停下之后再读注册表，它已经不在里面了，`read_disarmed_connections` 回 0。
+# 1.15/1.20 与 FAULT-INJECTION §5 的 B-5 都按这个新形态记。
 echo
 echo "== 阶段三：--high-water-mark 4096 + 100 KiB 请求 —— 停在停读线上，不丢不报错"
 BIG_FILE="$OUT/big-body.bin"
@@ -345,22 +349,38 @@ stop_pair tiny-line
 [[ "$(get_stat backpressure_resume_count)" == "0" ]] \
   && ok "resume=0：没有东西被转走，水位从未回落——恢复在这里没有资格发生" \
   || fail "backpressure_resume_count=$(get_stat backpressure_resume_count)，期望 0"
-[[ "$(get_stat read_disarmed_connections)" == "1" ]] \
-  && ok "read_disarmed_connections=1：这条连接**真的**停在没有 EPOLLIN 的状态上被观察到" \
-  || fail "read_disarmed_connections=$(get_stat read_disarmed_connections)，期望 1"
+[[ "$(get_stat drain_read_disarmed_at_entry)" == "1" ]] \
+  && ok "drain_read_disarmed_at_entry=1：这条连接**真的**停在没有 EPOLLIN 的状态上被观察到" \
+  || fail "drain_read_disarmed_at_entry=$(get_stat drain_read_disarmed_at_entry)，期望 1"
 READ_IN=$(get_stat bytes_read_downstream)
 if [[ -n "$READ_IN" ]] && (( READ_IN >= 4096 )) && (( READ_IN <= 8192 )); then
   ok "bytes_read_downstream=$READ_IN：读进去的就贴在线附近，100 KiB 没有进内存"
 else
   fail "bytes_read_downstream=${READ_IN:-?}，期望 4096..8192"
 fi
-# 这一步**不做** check_lifecycle：注入的就是一条永不完结的连接，而网关的停止语义是
-# "不再接受新连接 + 退出循环"，不排水在飞连接（FAULT-INJECTION §3 记过这条，真排水在
-# S2 之后）。所以这里改成断"停在那里是低成本的"：退出码 0、fd 没涨、RSS 有界。
-if [[ "$(get_stat live_connections)" == "1" ]]; then
-  ok "live_connections=1：这条连接按停止语义留在原地（不排水是**已知**边界，不是本步的结论）"
+# 这一步**不做** check_lifecycle 里的"live=0 之前就静置"那套：注入的就是一条永不完结的
+# 连接，而 S2-05 之后 SIGTERM 走的是**排水**——这条卡住的连接按口径既不算空闲（缓冲里有
+# 半包）也没有在飞请求（从没被接受过），所以它落进兜底格：`--drain-timeout-ms`（默认
+# 5000ms）到点被强关。于是这一步现在的形状是"等满兜底窗口 → 强关 → 三项归零"，
+# 这条正是 ROADMAP 债「优雅停止不排水在飞连接」还掉之后的实测形态（见 1.20 与 S2-05）。
+# 原样留在原地（live=1）是 S1 的语义，已经不作数了。
+LIVE=$(get_stat live_connections)
+DISARMED=$(get_stat drain_read_disarmed_at_entry)
+FORCED=$(get_stat drain_forced_timeout)
+if [[ "$LIVE" == "0" ]]; then
+  ok "live_connections=0：排水把这条卡住的连接收尾了（S2-05 之后不再是留原地）"
 else
-  fail "live_connections=$(get_stat live_connections)，期望 1（不是 0：无声关掉一条卡住的连接，就等于把它丢了）"
+  fail "live_connections=${LIVE:-?}，期望 0：排水没把它关掉"
+fi
+if [[ "$DISARMED" == "1" ]]; then
+  ok "drain_read_disarmed_at_entry=1：这条连接**真的**停在没有 EPOLLIN 的状态上被观察到"
+else
+  fail "drain_read_disarmed_at_entry=${DISARMED:-?}，期望 1（这是「网关不再消费下游可读事件」在进程侧的直接证据）"
+fi
+if [[ "$FORCED" == "1" ]]; then
+  ok "drain_forced_timeout=1：它是被**兜底**关的，不是被当成空闲悄悄关的"
+else
+  fail "drain_forced_timeout=${FORCED:-?}，期望 1（半包不该落进空闲格）"
 fi
 echo "  本步内存形状：rss_start_kib=$(get_stat rss_start_kib) → rss_end_kib=$(get_stat rss_end_kib)，压力窗口峰值=$(rss_peak tiny-line) KiB / VmHWM=$(rss_peak tiny-line VmHWM:) KiB"
 echo "  本步 fd：fd_start=$(get_stat fd_start) → fd_end=$(get_stat fd_end)"

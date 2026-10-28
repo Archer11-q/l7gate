@@ -108,10 +108,25 @@ class Reactor {
 
   // 可以在别的线程调用（测试就是这么停的），所以它只做一件跨线程的事：
   // 往 eventfd 写一个数。不碰任何循环内部状态 —— 那才是真正会在 S2 出问题的地方。
+  //
+  // **硬停**：置标志 + 敲门，循环下一轮检查就退出，在飞连接不被收尾（留给 `~Reactor`）。
+  // S1/S2-04 的全部生命周期断言走的就是这条路，S2-05 没有改它的语义。
+  // 排水请用 request_drain()；在排水期间收到 stop() 就是运维意义上的"别再等了"。
   void stop() noexcept;
+
+  // S2-05（ARCHITECTURE 1.20）：**优雅停止**。与 stop() 的区别是循环不立刻退出——
+  // 它进入排水相位：摘监听 fd（新连接从此拿 RST）、不再接受新请求、把已在飞的请求
+  // 逐条响应完 + 刷完出向再关、空闲连接立即关、隧道硬关，直到没有值得等的东西
+  // 或 timeout_ms 到点（兜底强关）才自己置上停止标志。
+  // 跨线程纪律与 stop() 同一条：只做原子 store + 写 eventfd，不碰循环内部状态。
+  void request_drain(std::int64_t timeout_ms) noexcept;
 
   bool running() const noexcept { return running_.load(std::memory_order_relaxed); }
   bool stop_requested() const noexcept { return stop_requested_.load(std::memory_order_relaxed); }
+  // 排水是否已请求。**循环线程自己**在排水完成时置 stop_requested_，所以
+  // ReactorGroup 用「所有 worker 的 stop_requested() 都为真」判断"全部排干了没有"，
+  // 不需要往回投递任何完成事件（也就多一个跨线程接触面都没有）。
+  bool drain_requested() const noexcept { return draining_.load(std::memory_order_relaxed); }
 
   // 实际监听端口（bind 到 0 时由内核决定，start_listen 之后才可读）。
   int listen_port() const noexcept { return listen_port_; }
@@ -282,6 +297,21 @@ class Reactor {
   // 循环退出时排空池：停掉的 worker 不该留着热连接。关闭全部空闲上游并清表。
   void drain_upstream_pool();
 
+  // --- 优雅停止：排水（S2-05，ARCHITECTURE 1.20）---------------------------
+  // 两条都只在**循环线程**上跑，碰的全是循环内状态（注册表 / epoll / 出向缓冲），
+  // 所以它们与 ADR-14 的单线程拥有零冲突；唯一的跨线程接触面还是那两个原子量 +
+  // 一次 eventfd 写。每轮排水 tick 的顺序固定为：扫描 → 判完成。
+  // 「不再接受新连接」不在这里，它在 accept_all()：排水期间 accept 到就立刻把那条 fd
+  // 关掉，而**不关监听 fd**——理由与代价都写在 accept_all 的注释里（一句话版本：
+  // `fd_start == fd_end` 是全项目生命周期证据的地基，而 fd_start 在 start_listen 之后量）。
+  // 逐条分流。快照一份 shared_ptr 再处理——注册表会在处理过程中被 erase
+  // （六步关闭第 3 步），拿着迭代器关连接是给自己埋"边遍历边删"那一类雷。
+  void drain_sweep();
+  // 还有没有值得等的东西：任何一条连接出向没刷完、任何一条下游还 kOpen、
+  // 任何一条配对中的上游还有在飞请求 → 还没排完。池里的空闲上游**不算**
+  // （它由循环出口的 drain_upstream_pool() 收，与 S1/S2-02 的既有收尾路径同一条）。
+  bool drain_pending_empty() const noexcept;
+
   // 关闭的**前置判断**：出向缓冲里还有没刷出去的字节时不能直接 close(fd)。
   // 那不是"少发一个响应"的语义问题，是我自己把已经接受的字节丢掉了：
   // 上游回完就断（客户端提前断开、S1-06 的截断判定）都会走到这条路径，
@@ -340,6 +370,17 @@ class Reactor {
   // 用 running_ 同时表达"我在循环里"和"我还没被要求停"，那么 run() 开头的
   // store(true) 就会把在那之前送达的 stop() 抹掉，循环再也不停。
   std::atomic<bool> stop_requested_{false};
+  // --- S2-05 排水的两个跨线程原子量 -----------------------------------------
+  // `draining_` 由 request_drain() 置位（信号 handler / ReactorGroup 的 accept 线程），
+  // 循环线程每轮读一次；`drain_deadline_ms_` 是**单调时钟**上的毫秒数（0 = 未设），
+  // 置位和读取都走原子，所以它不构成新的 data race（TSan 在这一层是门禁）。
+  // 为什么 deadline 用"绝对时刻"而不是"剩余毫秒"：剩余量得有人每轮递减，而递减的人
+  // 是循环线程 —— 那等于把兜底计时器做成"扫描频率的函数"，wait_timeout 一改它就变形。
+  std::atomic<bool> draining_{false};
+  std::atomic<std::int64_t> drain_deadline_ms_{0};
+  // 第一次扫描要取一份"停止那一刻手上有什么"的快照（drain_in_flight_at_entry）。
+  // 只被循环线程碰，所以是普通 bool，不进原子面。
+  bool drain_first_sweep_done_ = false;
   std::vector<Epoll::Event> events_;
 
   // --- worker 模式的 handoff 队列（S2-01，ADR-14）--------------------------

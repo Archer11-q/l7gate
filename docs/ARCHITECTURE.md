@@ -2,7 +2,7 @@
 
 > 契约第 6 节第 2 步要求这里写的是**已实现的现状，不是规划**。所以我用两个明确分开的部分：第 1 节是仓库里真实存在、能构建能跑的东西；第 3 节是已定但未实现的结构意图，只到「接口形状」这一层，避免把愿望写成事实。
 >
-> 现状一句话：**仓库里有了一个能转发请求、并且认得 101 的网关骨架，但它还不认识 HTTP 的其余语义。** `l7gate --serve` 起一个单线程 epoll 边缘触发循环，下游收到的完整请求按**原始字节**搬到上游、上游的响应按原始字节搬回来，keep-alive 复用同一条回源连接；`Connection: close` 按语义兑现成一次性配对，带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**（帧不解析、不改写，ADR-09）——10000 个真 curl 请求跑完 fd 回到基线、存活连接归零。它不做状态码映射、不改写响应、畸形请求只关连接不回 400，这些是 S1-06 的活。filter 链、路由、负载均衡、限流、熔断、多线程、连接池仍然未实现。
+> 现状一句话：**仓库里有了一个能把并发摊到多个线程、并且能体面下线的网关骨架，但它还不认识 HTTP 的其余治理语义。** `l7gate --serve` 起一条（`--workers 1`，S1 形状）或一个 acceptor + N 条 worker 的 epoll 边缘触发循环（S2-01：连接单线程拥有、跨线程只传裸 fd，ADR-14），下游收到的完整请求按**原始字节**搬到上游、上游的响应按原始字节搬回来，keep-alive 复用同一条回源连接，per-worker 的上游连接池让短命下游复用热上游（S2-02，ADR-15）；一条下游是一个有序的请求-响应管线，`Connection: close` 在**它自己那条请求的响应**之后才兑现（S2-04，ADR-16）；带 upgrade 记号的请求在上游回出完整 101 头后整条连接转成**纯字节隧道**（帧不解析、不改写，ADR-09）。SIGTERM/SIGINT 现在走**按请求排水**的优雅停止：不再接受新请求、把在飞请求逐条响应完 + 刷完出向再关、空闲连接立即关、`--drain-timeout-ms`（默认 5000）兜底强关、隧道只能硬关（S2-05，见 1.20）。10000 个真 curl 请求跑完 fd 回到基线、存活连接归零。它不改写响应、不做路由、不做限流熔断。filter 链是**空壳顺序**（S1-08，无业务 filter），路由、负载均衡、限流、熔断仍然未实现。
 
 ## 1. 当前真实存在的模块
 
@@ -14,11 +14,16 @@ l7gate/
 │   ├── verify-all-presets.sh  三 preset 全量构建 + ctest + 警告计数，任务收尾用
 │   ├── smoke-s1-04.sh      真 curl 冒烟：单请求逐字节可见 + 10000 请求后 fd/连接归零
 │   ├── smoke-s1-06.sh      八阶段真 curl：逐字节一致 / chunked / 两种截断 / 坏框架 / 永不齐头 / 4xx+501
+│   ├── smoke-s1-07.sh      四阶段背压：慢客户端响应 / 慢上游请求 / 停在停读线上 / 半条响应头
+│   ├── smoke-s2-05.sh      五阶段优雅停止：在飞答完才退 / 空闲立即关 / 半包走兜底 / 隧道硬关不伪造 / 3 worker 各排各的
 │   └── bench/
 │       ├── s1-p99.sh       SLO #1 取数（口径写死，canonic 自检；非标准口径不进 BENCHMARK）
+│       ├── s2-qps-vs-nginx.sh SLO #3 五档（nginx 三档 + 网关 + 直连天花板）
 │       └── env-snapshot.sh 每次压测前的环境落盘（绑核/分配器/版本号/文件系统）
 ├── src/
-│   ├── main.cc             入口：--self-check / --serve / --help
+│   ├── main.cc             入口：--self-check / --serve（--listen --upstream --workers
+│   │                       --max-connections --high-water-mark --serve-requests
+│   │                       --drain-timeout-ms）/ --help
 │   ├── core/
 │   │   ├── build_info.h    BuildInfo 结构 + current() + render_one_line()
 │   │   └── build_info.cc   编译期与运行期事实的采集实现
@@ -26,13 +31,15 @@ l7gate/
 │   │   ├── fd.h/.cc        UniqueFd：fd 的 RAII。"漏 fd" 从这里开始可被类型系统抓住
 │   │   ├── socket.h/.cc    非阻塞/CLOEXEC/listen/异步 connect/SO_ERROR，不含读写
 │   │   ├── epoll.h/.cc     Epoll：add/modify/remove/wait，**无条件或进 EPOLLET**，自带计数器
-│   │   ├── stats.h         ReactorStats：全原子的观测面（「观测不是同步手段」）
+│   │   ├── stats.h         ReactorStats：全原子的观测面（「观测不是同步手段」），含 S2-05 排水的 8 个计数
 │   │   ├── buffer.h        Buffer + Config + ReadResult：接口、不变量、口径都写在头文件
 │   │   ├── buffer.cc       读满即停 / 压缩 / 扩容 / 水位停止 / 空仓归还 / 写到 EAGAIN
 │   │   ├── connection.h    Connection：一条 fd + 入向/出向 Buffer + 解析游标 + view 生命周期 + 隧道态
 │   │   ├── connection.cc   已扫描游标推进 / 惰性分配 / generation 作废判定 / 101 检测 / 收尾释放
-│   │   ├── reactor.h       Reactor + Config：六步关闭、ET accept、延后析构的接口与理由
-│   │   ├── reactor.cc      事件循环、上下游配对、双向 pump、隧道 pump、背压挂起点的形状
+│   │   ├── reactor.h       Reactor + Config：三态停止（run/排水/退出）、六步关闭、ET accept、
+│   │   │                   延后析构的接口与理由
+│   │   ├── reactor.cc      事件循环、上下游配对、双向 pump、隧道 pump、背压挂起点的形状、
+│   │   │                   排水扫描（1.20）
 │   │   ├── reactor_group.h  ReactorGroup（S2-01）：acceptor + N worker + round-robin 派发的接口与所有权理由
 │   │   └── reactor_group.cc 监听 fd、accept 循环、handoff 派发、聚合观测（每 worker 各一份的非原子量求和）
 │   └── http/
@@ -57,12 +64,19 @@ l7gate/
     ├── reactor_test.cc     10 条（S1_04_Reactor），含真 curl 之外的 10000 请求生命周期用例 + 5 条握手闭环（S1_05_Reactor）
     │                        + 7 条响应语义闭环（S1_06_Reactor）：逐字节一致 / chunked 不吃下一条 /
     │                          两种截断各自落在互斥计数上 / 头超预算判死 / 4xx+501 端到端 / close 在框架边界兑现
+    │                        + 4 条背压（S1_07_Backpressure）+ 2 条链在真循环里（S1_08_FilterReactor）
+    │                        + 5 条多 Reactor（S2_01_MultiReactor）+ 3 条上游池（S2_02_UpstreamPool）
+    │                        + 3 条跨线程销毁红队（S2_03_CrossThreadDestruction）+ 3 条配对/close 时机（S2_04_Pairing）
+    │                        + **6 条优雅停止（S2_05_GracefulStop）**：在飞答完才退 / 空闲立即关 / 半包走兜底 /
+    │                          隧道硬关不伪造 / 排水期新连接被拒 / 3 worker 各自排干并 join
+    ├── filter_chain_test.cc 6 条纯链断言（S1_08_FilterChain）：顺序==添加顺序、第一个 kStop 之后短路、
+    │                        filter 状态跨请求存活、RequestInfo 的借用面只递给真请求
     ├── framing_test.cc     19 条（S1_06_Framing）响应框架纯函数断言：七种结论、chunked 游标的切分不变量与
     │                        坏框架在"断掉那一字节"停住、映射表拥有每个错误码、自产响应的 CL 与字节数自洽
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**，S2-03 加 **3** 条 `S2_03_CrossThreadDestruction`（负载活跃时 stop / handoff fd 注册前被对端关 / 连接风暴）→ **123**，S2-04 加 **3** 条 `S2_04_Pairing`（close 在 pipeline 中间 / 末尾 / 整批无 close）→ **126**。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**，S2-03 加 **3** 条 `S2_03_CrossThreadDestruction`（负载活跃时 stop / handoff fd 注册前被对端关 / 连接风暴）→ **123**，S2-04 加 **3** 条 `S2_04_Pairing`（close 在 pipeline 中间 / 末尾 / 整批无 close）→ **126**，S2-05 加 **6** 条 `S2_05_GracefulStop`（在飞答完才退 / 空闲立即关 / 半包走兜底 / 隧道硬关不伪造 / 排水期新连接被拒 / 3 worker 各自排干）→ **132**。
 
 ### 1.1 `core/build_info`
 
@@ -248,7 +262,7 @@ S1-04 就有了字节通路（下游来一条、回源一条、原路回写）�
 
 实测（全部本任务重跑取数）：三 preset 各 **100/100**（debug / asan-ubsan / tsan），本任务新增 **26** 条（19 `S1_06_Framing` 纯函数 + 7 `S1_06_Reactor` 闭环），非 gtest 警告 **0 条**——这个 0 是门禁抓出来的：asan/tsan 首跑各报 1 条 `-Wunused-const-variable`（`tools/` 里一个只用于注释目的的常量），debug 用 gcc 不报、clang 的两个 preset 才报，删掉未用常量后归零；纯函数那 19 条里 `MappingTableOwnsEveryErrorCode` 是把"每个 `ParseError` 都有归属"写成数据断言的（表里没有 default，靠遍历枚举核），`GatewayRepliesAreCompleteAndSelfConsistent` 逐条核对 CL 与字面字节数。逐字节一致那条：`ProxiedResponseIsByteIdenticalToDirectUpstream` + 冒烟阶段一（1200 B 固定体，直连与经网关两份文件比 sha），chunked 那条同口径但带 `--raw`，且额外断言框架边界不吃掉下一条响应（`ChunkedResponseIsByteIdenticalAndLeavesTheNextResponseAlone`）。两种截断分别落在两条互斥的计数上：`UpstreamDyingBeforeAnyResponseGetsDefined502`（before_head + 502 + `gateway_replies_sent`）与 `UpstreamDyingMidBodyIsTruncatedByEofWithoutASecondReply`（in_body + 零追加字节）；`EndlessResponseHeadIsKilledAtTheBudget` 打的是头超预算那条早期判定；`ClosePairCompletesAtTheFramingBoundary` 是 S1-05 那个口子的兑现点。回归：`smoke-s1-04.sh` 真 curl 10000 仍全绿（3.04 s、fd 9→9、`header_scan_bytes == bytes_down_to_upstream == 838,894`）。**结构成本照记**：`sizeof(Connection)` 从 400 涨到 **512**（`ResponseTracking` + `ChunkedProgress` 的支出，1.11 那条口径要跟着改），空闲 128 条下游连接本轮 5.31 KiB/连接。第一份 p99 与归因在 `docs/BENCHMARK.md` B-001（增量 p99 = 57.540 ms，**未达标**）。
 
-已知边界，照记不藏：411 在映射表里没有触发路径（解析器把"无 CL 无 TE"判成无 body，见上）；`gateway_error_reply` 只覆盖 400/411/413/501/502，503/504 的字节模板存在但没有产生它们的代码路径（限流与超时是 S4）；响应头的语法只做框架声明级别的一致性检查（不当响应解析器用，S1 不需要）；优雅停止在语义上是"停止接受新连接 + 退出循环"，**不排水在飞连接**——压测脚本因此必须先静置再 SIGTERM，否则报告里的 `live_connections` 反映的是我杀进程的时机而不是网关的收尾能力（这条在 B-001 的生命周期段有对账）。
+已知边界，照记不藏：411 在映射表里没有触发路径（解析器把"无 CL 无 TE"判成无 body，见上）；`gateway_error_reply` 只覆盖 400/411/413/501/502，503/504 的字节模板存在但没有产生它们的代码路径（限流与超时是 S4）；响应头的语法只做框架声明级别的一致性检查（不当响应解析器用，S1 不需要）；~~优雅停止在语义上是"停止接受新连接 + 退出循环"，**不排水在飞连接**~~ —— **这一条已由 S2-05 改掉（1.20）：SIGTERM/SIGINT 现在走排水**。压测脚本"先静置再 SIGTERM、然后断言归零"的写法**保持不变且仍然必要**：它证的从"绕开一个没做的功能"变成了"验证排水确实把在飞的都收尾了"（这条在 B-001 的生命周期段有对账，那里是 S1 当时的语义，原样留着不改）。
 
 ### 1.15 背压：判据、滞回、探测读，以及"应用堆与内核套接字缓冲是两本账"
 
@@ -266,7 +280,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 
 **应用堆与内核套接字缓冲是两本账，SLO #2 只记前者。** `sizeof(Connection)=520`（S1-06 的 512 + `armed_events_` 4 B，被对齐吃掉成 +8 B；1.11 口径同步），而平台期停住的那 ≈1.9 MB 是内核的 socket 缓冲，**不进 RSS**。进程侧的数因此是两个方向都要看的：`scripts/smoke-s1-07.sh` 三个压力阶段的 `VmHWM` 是 4,676–5,032 KiB，相对各自的 `rss_start`（4,472–4,484 KiB）增量 +204 到 +548 KiB，而同期在飞的字节是 1 MiB 的响应和 3.3 MB 的请求——**内存没有随在飞字节增长**，这才是验收句「内存不继续增长」在进程侧的可断言形式。ctest 那边则用另一本账：`bytes_read_downstream`/`bytes_read_upstream` 按角色分开累计，平台期就是"这两个数中的某一个不再增长"，合在一个数里就分不出是哪个方向停了。
 
-**「整块才转」的边界与 `--high-water-mark` 的真实身份。** 转发的最小单位是整条请求 / 整个响应头（`queue_bytes` 的整块判断），所以停读线压得比一条请求还小，那条请求就永远装不进出向缓冲——它**停在停读线上等人来处理，不是被丢弃，也不是被报错**。这句话在冒烟阶段三有实测形态：`--high-water-mark 4096` + 一条 100 KiB 的 POST → curl 超时且**零字节**，网关侧 `requests_parsed=0`、`upstream_opened=0`、`gateway_replies_sent=0`、`pause=1`、`resume=0`、`bytes_read_downstream=4096`，而 `read_disarmed_connections=1`。最后那个数是验收句「网关不再消费下游可读事件」在整个仓库里唯一被直接读出来的形式（非原子观测，只在循环停下之后读）。所以 `--high-water-mark` 是**取证旋钮不是调优入口**，下限 4 KiB 由这条边界决定，不是随手取的。默认 256 KiB 因此是真实链路（跨机、带宽延迟积大）上的量级，回环上顶不动它——这条差异记在这里，不靠调小默认值掩盖。
+**「整块才转」的边界与 `--high-water-mark` 的真实身份。** 转发的最小单位是整条请求 / 整个响应头（`queue_bytes` 的整块判断），所以停读线压得比一条请求还小，那条请求就永远装不进出向缓冲——它**停在停读线上等人来处理，不是被丢弃，也不是被报错**。这句话在冒烟阶段三有实测形态：`--high-water-mark 4096` + 一条 100 KiB 的 POST → curl 超时且**零字节**，网关侧 `requests_parsed=0`、`upstream_opened=0`、`gateway_replies_sent=0`、`pause=1`、`resume=0`、`bytes_read_downstream=4096`，而 `read_disarmed_connections=1`。最后那个数是验收句「网关不再消费下游可读事件」在整个仓库里被直接读出来的形式（非原子观测，只在循环停下之后读）。**S2-05 之后这一格的进程侧读法换了一次**：SIGTERM 从硬停变成排水，那条卡住的连接最终会被收尾，循环停下时 `read_disarmed_connections` 回 0——那个 0 是排水做对了的表现，所以判据改由**排水的第一次扫描**就地取（`drain_read_disarmed_at_entry=1`，取的人正是循环线程，注册表此刻归它独占，不违反观测纪律）。ctest 侧 `connections_with_read_disarmed()` 的严格断言一条没动，见 1.20 与 FAULT-INJECTION §5 的 B-5。所以 `--high-water-mark` 是**取证旋钮不是调优入口**，下限 4 KiB 由这条边界决定，不是随手取的。默认 256 KiB 因此是真实链路（跨机、带宽延迟积大）上的量级，回环上顶不动它——这条差异记在这里，不靠调小默认值掩盖。
 
 实测：本任务新增 **4** 条 `S1_07_Backpressure` 闭环（请求方向 / 响应方向 / 隧道方向 / 稳态无压强），三 preset 各 **104/104**，非 gtest 警告 0 条。debug 四条耗时 417 / 237 / 241 / 334 ms，asan-ubsan 405 / 239 / 416 / 438 ms。响应方向那条用的是 1 MiB 固定体 + 客户端一个字节都不读（`pause` 与 `resume` 都 ≥1，逐字节补齐）；隧道那条的载荷是 2,742,440 B 非 HTTP 形态字节（0x00/0x0D/0x0A 混在里面），它同时是 ADR-09 的复查——`requests_parsed` 全程停在 1。冒烟四阶段（真 curl `--limit-rate 200k` 的慢客户端、`/dev/tcp` 的 400 条 pipelined POST 打在 `--stall-reads-ms 8000` 的慢上游、4 KiB 线下的 100 KiB 请求、`/dies-mid-head`）全绿，FAULT-INJECTION §5 里归属本任务的两条缺口（慢读之后的恢复、accept 后半条响应头就关）就此关闭。
 
@@ -305,7 +319,7 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 - **派发是 round-robin**（`rr_counter_` 原子自增 mod N），不是最少连接。理由：最少连接要跨 worker 读实时连接数（共享状态，违背"把共享面收到最小"），且负载均衡是 S3 的显式任务。round-robin 确定性、可断言（`DispatchIsRoundRobinBalanced`：8 条派发到 4 worker，每个恰好 2 条）。
 - **handoff 之后补一次探测读**（`drain_handoff()` 末尾 `schedule_probe()`）。这是 ET 的旧账在新位置复发：边沿触发不为"注册之前已缓冲的字节"负责，而 fd 从 acceptor accept、排队、到 worker 注册这段跨线程窗口，比单 Reactor 里 accept 紧邻注册大得多，客户端很可能已经把请求写进了内核接收缓冲。复用的是 S1-07 背压恢复那套「挂回 EPOLLIN 后主动读一次」的机器（`schedule_probe`/`drain_probes`/`probe_read`），不另写路径。单 Reactor 的 `accept_all()` 不补这次探测——它 accept 与注册在同一线程紧邻发生，窗口小到 S1 全套从未撞到。
 
-**线程账**：`run()` 在**调用它的线程**上跑 accept 循环（生产里是主线程），另外 spawn N 条 worker 线程，总数 1 + N，与 ADR-03「主线程 accept + N 个 Reactor 线程」逐字对上。停止沿用 S1 语义（停止接受 + 退出循环，**不排水在飞连接**）：`stop()` 只置标志 + 写 accept 侧 eventfd，accept 循环退出后 `run()` 再 stop + join 所有 worker——真正的排水 + 超时兜底是 S2-05。析构顺序有两处硬约束（都写在 `reactor_group.h` 的成员注释里）：`stats_` 必须先于 `workers_` 声明（worker 持 `ReactorStats&`，不能比它先死）；析构函数体先 join 所有线程，再让成员逆序 unwind（joinable 的 `std::thread` 被析构会 `std::terminate`）。
+**线程账**：`run()` 在**调用它的线程**上跑 accept 循环（生产里是主线程），另外 spawn N 条 worker 线程，总数 1 + N，与 ADR-03「主线程 accept + N 个 Reactor 线程」逐字对上。停止有两条路（S2-05，见 1.20）：`stop()` 是硬停（S1 语义原样保留，既有测试与 `--serve-requests` 走它），`request_drain(timeout_ms)` 是优雅停止——把排水下发给每个 worker、**继续在 accept 循环里空转**直到每个 worker 自行置上 `stop_requested_`，才 join（不阻塞 join，因为 worker 的排水进度需要它自己的线程在跑）。析构顺序有两处硬约束（都写在 `reactor_group.h` 的成员注释里）：`stats_` 必须先于 `workers_` 声明（worker 持 `ReactorStats&`，不能比它先死）；析构函数体先 join 所有线程，再让成员逆序 unwind（joinable 的 `std::thread` 被析构会 `std::terminate`）。
 
 **`--serve` 默认仍是单 Reactor（`--workers 1`）**，多 Reactor 走显式 `--workers N`（N≥2）。这不是保守，是不作废 S1 的门禁证据：S1 三个冒烟脚本断言的是单 Reactor 的精确 epoll 计数，多 Reactor 下 acceptor 与每个 worker 各有自己的 epoll，那些数会变（ADR-14 后果段）。`report_stats` 因此改成接收**显式聚合量**而不是 `Reactor&`，单/多两条路复用同一份 `[serve] key=value` 输出，冒烟脚本 grep 的键不必区分。
 
@@ -346,6 +360,60 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 
 已知边界：不支持服务端对 pipelined 请求的并行回源 + 按序重排（那是吞吐优化，且要先有 shared 池或每请求借还，撞 ADR-15 的下游生命周期独占——无 SLO 证据不做，契约 3.2）；不定义"一条配对上普通请求与 upgrade 混 pipeline"的行为（真实客户端不这么发）。
 
+### 1.20 优雅停止（S2-05）：三态停止协议、按请求排水、超时兜底、隧道只能硬关
+
+这一节写的是**已实现的现状**。它关掉的是 ROADMAP 债表里那行「优雅停止不排水在飞连接」——S1/S2-04 期间 `stop()` 的语义是"不再接受新连接 + 退出循环"，在飞连接留给 `~Reactor`（S1-07 冒烟阶段三因此**故意**断言 `live_connections=1`，压测脚本必须先静置再 SIGTERM 才敢读归零）。
+
+**这条线在问什么**：一个网关收到 SIGTERM 之后，正在谈的那几条 HTTP 会话该怎么办。答案不能是"全丢"（下线即事故），也不能是"全等"（一个卡死的客户端就能把下线拖成长期挂起）。
+
+**三态停止协议**：`Reactor` 的循环现在有 `kRunning / kDraining / kStopped` 三个相位，两个入口——
+
+- `stop()`：**硬停**，S1 语义原样保留（置标志 + 敲 eventfd，循环退出，在飞连接交给析构）。`--serve-requests` 那条 break、以及全部既有测试的 `stop_loop()` 走的都是这条路，所以 S1/S2 前四个任务的 126 条生命周期断言一条没改。
+- `request_drain(timeout_ms)`：进入 `kDraining`。**循环继续跑**，只是从此不再接受新请求，直到手上没有值得等的东西才自己置 `stop_requested_` 退出。
+
+**排水粒度 = 按请求，而"已收到的请求"的判据是 `in_flight_requests_ > 0`**（就是 S2-04/ADR-16 那个在飞计数，转发 +1 / 响应完结 −1）。这条线必须写死成一句可断言的话，因为"已收到"在字节层面根本没有边界：
+
+- **已转发给配对上游的请求 = 已接受** → 它的响应必须逐条送完（`kFlushThenClose` 保证出向字节也刷完）。
+- **停在下游入向缓冲里、还没转出去的完整请求 = 尚未接受** → 排水期间 `forward_pending_requests_body` 入口直接返回 `kBlocked`，一条都不再转发（"不再接受新请求"的字面落实）。我不为它回 4xx：网关不替一个正在下线的自己伪造状态码，那是 S4 的限流才有的表态能力。
+- **半条请求 / 客户端写完就发呆** → 判不出"有没有请求"，交给超时兜底。这就是兜底存在的理由，不是实现没做完的借口。
+
+**每轮扫描（`drain_sweep()`，只在 owner worker 线程跑）做三件事**：① 取一次性快照（`drain_in_flight_at_entry`、`drain_read_disarmed_at_entry`）；② 逐条分流；③ 判完成——没排干且 deadline 未到就继续跑，到点则一律强关。分流的四条规则，顺序要紧：
+
+| 这条连接现在是什么样 | 排水动作 |
+|---|---|
+| **隧道态**（任一侧 `tunneling()`） | 先把入向已缓冲的帧字节整块搬到对端出向（`pump_tunnel`），然后**硬关**（见下面"隧道只能硬关"） |
+| 下游，`in_flight==0` 且（可读区为空 **或** 只剩一条完整但未转发的请求） | **立即关**（空闲连接的判据；`kFlushThenClose`） |
+| 下游，`in_flight>0` | **等**——它正有条响应在路上，等它到齐（到齐那一轮扫描就关） |
+| 上游，它的配对下游已进入 `kClosing/kClosed` 且在飞归零 | 跟着关（级联），干净上游照旧先经 `recycle_upstream()` 进池，池由循环出口的 `drain_upstream_pool()` 排空 |
+
+**「不再接受新连接」落在 `accept_all()` / `accept_and_dispatch()`，而监听 fd 留到析构才关**——这是一个有代价的选择，写清楚而不是含糊过去。`fd_start` 是在 `start_listen()` **之后**量的，而 `fd_start == fd_end` 是全项目生命周期证据的地基（S1 三个冒烟脚本 + BENCHMARK 四份记录都读它）；排水途中关掉监听 fd 会把这条等式变成"要按停止方式加分支的等式"，那是把一块地基换成随时会算错的算式。所以排水期间的动作是：**照旧把 accept 队列排空（ET 下监听事件只报一次，不排空就是滞留），但每条 accept 到的 fd 直接关掉、不构造 `Connection`、不 handoff**，计 `drain_rejected_new_connections`。这和 S1-04 既有的"超容量就 accept 掉再关"是同一条动作，不是新机制。
+**代价照记**：排水期间的新客户端看到的是"连上就被关"，不是 `ECONNREFUSED`——后者要等进程退出、监听 socket 真的没了才成立。
+
+**"值得等的东西还有没有"= `drain_pending_empty()`**：遍历注册表，任何一条连接出向还有货、或下游仍 `kOpen`、或上游仍有在飞请求，就还没排完。全空 → 自己置 `stop_requested_` + 敲 eventfd → 循环退出 → `drain_upstream_pool()` → `run()` 返回。**所以"排水完成后退出"这条路径的收尾和 S1 完全同一条**（六步关闭 + `retiring_` 批末析构 + 池排空），`live_connections=0` / `constructed==destructed` / fd 回基线这三条断言因此不需要新的口径。
+
+**超时兜底：`--drain-timeout-ms`，默认 5000。** 它是**兜底不是承诺**——一个卡死的客户端不该能无限拖住一次下线。到点之后仍未收尾的连接一律强关，走的是 `CloseWhy::kDiscardOutbound`：它天然跳过六步关闭的第 0 步（"出向没刷完就只挂 EPOLLOUT、不碰 fd"），所以连"出向永远刷不完"的收尾中连接也能走完这一步。不绕的话就是另一类形态：**决定强关、却因为刷不完而永远关不掉**。丢的是网关出向里没发出去的字节，客户端看到截断——这是兜底的代价，写在这里而不是粉饰掉。
+**它必须与 S4 的"请求超时"对齐（`drain ≥ 请求超时`）**，理由不是好看：一条正常在飞的请求如果先撞上排水线而不是先撞上请求超时，它会被强关而不是被正常判超时，`drain_forced_timeout` 与 S4 的超时计数就会互相冒充。S4 定义请求超时之前，5000 是**占位中值**；S4 落地时必须显式声明二者关系（调大默认值，或在 SLO/BENCHMARK 里写明"这条 SLO 场景下请求超时 ≤ drain"）。
+
+**多 worker 的协调顺序**（`ReactorGroup::request_drain`）：accept 循环被 eventfd 叫醒后，把 `request_drain(timeout_ms)` 下发给每个 worker → **继续在 accept 循环里空转，直到所有 worker 自行置上 `stop_requested_`，才 join**（"不再接受新连接"由 `accept_and_dispatch()` 自己按同一个原子标志判断，见上面那段）。这里刻意不用现成的 `stop_workers_and_join()`，因为它是**阻塞** join：joiner 停在第一条 worker 线程上，而那条 worker 的排水进度需要它自己的线程在跑——把 joiner 变成排水的依赖是错的形状（虽然这里不会死锁，但它会让"谁在推进排水"这件事说不清）。也没有做任何"排水完成"的投递：worker 排干后由**它自己的循环线程**置 `stop_requested_`，accept 线程只读那个原子量，所以 ADR-14 的跨线程接触面一个字节都没有变大。第二次 `stop()` 是运维意义上的硬停：置标志 + 敲门 + 通知所有 worker 立即硬停。
+
+**隧道只能硬关**——这是 ADR-09 的直接推论，不是偷懒。发出一条 WebSocket close 握手需要**认得帧**（close opcode、状态码、掩码、还要等对端的 close 回帧），而 ADR-09 定的正是"只透传、不解析帧"。所以网关能做且做的只有：把已经缓冲在手的隧道字节刷出去（`pump_tunnel` 两个方向各搬一次，只从下游那一侧动手——级联会带走配对上游，所以一条配对**关一次、计一次**），然后按 `kFlushThenClose` 关掉 socket。**客户端的表现是断线重连到下一个实例**，没有优雅握手可讲，我也不假装能优雅握手。这条边界写在这里而不是藏在代码注释里。
+
+**新观测面八个原子计数**（`stats.h`，共享一份、全 worker 聚合自动成立；每个都对应一种"没有它就只能靠我口头说"的失效）：
+
+| 计数 | 口径 | 它防的那句话 |
+|---|---|---|
+| `drain_requested` | **事件循环**进入排水的次数：单 Reactor = 1，多 Reactor = worker 数（accept 循环不持有连接、没有水可排，所以不计数）；第二次信号幂等重入 | "我等到点了才关的"其实是"我根本没开始等" |
+| `drain_in_flight_at_entry` | 每条循环**第一次扫描那一刻**带着在飞请求的下游条数之和（跨 worker `fetch_add`；`store` 版本会被最后扫完的那条循环覆盖成一个少报的数） | 排水到底等到了什么，还是只是碰巧没人 |
+| `drain_read_disarmed_at_entry` | 同一刻还停在没有 EPOLLIN 上的连接数（同样跨 worker 求和） | S1-07 那条进程侧证据会被排水本身抹掉，所以必须在这一刻取 |
+| `drain_closed_idle` | 因「在飞归零 + 缓冲为空」被立即关的下游条数 | "空闲连接立即关"到底关了几条 |
+| `drain_closed_buffered` | 因「在飞归零 + 只剩一条没被接受的完整请求」被关闭的条数 | 与上一条互斥可断言；"未接受"这件事要有账 |
+| `drain_tunnels_hard_closed` | 被硬关的隧道配对数（按下游侧计，一条配对一次） | 隧道是按硬关走的，不是走了优雅握手 |
+| `drain_forced_timeout` | 兜底强关的条数 | **这条不为 0 就意味着有客户端卡死**，是兜底生效的证据不是正常路径 |
+| `drain_rejected_new_connections` | 排水期间 accept 到、没构造连接对象就关掉的 fd 数 | "停止接受新连接"发生在连接对象这一层（监听 fd 留到析构），没这个计数就只剩我一句"我拒了" |
+
+**已知边界，照记不藏**：① `--serve-requests N` 仍是硬 break（它可能抢在最后一条响应送达之前退出，帮助文本一直明写着），排水只挂在信号/`request_drain()` 上；② 强关丢的是网关**出向里还没发出去的字节**，客户端看到截断——这是兜底的代价，写在上面那段而不是粉饰；③ 排水期间到达的新连接是**"连上就被关"**而不是 `ECONNREFUSED`（监听 fd 按设计留到析构，理由见上面 `fd_start == fd_end` 那一段）——`refused` 要等进程退出才成立，这一层差别是取舍的结果，不是遗漏；也没有"接进来再温柔地告诉它下线中"这一层，那是 S3 之后 connection draining 的事；④ 排水利弊的量化（排水耗时、100k 连接下排水要多久）归 S2-06/S2-07 的 `c100k.sh`，本任务只交正确性与可断言形状。
+
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -373,7 +441,8 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 - **多 Reactor（S2-01）：已实现，记录在 1.17。** 一个 acceptor + N 个 worker、round-robin 派发、连接单线程拥有、跨线程只传 fd（ADR-03 + ADR-14）。`ReactorStats` 全原子从 S1 起就是给这一刻留的基线，现在它被全 worker 共享一份；六步关闭 + `retiring_` 与 S1 完全一致（连接的 `shared_ptr` 全在 owner worker 内，析构必然在 owner 线程）。
 - **上游连接池（S2-02）：已实现，记录在 1.18（ADR-15）。** per-worker、借还按下游生命周期、隧道不入池、`pool_max_idle` 硬上界、空闲 EOF 淘汰（不误计截断）。**关键：选 per-worker 让池没有打破 ADR-14 的单线程拥有**——上游连接始终归它的 owner worker 独占，所以"一条上游被非 owner 线程借出/归还/淘汰"那批跨线程异步销毁的 harder 情形**没有出现**。这直接把 S2-03 的担子减轻了：它现在主要验"停 stop 时的收尾竞态 + 把已实现的无竞争性质钉成 TSan 断言"，而不是从零处理一个 shared 池的跨线程销毁。**S2-03 已用红队用例（`S2_03_CrossThreadDestruction` 三条）+ 摘锁阳性验证定稿了 ADR-14 的销毁协议章**：per-worker 下连接的 `shared_ptr` 持有者全在 owner 线程内、析构永远在 owner 线程，跨线程只流动裸 fd；那次"摘掉 handoff 锁 → TSan 报 14 处 race → 还原"的反证记在 FAULT-INJECTION §3。若 S3/S4 之后有证据要换 shared 池，那批 harder 情形才会真正到来（届时新写 ADR + 回 ADR-14 追加跨线程 retire 投递那套机制）。
 - **`filter/chain`（S1-08）**：已落地，记录在 1.16。当年那句验收——「新增 filter 不修改转发主路径的任何一行代码」——现在有可执行形式了：空链与两条放行 filter 的链，同一套流量的响应内容与七项计数逐项相等（`PassThroughFiltersChangeNothingInTheForwardingPath`）。留给后面的两笔返工也写在 1.16 末尾：路由要一个"目标上游"字段、响应方向要一个钩子，两者今天都没有读者，所以我不预先造字段。
-- **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写）。真正的服务生命周期（配置加载、优雅排水、指标暴露）都不在 S1 范围里。
+- **优雅停止 / 排水（S2-05）：已实现，记录在 1.20。** 留给后面两件事的口径：排水线是"**已转发给配对上游的请求**"（`in_flight_requests_ > 0`），不是"字节已经进网关"；`--drain-timeout-ms` 是兜底不是承诺，且**必须 ≥ S4 的请求超时**（S4 落地时要么调大默认值，要么显式声明二者关系）；隧道只能硬关（ADR-09 不解析帧 → 发不出 WS close 握手）。
+- **`--serve` 还不是产品形态**：`--serve-requests` 是"解析满 N 条就停循环"，它可能在最后一条响应送达之前就 break（帮助文本里明写；排水只挂在信号/`request_drain()` 上）。配置加载与指标暴露仍不在 S2 范围里（S5）。
 
 ## 4. 已知噪声与待补项
 
@@ -413,6 +482,8 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | 级联关闭把刚排进配对的 502 当残留字节丢掉 | `kDiscardOutbound` 的传染性；`close_connection` 的"同一种 why"会传给对端 | `fail_pair_with_reply` 先手工解链再分别关；`S1_06_Reactor.UpstreamDyingBeforeAnyResponseGetsDefined502`（ARCH 1.14） |
 | 空闲池内上游被对端正常关闭，却被计成 `upstream_truncated_before_head` 还朝不存在的下游发 502 | `on_upstream_event` 的 EOF 分支默认"上游总有配对下游"；池化后空闲上游 `peer_fd` 无效、没有下游可表态 | EOF 分支开头 `peer_fd==kInvalidFd` 短路成"淘汰"；`S2_02_UpstreamPool.IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation`（ARCH 1.18） |
 | 一批 pipelined 请求里带 `Connection: close` 的那条在**第一条**响应完结就把配对关了，400 条只兑现 1 条响应 | `pump_response` 的 `kComplete` 只读一个 `close_after_response()` 布尔，不区分"完结的是第几条响应"；且 `forward_pending_requests_body` 的 close 检查只在入口、一批里 close 之后的请求还会被转出去 | 在飞请求计数（`in_flight_requests_`，转发 +1 / 完结 −1），close 只在"布尔为真且归零"时兑现 + 循环体内查 `close_after_forward`；`S2_04_Pairing.CloseInMiddle/CloseAtEnd`（旧条件下这两条会红，ADR-16） |
+| 隧道的硬关计数是 0，而配对明明被关了（数字看着像"根本没走硬关这条分支"） | 排水扫描按 fd 顺序遍历注册表，**先扫到上游侧**就直接关它——级联把下游一起带走，于是那条"按下游侧计一次"的分支一次都没走到 | 隧道分支里上游侧只在"下游已经不在了"时才自己关（`peer_of()!=nullptr` 就 continue）；`S2_05_GracefulStop.TunnelIsHardClosedWithoutAFabricatedCloseHandshake` 同时断 `drain_tunnels_hard_closed==1` 与 `drain_forced_timeout==0`——把那条分支摘掉，两个 EXPECT 一起红（实测 1.26s 后兜底接管） |
+| 跨 worker 的排水快照只报 1，实际是 3/6 条（少报，不是多报） | `ReactorStats` 是**全 worker 共享一份**（ADR-14 第 4 条），而快照写成了 `store()` —— 最后扫完的那条 worker 把前面所有 worker 的数覆盖掉。单 Reactor 下这个 bug 完全看不见 | 快照一律 `fetch_add`（每条循环第一次扫描各加自己的读数）；`S2_05_GracefulStop.GroupDrainQuiescesEveryWorker...` 断 `drain_in_flight_at_entry==6`、冒烟阶段五断 `==3` 且 `drain_requested==3`（等于 worker 数）——用 `store` 时这两个数当场变成 1/2 |
 
 ### 测试自己写的错，比实现的错更难发现
 
@@ -433,11 +504,14 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | 现象 | 根因 | 防复发的断言 |
 |---|---|---|
 | 报告里 p50…p99 全空、增量被算成 **0.000 ms** | wrk 的 `Latency Distribution` 整行缩进两个空格，锚写成顶格 | `s1-p99.sh` 的 `/^[ \t]*Latency Distribution[ \t]*$/` 锚 + 解析失败即 `die`（BENCHMARK B-001） |
-| `fd_end=351`、`live_connections=342` 被当成泄漏 | 1000 并发还在跑就 SIGTERM；网关停止语义不排水在飞连接 | 静置 5 s 后**断言**归零（`fatal` 不是 `warn`）：`s1-p99.sh`、`s2-qps-vs-nginx.sh` 生命周期段 |
+| `fd_end=351`、`live_connections=342` 被当成泄漏 | 1000 并发还在跑就 SIGTERM；**当时**的停止语义不排水在飞连接（S2-05 起 SIGTERM 走排水，见 1.20；但这条坑的成因不是"没排水"，是**拿我杀进程的时机当观测条件**，所以脚本的写法一条没改） | 静置 5 s 后**断言**归零（`fatal` 不是 `warn`）：`s1-p99.sh`、`s2-qps-vs-nginx.sh` 生命周期段；排水侧的正向断言在 `scripts/smoke-s2-05.sh` 五阶段 |
 | 只发了 1 个请求，退出码 0、耗时 0.02 s | `{1..10000}` 是 bash 的 brace expansion，curl 的 glob 只认 `[1-N]`/`{a,b,c}`，原样当路径吞了 | `smoke-s1-04.sh` 里那句 `requests_parsed == 10000` 断言（TASKS 卡点二） |
 | 一档崩了 5,622 条非 2xx，脚本仍然退出码 0 | `fatal` 写在 `$(...)` 命令替换的子 shell 里，`exit` 只结束子 shell | `run_wrk` 改 `return 1` + 每个调用点自己 `|| fatal`：`s2-qps-vs-nginx.sh`（BENCHMARK B-005） |
 | 单 worker 的 nginx 档测的是"被自己的连接上限打死" | `upstream keepalive` 池**按 worker 计**，1 worker 时 128 撑不住 1000 并发 | 池抬到 1024 且所有档共用同一份配置文本：`s2-qps-vs-nginx.sh` 的 `write_nginx_conf`（B-005） |
 | 从 Windows 侧编辑过的脚本跑不了 / `unexpected condition` | UNC 编辑丢执行位、带进 CRLF；`sed -i` 还会新建文件把 `chmod +x` 抹掉 | 提交固化 100755 + `file x.sh` 查 CRLF（`bash -n` 验不出行尾）：TASKS 交接段纪律二 |
+| 冒烟脚本跑到一半**静悄悄退出**（rc=13，日志里一行 `✗` 都没有，看着像"这步没输出"而不是"失败了"） | 阶段五往"排水刚 accept 完就关掉"的那个 socket 写 → 下一次写拿 EPIPE → **SIGPIPE 把非交互 shell 直接打死**。A/B（唯一差别是 `trap '' PIPE` 在不在）：有 trap 连跑 6 次 rc=0；没它连跑 3 次里 2 次死在阶段五开头 | `scripts/smoke-s2-05.sh` 顶部 `trap '' PIPE`，另加 **DONE 哨兵**：`REACHED_END` 没置位时 EXIT trap 必须打一句"脚本提前终止——这不是通过"并把 `FAILED` 置 1。归因到 SIGPIPE 只有这次 A/B 一层证据（我构造的两写最小样本里 shell 活下来了），所以那句话按这个强度读，不写成已证实的机制 |
+| 三条用例一起红在"字节数对不上"，而网关是对的 | 用 `grep -abo $'\r\n\r\n'` 找头部区终止串——**grep 按行工作，模式里的 `\n` 让它跨不了行**，报出来的是行内偏移不是文件偏移，我拿它算了头长 | `head_len_of()` 改成"整档读成一条记录 + `index()`"（RS 取一个文件里绝不出现的串）；防复发的形式是阶段四那条**等式**断言（总字节 == 头长 + 2048）：偏移一错，等式当场不成立而不是悄悄通过 |
+| 脚本在阶段一中间静悄悄退出、rc=127 | 关 fd 写成 `exec {1}>&-`：`{1}` 不是变量名，bash 把它当**文件名**去重定向，而 exec 的重定向失败会带走非交互 shell | 先校验是纯数字再 `eval "exec $fd>&-"`；同一条 DONE 哨兵兜住任何这类早退（`scripts/smoke-s2-05.sh`） |
 | 仓库搬家后 7 个脚本全部 `exit 1`，`env-snapshot` 的 ext4 证据行读的是死路径 | 脚本开头硬编码 `cd /home/archer/l7gate`，`findmnt -T` 也写死了同一个绝对路径 | **结构上消除**：改成由脚本自身位置推导（`cd "$(dirname "$(readlink -f "$0")")/.."`）、`findmnt -T .`。这一条的**第三条缺**——没有任何断言管"仓库能不能换位置"，只有搬家当天的一次全量复跑（三 preset 112/112 + 三个冒烟全绿）证明它当时成立 |
 | 一档测出 3,148.41 QPS（正常值的三分之一），只因为它是"对照组"就看着无害 | Docker Desktop 的 WSL Integration 当天掉过两次线，引擎正在退出时 wrk 照样能发完 60 s 并交出一个**语法完全合法**的读数 | 作废轮留档不进表、比值异常先查**被测方那一轮的绝对值**（B-005 附 第二条）；`s2-qps-vs-nginx.sh` 只在镜像缺失时拒绝。**这一条的第三条只有一半**——脚本能证明"基线容器起来了"，证不了"这台机器的容器路径此刻没有退化"；补法要么在每档前断言 `docker info` 与引擎启动时间，要么靠取样规程的两轮复现兜住（目前选的是后者） |
 | 一条从没核验过的断言活了半天，还复制进了十处文档："`ulimit -n`=10240 是 100k 的硬前置，要环境侧解决" | 只读了 `ulimit -n` 的 **soft** 值，没读 hard、没读 `fs.file-max`、**没试过一次抬升**；`ENVIRONMENT.md` 第 2 节的快照里本来就有 `ip_local_port_range=32768–60999`，我也没把它算成端口数 | 2026-10-27 实测：`ulimit -Hn`=1048576、`bash -c 'ulimit -n 300000'` **当场成功**、`fs.file-max`=9.2e18 → soft 可自抬，**它不是环境阻塞项**；100k 的真前置是**临时端口只有 28,232 个**。十处措辞已就地更正并留删除线，取证在 `ENVIRONMENT.md` 第 7 节。**这一条的第三条缺**——没有断言管"文档里的环境断言核验过没有"；防复发的规矩：写"必须由环境侧解决"之前，必须同时给出 soft/hard 两个值和一次真实的抬升尝试结果 |

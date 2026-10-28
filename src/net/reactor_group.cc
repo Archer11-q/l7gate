@@ -3,6 +3,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <system_error>
 #include <utility>
@@ -112,10 +113,16 @@ std::uint64_t ReactorGroup::run() {
   }
 
   std::uint64_t batches = 0;
+  bool drain_dispatched = false;
   // accept 循环跑在调用线程上（生产里是主线程，ADR-03「主线程 accept」）。
   while (!stop_requested_.load(std::memory_order_acquire)) {
     int error = 0;
-    const int n = accept_epoll_.wait(config_.wait_timeout_ms, &events_, &error);
+    // 排水期间把等待上限收紧到 50ms：worker 全部排干之后 accept 循环要能立刻发现，
+    // 而不是等满 config_.wait_timeout_ms（生产里 200ms）——下线时间是被这条兜住的。
+    const int wait_ms = drain_requested_.load(std::memory_order_relaxed)
+                            ? std::min(config_.wait_timeout_ms, 50)
+                            : config_.wait_timeout_ms;
+    const int n = accept_epoll_.wait(wait_ms, &events_, &error);
     if (n < 0) break;  // accept_epoll_ 坏了：继续只会让后面的数字不可信
     if (!events_.empty()) {
       for (const auto& ev : events_) {
@@ -133,6 +140,25 @@ std::uint64_t ReactorGroup::run() {
         stats_->requests_parsed.load(std::memory_order_relaxed) >= config_.stop_after_requests) {
       break;
     }
+
+    // S2-05：优雅停止。**先下发、后等齐**，两步都在这一条循环里做。
+    if (drain_requested_.load(std::memory_order_acquire)) {
+      if (!drain_dispatched) {
+        // 「不再接受新连接」由 accept_and_dispatch() 自己按 drain_requested_ 判：
+        // accept 到就关掉那条 fd、不再 handoff。**不关监听 fd**——理由写在
+        // Reactor::accept_all 的注释里（fd_start==fd_end 是全项目的生命周期地基）。
+        const std::int64_t timeout_ms = drain_timeout_ms_.load(std::memory_order_relaxed);
+        for (auto& worker : workers_) {
+          if (worker) worker->request_drain(timeout_ms);
+        }
+        drain_dispatched = true;
+        continue;  // 本轮只负责下发，下一条判断从下一轮开始
+      }
+      // 每个 worker 排干之后会**自己**置上 stop_requested_（那是它循环线程的最后一步），
+      // 所以这里只需要读那个原子量，不需要任何完成投递。用阻塞 join 等它们会挡住
+      // accept 线程本身——而 worker 的进度需要它自己的线程在跑。
+      if (all_workers_stop_requested()) break;
+    }
   }
 
   stop_workers_and_join();
@@ -148,7 +174,34 @@ void ReactorGroup::stop() noexcept {
   (void)rc;
 }
 
+void ReactorGroup::request_drain(std::int64_t timeout_ms) noexcept {
+  if (stop_requested_.load(std::memory_order_relaxed)) return;  // 已经在退出路上
+  const bool first = !drain_requested_.exchange(true, std::memory_order_relaxed);
+  if (first) {
+    drain_timeout_ms_.store(timeout_ms, std::memory_order_relaxed);
+  }
+  // 只做 async-signal-safe 的那一件事：敲 accept 循环的门。真正做事的是 run() 里
+  // 那条循环——它关掉监听 fd、把排水下发给 worker、然后等它们各自报"排干了"。
+  const std::uint64_t one = 1;
+  ssize_t rc = ::write(accept_wake_fd_.get(), &one, sizeof(one));
+  (void)rc;
+}
+
+bool ReactorGroup::all_workers_stop_requested() const noexcept {
+  // 只读每个 worker 的**原子**停止标志，所以 accept 线程在循环里查它是合法的。
+  // worker 自己排干之后由它自己的循环线程置上这个标志（Reactor::run 的排水分支），
+  // 因此这里不需要任何"排水完成"的投递队列——跨线程接触面没有变大。
+  for (const auto& worker : workers_) {
+    if (worker && !worker->stop_requested()) return false;
+  }
+  return true;
+}
+
 void ReactorGroup::accept_and_dispatch() {
+  // 排水期间：照旧把 accept 队列排空（ET 的监听事件只报一次，不排空就是滞留），
+  // 但每一条新连接**不构造 Connection、不 handoff**，随 accepted 出作用域就被关掉。
+  // 与 Reactor::accept_all 同一条动作、同一个理由（那边注释记着为什么不关监听 fd）。
+  const bool draining = drain_requested_.load(std::memory_order_relaxed);
   while (true) {
     AcceptOutcome accepted = accept_connection(listener_.get());
     if (!accepted.ok()) {
@@ -158,6 +211,10 @@ void ReactorGroup::accept_and_dispatch() {
       // EMFILE/ENFILE 一类：进程级 fd 耗尽，继续循环是忙等。accept_errors 替我说话。
       stats_->accept_errors.fetch_add(1, std::memory_order_relaxed);
       return;
+    }
+    if (draining) {
+      stats_->drain_rejected_new_connections.fetch_add(1, std::memory_order_relaxed);
+      continue;
     }
     if (workers_.empty()) return;  // 不该发生（start_listen 至少建 1 个）
     // round-robin：第 k 条 accept 交给 worker[k mod N]。确定性、可断言均衡（ADR-14 第 3 条）。

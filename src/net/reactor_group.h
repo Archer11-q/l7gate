@@ -33,8 +33,18 @@ namespace l7gate::net {
 // N 条 worker 线程。所以总线程数 = 1 + N，与 ADR-03「主线程 accept + N 个 Reactor
 // 线程」逐字对上。
 //
-// 停止语义沿用 S1（停止接受 + 退出循环，**不排水在飞连接**）：stop() 让 accept 循环
-// 退出，run() 随后 stop 所有 worker 并 join。真正的排水 + 超时兜底是 S2-05。
+// 停止有两条路（S2-05，ARCHITECTURE 1.20）：
+//   **stop()** = 硬停，S1 语义原样保留——accept 循环退出，run() 随后 stop + join
+//   所有 worker，在飞连接不被收尾（交给 ~Reactor）。既有测试与 `--serve-requests`
+//   走的都是这条路，所以 S1/S2-04 的生命周期断言一条没改。
+//   **request_drain(timeout_ms)** = 优雅停止：把排水下发给每个 worker，然后**继续在
+//   accept 循环里空转**，直到每个 worker 都自行置上 stop_requested_（排水完成或兜底
+//   到点）才 join。"不再接受新连接"落在 accept_and_dispatch()：排水期间 accept 到就把
+//   那条 fd 关掉，而**监听 fd 留到析构**（理由与代价写在 Reactor::accept_all 的注释里）。
+//   这里刻意不用现成的 stop_workers_and_join()：它是阻塞 join，会把 joiner 变成
+//   排水的依赖——而 worker 的排水进度需要它自己的线程在跑。
+//   排水期间再收到一次 stop() 就是运维意义上的"别再等了"：accept 循环退出，
+//   run() 对每个 worker 走硬停。
 class ReactorGroup {
  public:
   struct Config {
@@ -78,12 +88,22 @@ class ReactorGroup {
 
   // 跨线程调用（信号 handler / 测试主线程）：只做两件 async-signal-safe 的事——
   // 置 stop_requested_、写 accept 侧 eventfd。worker 的停止与 join 在 run() 里做。
+  // **硬停**（S1 语义）：不排水。排水用 request_drain()。
   void stop() noexcept;
+
+  // S2-05（ARCHITECTURE 1.20）：**优雅停止**。跨线程纪律与 stop() 同一条——只做
+  // 原子 store + 写 accept 侧 eventfd，不碰任何 worker 的循环内状态。
+  // 被叫醒的 accept 循环负责：把 request_drain() 下发给每个 worker，然后在自己的
+  // 循环里等到**每个 worker 都自行置上 stop_requested_**（各自的排水各自完成）才退出
+  // 并 join。"不再接受新连接"落在 accept_and_dispatch()：accept 到就关掉那条 fd，
+  // 而监听 fd 留到析构（理由写在 Reactor::accept_all 的注释里）。
+  void request_drain(std::int64_t timeout_ms) noexcept;
 
   int listen_port() const noexcept { return listen_port_; }
   int worker_count() const noexcept { return static_cast<int>(workers_.size()); }
   bool running() const noexcept { return running_.load(std::memory_order_relaxed); }
   bool stop_requested() const noexcept { return stop_requested_.load(std::memory_order_relaxed); }
+  bool drain_requested() const noexcept { return drain_requested_.load(std::memory_order_relaxed); }
 
   ReactorStats& stats() noexcept { return *stats_; }
   const ReactorStats& stats() const noexcept { return *stats_; }
@@ -103,6 +123,10 @@ class ReactorGroup {
  private:
   void accept_and_dispatch();
   void drain_accept_wake();
+  // 每个 worker 都自己置上了 stop_requested_（排水完成或兜底到点）。
+  // 只读原子量，所以 accept 线程在循环里查它是合法的——这也是本组不需要
+  // 任何"排水完成"投递队列的原因。
+  bool all_workers_stop_requested() const noexcept;
   // stop 所有 worker + join 所有线程。幂等：run() 末尾调一次，~ReactorGroup 再调
   // 一次兜底（run() 没被调用、或中途抛异常时线程不会带着未 join 的状态被析构）。
   void stop_workers_and_join();
@@ -125,6 +149,12 @@ class ReactorGroup {
   std::atomic<std::size_t> rr_counter_{0};
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
+  // 排水请求与它的兜底窗口。两个都是原子：request_drain() 可能来自信号 handler 或
+  // 测试线程，而读它们的是跑 accept 循环的调用线程。窗口存的是**毫秒数**（不是绝对
+  // 时刻），因为下发给每个 worker 的那一刻才由 worker 各自换算成自己的 deadline——
+  // 换算点越靠近实际干活的那条线程，多个 worker 之间的"同时到点"就越不是假话。
+  std::atomic<bool> drain_requested_{false};
+  std::atomic<std::int64_t> drain_timeout_ms_{0};
   std::vector<Epoll::Event> events_;
 };
 

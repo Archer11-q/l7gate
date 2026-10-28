@@ -138,6 +138,52 @@ struct ReactorStats {
   std::atomic<std::uint64_t> pool_returns{0};
   std::atomic<std::uint64_t> pool_evictions_eof{0};
   std::atomic<std::uint64_t> pool_evictions_full{0};
+
+  // --- S2-05：优雅停止（排水）的观测面 ---------------------------------------
+  // 这八个数存在的理由是同一条：「停止之后什么都没留下」这句话，只靠
+  // live_connections==0 是证不了的——硬停（S1 语义）之后它也可能恰好是 0（客户端
+  // 正好都走了）。要区分"我等的"和"我碰巧没赶上"，就得把**等什么、等到了什么、
+  // 什么没等到**分别落账。口径写死在下面每一行。
+  //   drain_requested            —— **事件循环**进入排水的次数：单 Reactor 里是 1，
+  //                                多 Reactor 里等于 worker 数（每个循环各计一次，
+  //                                accept 循环不计数——它不持有连接，没有水可排）。
+  //                                第二次信号是幂等重入，不重复计、也不重设 deadline。
+  //   drain_in_flight_at_entry   —— 每条循环**第一次扫描那一刻**带着在飞请求的下游条数
+  //                                之和（跨 worker 用 fetch_add 聚合；store 版本会被
+  //                                最后扫完的那条循环覆盖掉，那是个少报的数）。
+  //                                只在那一刻取一次，所以它是"停止时手上有什么"的快照，
+  //                                不是每轮扫描的累加（累加版会把同一个等待数 N 遍）。
+  //   drain_closed_idle          —— 因「在飞归零且入向缓冲为空」被立即关闭的下游条数。
+  //                                SLO #2 那 100k 空闲长连接的下线时间就压在这条上。
+  //   drain_closed_buffered      —— 因「在飞归零但缓冲里还有字节」被关闭的下游条数，
+  //                                那些字节按口径属于**尚未接受**的请求，不回源、不表态。
+  //                                与上一条互斥可断言（同一条连接只会落进其中一个）。
+  //   drain_tunnels_hard_closed  —— 被硬关的隧道配对数（按下游侧计，一条配对一次）。
+  //                                ADR-09 不解析帧 → 发不出 WS close 握手，这是已知边界。
+  //   drain_forced_timeout       —— 排水超时兜底强关的连接条数（含"到点仍没刷完出向"的
+  //                                收尾中连接）。**这条不为 0 就意味着有客户端卡死**，
+  //                                它是兜底生效的证据，不是正常路径。
+  //   drain_read_disarmed_at_entry —— **第一次扫描那一刻**还停在没有 EPOLLIN 状态上的
+  //                                连接数（S1-07 那个"网关不再消费下游可读事件"的观测，
+  //                                换成排水启动时的原子快照）。这条存在的理由很具体：
+  //                                排水会把那条卡住的连接也收尾，于是循环停下之后
+  //                                `read_disarmed_connections` 回 0 —— 如果只在停下之后
+  //                                读，S1-07 在进程侧唯一那份直接证据就会被 S2-05 自己
+  //                                抹掉。快照由**循环线程自己**取（它有权读注册表），
+  //                                所以它不是"跨线程读非原子量"那一类 race。
+  //   drain_rejected_new_connections —— 排水期间 accept 到、没构造连接对象就关掉的
+  //                                fd 数。「停止接受新连接」必须有一个可断言的形态：
+  //                                监听 fd 按设计留到析构（见 ARCHITECTURE 1.20 的
+  //                                fd_start==fd_end 那段），所以"拒"发生在连接对象这一层，
+  //                                没有这个计数就只剩我一句"我拒了"。
+  std::atomic<std::uint64_t> drain_requested{0};
+  std::atomic<std::uint64_t> drain_in_flight_at_entry{0};
+  std::atomic<std::uint64_t> drain_closed_idle{0};
+  std::atomic<std::uint64_t> drain_closed_buffered{0};
+  std::atomic<std::uint64_t> drain_tunnels_hard_closed{0};
+  std::atomic<std::uint64_t> drain_forced_timeout{0};
+  std::atomic<std::uint64_t> drain_read_disarmed_at_entry{0};
+  std::atomic<std::uint64_t> drain_rejected_new_connections{0};
 };
 
 }  // namespace l7gate::net
