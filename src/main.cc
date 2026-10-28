@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "core/build_info.h"
 #include "net/reactor.h"
@@ -27,7 +28,7 @@ void usage(std::FILE* out) {
   std::fprintf(out,
       "l7gate —— L7 流量治理网关（开发中）\n"
       "用法: l7gate --self-check\n"
-      "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>\n"
+      "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>[,<ipv4:port>...]\n"
       "               [--serve-requests N] [--max-connections N]\n"
       "               [--high-water-mark BYTES] [--workers N] [--drain-timeout-ms MS]\n"
       "\n"
@@ -135,6 +136,33 @@ bool parse_addr_port(std::string_view spec, std::string* addr, std::uint16_t* po
   }
   *port = static_cast<std::uint16_t>(value);
   return !addr->empty();
+}
+
+using UpstreamEndpoint = l7gate::net::ReactorGroup::Config::UpstreamEndpoint;
+
+// S2-06a（ADR-17 候选 A）：`--upstream a:1,b:1,c:1` → 端点列表。任何一段非法就整体失败：
+// 配置写错不该退化成"少连一个上游"那种安静形态，而它在观测上和"回源元组耗尽"长得太像了
+// （两者最后都表现为 established < planned）。
+bool parse_upstream_list(std::string_view spec, std::vector<UpstreamEndpoint>* out) {
+  for (;;) {
+    const std::size_t comma = spec.find(',');
+    const std::string_view item = comma == std::string_view::npos ? spec : spec.substr(0, comma);
+    std::string address;
+    std::uint16_t port = 0;
+    if (!parse_addr_port(item, &address, &port)) return false;
+    out->push_back(UpstreamEndpoint{std::move(address), port});
+    if (comma == std::string_view::npos) return true;
+    spec = spec.substr(comma + 1);
+  }
+}
+
+std::string join_upstream_list(const std::vector<UpstreamEndpoint>& endpoints) {
+  std::string text;
+  for (const UpstreamEndpoint& endpoint : endpoints) {
+    if (!text.empty()) text += ',';
+    text += endpoint.address + ':' + std::to_string(endpoint.port);
+  }
+  return text;
 }
 
 bool parse_number(const char* text, long long* out) {
@@ -256,6 +284,7 @@ int serve(int argc, char** argv) {
   long long drain_timeout_ms = 5000;
   bool have_listen = false;
   bool have_upstream = false;
+  std::vector<UpstreamEndpoint> upstream_endpoints;
 
   for (int i = 2; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -268,8 +297,8 @@ int serve(int argc, char** argv) {
       have_listen = true;
       ++i;
     } else if (flag == "--upstream" && value != nullptr) {
-      if (!parse_addr_port(value, &config.upstream_address, &config.upstream_port)) {
-        std::fprintf(stderr, "参数错误: --upstream 要的是 <ipv4:port>，收到 %s\n", value);
+      if (!parse_upstream_list(value, &upstream_endpoints)) {
+        std::fprintf(stderr, "参数错误: --upstream 要的是 <ipv4:port>[,<ipv4:port>...]，收到 %s\n", value);
         return 2;
       }
       have_upstream = true;
@@ -347,14 +376,19 @@ int serve(int argc, char** argv) {
     std::fprintf(stderr, "参数错误: --serve 需要同时给 --listen 和 --upstream\n");
     return 2;
   }
+  // 单 Reactor 路径（workers < 2）只有一条循环，所以它只会用到第 0 个端点：这一跳的容量
+  // 还是 min(1, E) × 单元组容量 = 28,232，与给了几个端点无关。给它加"一条循环轮换多端点"
+  // 就是按请求选目标，那是 S3 的路由，不在这里预支（ADR-17 候选 A 的边界）。
+  config.upstream_address = upstream_endpoints[0].address;
+  config.upstream_port = upstream_endpoints[0].port;
+  const std::string upstream_list = join_upstream_list(upstream_endpoints);
 
   // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
   if (workers >= 2) {
     l7gate::net::ReactorGroup::Config gconfig;
     gconfig.listen_address = config.listen_address;
     gconfig.listen_port = config.listen_port;
-    gconfig.upstream_address = config.upstream_address;
-    gconfig.upstream_port = config.upstream_port;
+    gconfig.upstream_endpoints = upstream_endpoints;
     gconfig.listen_backlog = config.listen_backlog;
     gconfig.worker_count = workers;
     gconfig.max_connections_per_worker = config.max_connections;
@@ -379,11 +413,11 @@ int serve(int argc, char** argv) {
     const std::int64_t fd_start = count_open_fds();
     const std::int64_t rss_start = current_rss_kib();
     std::printf("[serve] 监听 %s:%d（workers=%d backlog=%d max_connections_per_worker=%zu "
-                "upstream=%s:%u stop_after_requests=%zu wait_timeout_ms=%d high_water_mark=%zu "
-                "drain_timeout_ms=%lld）\n",
+                "upstream=%s upstream_endpoints=%zu stop_after_requests=%zu wait_timeout_ms=%d "
+                "high_water_mark=%zu drain_timeout_ms=%lld）\n",
                 gconfig.listen_address.c_str(), group.listen_port(), workers, gconfig.listen_backlog,
-                gconfig.max_connections_per_worker, gconfig.upstream_address.c_str(),
-                gconfig.upstream_port, stop_after_requests, gconfig.wait_timeout_ms,
+                gconfig.max_connections_per_worker, upstream_list.c_str(), upstream_endpoints.size(),
+                stop_after_requests, gconfig.wait_timeout_ms,
                 gconfig.connection.inbound.high_water_mark, drain_timeout_ms);
     std::fflush(stdout);
 

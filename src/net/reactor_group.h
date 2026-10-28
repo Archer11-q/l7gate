@@ -51,8 +51,21 @@ class ReactorGroup {
     std::string listen_address = "127.0.0.1";
     // 0 表示由内核选端口；测试全靠它避免端口撞车。
     std::uint16_t listen_port = 0;
-    std::string upstream_address = "127.0.0.1";
-    std::uint16_t upstream_port = 0;
+
+    // S2-06a（ADR-17 已裁候选 A）：回源端点列表。**第 i 条 worker 只用第 i mod E 个端点**
+    // （E = 列表长度），所以一条 worker 从头到尾只面对一个 (目的地址, 目的端口) 元组。
+    // 这条形状是选它而不是选"共享池 + 按请求选目标"的实际原因：ADR-15 的 per-worker 池
+    // 因此**仍然是单目标池**（`upstream_pool_` 不带目标键），不加锁、不扩大 ADR-14 的
+    // 跨线程接触面。它**不是**路由也不是负载均衡：那两者要按请求决定目标，归 S3。
+    // 容量账：这一跳能开出的连接数 = min(worker 数, E) × 单元组容量（本机实测 28,232），
+    // 所以 `--workers 1` 的单 Reactor 路径永远只用第 0 个端点（`main.cc` 里就是这么取的）。
+    struct UpstreamEndpoint {
+      std::string address = "127.0.0.1";
+      std::uint16_t port = 0;
+    };
+    // 空列表 = 没配上游（与 `Reactor::Config` 里 `upstream_port == 0` 同一口径，
+    // `ensure_upstream` 那条短路一致）。
+    std::vector<UpstreamEndpoint> upstream_endpoints;
 
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，

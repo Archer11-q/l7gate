@@ -84,8 +84,15 @@ bool ReactorGroup::start_listen(int* error) noexcept {
   if (n < 1) n = 1;
   for (int i = 0; i < n; ++i) {
     Reactor::Config wc;
-    wc.upstream_address = config_.upstream_address;
-    wc.upstream_port = config_.upstream_port;
+    // S2-06a（ADR-17 候选 A）：静态指派——worker i 拿第 i mod E 个端点，**一整轮进程生命
+    // 期都不换**。所以 `Reactor::Config` 侧看到的仍然是一个端点：`ensure_upstream` 不知道
+    // 列表存在，池不需要目标键，跨线程面也没变大（这三条就是"静态映射"买到的东西）。
+    if (!config_.upstream_endpoints.empty()) {
+      const auto& endpoint =
+          config_.upstream_endpoints[static_cast<std::size_t>(i) % config_.upstream_endpoints.size()];
+      wc.upstream_address = endpoint.address;
+      wc.upstream_port = endpoint.port;
+    }
     wc.max_connections = config_.max_connections_per_worker;
     wc.connection = config_.connection;
     wc.wait_timeout_ms = config_.wait_timeout_ms;

@@ -25,6 +25,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -36,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "net/epoll.h"
@@ -220,6 +223,14 @@ class BenchUpstream {
                 static_cast<unsigned long long>(responses_written_),
                 static_cast<unsigned long long>(bytes_written_),
                 static_cast<unsigned long long>(upgrades_));
+    // 每个目的地址各收到多少条（S2-06a 的容量账）。单独一行，且按键打印：既有的
+    // `uval` 那类"按 key 取值"的解析不受影响，新字段也不会挤掉旧字段的列序。
+    std::printf("[bench-upstream] accepted_by_addr=");
+    for (std::size_t i = 0; i < accepted_by_addr_.size(); ++i) {
+      std::printf("%s%s:%llu", i == 0 ? "" : ",", accepted_by_addr_[i].first.c_str(),
+                  static_cast<unsigned long long>(accepted_by_addr_[i].second));
+    }
+    std::printf("\n");
   }
 
  private:
@@ -252,6 +263,27 @@ class BenchUpstream {
         ++refused_addfail_;
         clients_.erase(fd);
         continue;
+      }
+      // S2-06a（ADR-17 候选 A）：记下这条连接落在**哪个目的地址**上。100k 那一档报告里的
+      // "每端点 25,000 条"必须是实测的，不能是 100k÷4 算出来的——当初我为了不用算术代替
+      // 结论，专门去实测了单元组容量 28,232（ADR-17「为什么」），同一把尺子量自己。
+      // 只在 --upgrade 形态下取：SLO #1 那条路径（B-001…B-006）一个 syscall 都不该多。
+      if (options_.upgrade) {
+        char text[INET_ADDRSTRLEN] = {};
+        sockaddr_in local = {};
+        socklen_t len = sizeof(local);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) == 0 &&
+            ::inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text)) != nullptr) {
+          bool counted = false;
+          for (auto& entry : accepted_by_addr_) {
+            if (entry.first == text) {
+              ++entry.second;
+              counted = true;
+              break;
+            }
+          }
+          if (!counted) accepted_by_addr_.emplace_back(std::string(text), std::uint64_t{1});
+        }
       }
       ++accepted_;
     }
@@ -359,6 +391,9 @@ class BenchUpstream {
   ListenerTag listener_tag_;
   std::uint16_t port_ = 0;
   std::uint64_t accepted_ = 0;
+  // 按目的地址分桶的 accept 数（S2-06a）。条目数 == 实际用上的端点数，最多 4 条，
+  // 所以线性查找比再引入一个 map 更清楚，也保证打印顺序就是第一次出现的顺序。
+  std::vector<std::pair<std::string, std::uint64_t>> accepted_by_addr_;
   // 两个"没接住"必须分开：一个是**容量**（说明这次压测的并发超过了工具的上限，
   // 数字要作废重跑），一个是 **epoll 注册失败**（说明工具自己坏了）。把它们
   // 记成同一个数，就等于把"我该调参"和"该修 bug"混成一条日志。

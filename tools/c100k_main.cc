@@ -744,6 +744,15 @@ class Client {
       }
     };
     dump("handshake", handshake_hist_);
+    if (options_.requests_per_conn == 0) {
+      // 观察者自己的账，隧道形态也要打印（闭环形态下面那一支本来就有这两个键）。
+      // 起因是一轮 100k **直连上游**的探针：established 冻在 60,958 达 75 秒、失败一路涨到
+      // 35,718，而上游那边 accepted=100000 / upgrades=100000 全服务成功——这一轮的结论本该
+      // 是"客户端算不过来"，可当时只有进度行的差分能反推它。ADR-17 写着"工具自报
+      // RSS/fd/CPU"，这一行才是把那句话落到两种形态上都成立。
+      std::printf("[c100k] elapsed_ms=%" PRId64 " self_cpu_ticks=%" PRId64 "\n",
+                  static_cast<std::int64_t>((last_tick_us_ - began_us_) / 1000), self_cpu_ticks());
+    }
     if (options_.requests_per_conn > 0) {
       // QPS 的分母是**吞吐窗口**（所有连接都活着之后的那段），不是进程活过的总时长：
       // 后者把 ramp 摊进去，1000 条连接那档会报出 18k/s，而真实窗口是 244k/s——

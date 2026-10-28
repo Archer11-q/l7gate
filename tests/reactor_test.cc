@@ -2019,7 +2019,10 @@ class GroupHarness {
     if (options.with_upstream) {
       if (!upstream_.start(why)) return false;
       upstream_.set_response_body_bytes(kBodyBytes);
-      config.upstream_port = upstream_.port();
+      // S2-06a：端点进了列表，一个 worker 拿一个（i mod E）。这里给 1 个端点，
+      // 所以既有 S2-01…S2-05 用例的拓扑与改动前逐字节相同。
+      config.upstream_endpoints.push_back(
+          ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", upstream_.port()});
     }
     config.listen_port = 0;  // 内核选端口：测试并行/重跑都不该撞车
     group_ = std::make_unique<ReactorGroup>(config);
@@ -3124,6 +3127,197 @@ TEST(S2_05_GracefulStop, GroupDrainQuiescesEveryWorkerAndDeliversEveryInFlightRe
   harness.shutdown_all();
 }
 
+// ===========================================================================
+// S2-06a：回源多端点 + per-worker 静态映射（ADR-17 已裁候选 A）
+// ===========================================================================
+//
+// 这一组只测一件事：**第 i 条 worker 的回源目的地址是第 i mod E 个端点，而且它一辈子只用
+// 那一个**。端点靠"响应体长度不同"来区分——两个 TestUpstream 各自 set_response_body_bytes
+// 一个不同值，客户端拿到多长的体就是被派到了哪个端点，不需要任何新的观测计数。
+//
+// 客户端落到哪条 worker 由 S2-01 的 round-robin 决定（`DispatchIsRoundRobinBalanced` 已把
+// 那条等式钉住），所以这里逐条 connect 并等 `downstream_accepted` 到位，把到达顺序也钉住，
+// 配对才不会变成"看起来对但顺序随机"的那种用例。
+
+// 起一个只回定制体长的上游，返回它的端口。两个端点靠 127.0.0.1 上的不同端口区分：
+// 被测的是"目标地址怎么指派"，不是"环回别名怎么解析"，用端口更干净。
+bool start_sized_upstream(TestUpstream* upstream, std::size_t body_bytes, std::string* why) {
+  if (!upstream->start(why)) return false;
+  upstream->set_response_body_bytes(body_bytes);
+  return true;
+}
+
+// 依次建 k 条连接、每条发一条请求、收一条响应，把每条的响应体长度交回来。
+bool drive_one_request_each(GroupHarness* harness, std::vector<Client>* clients,
+                            std::vector<std::size_t>* body_sizes, std::string* why) {
+  ReactorStats& stats = harness->group()->stats();
+  for (std::size_t i = 0; i < clients->size(); ++i) {
+    Client& c = (*clients)[i];
+    if (!c.connect_to(harness->port(), why)) return false;
+    // 钉住到达顺序：这条被 accept 之后才连下一条，所以 worker = i mod N 是确定的。
+    const std::uint64_t want = static_cast<std::uint64_t>(i + 1);
+    if (!wait_until([&] { return stats.load(stats.downstream_accepted) == want; }, 3000)) {
+      *why = "第 " + std::to_string(i) + " 条连接没有被 accept";
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < clients->size(); ++i) {
+    Client& c = (*clients)[i];
+    if (!c.write_all(request_text(i + 1))) {
+      *why = "conn " + std::to_string(i) + " 写请求失败";
+      return false;
+    }
+    std::string status;
+    std::string body;
+    if (!c.read_response(&status, &body, why)) return false;
+    if (status != "HTTP/1.1 200 OK") {
+      *why = "conn " + std::to_string(i) + " 状态码不是 200：" + status;
+      return false;
+    }
+    body_sizes->push_back(body.size());
+  }
+  return true;
+}
+
 }  // namespace
+
+// 一、最基本的形状：2 worker × 2 端点 → worker0 打端点 0、worker1 打端点 1。
+// 这条红了意味着映射错位（或者根本没生效，全部落到第 0 个端点——那正是改动前唯一的形态）。
+TEST(S2_06a_MultiEndpoint, EachWorkerUsesItsAssignedEndpoint) {
+  constexpr int kWorkers = 2;
+  constexpr std::size_t kFirstBody = 64;
+  constexpr std::size_t kSecondBody = 128;
+
+  std::string why;
+  TestUpstream first;
+  TestUpstream second;
+  ASSERT_TRUE(start_sized_upstream(&first, kFirstBody, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&second, kSecondBody, &why)) << why;
+
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", first.port()});
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", second.port()});
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::vector<Client> clients(2);
+  std::vector<std::size_t> sizes;
+  ASSERT_TRUE(drive_one_request_each(&harness, &clients, &sizes, &why)) << why;
+
+  ASSERT_EQ(sizes.size(), 2u);
+  EXPECT_EQ(sizes[0], kFirstBody) << "worker0 的下游拿到了别的端点的响应：静态指派错位";
+  EXPECT_EQ(sizes[1], kSecondBody) << "worker1 的下游拿到了别的端点的响应：静态指派错位";
+  EXPECT_EQ(first.requests_served(), 1u);
+  EXPECT_EQ(second.requests_served(), 1u);
+  ReactorStats& stats = harness.group()->stats();
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "两条 worker 各开一条上游，池不该在这里摊薄";
+
+  for (auto& c : clients) c.close();
+  harness.stop_loop();
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  first.stop_and_join();
+  second.stop_and_join();
+}
+
+// 二、`i mod E` 而不只是"前 E 条 worker 各拿一个"：4 worker × 2 端点 → 端点 0 拿到
+// worker 0 与 2，端点 1 拿到 worker 1 与 3。每端点恰好 2 条，容量公式的那个"均匀"
+// 因此不是我以为，是被断言过的。
+TEST(S2_06a_MultiEndpoint, MappingIsModuloSoEndpointsStayBalanced) {
+  constexpr int kWorkers = 4;
+  constexpr std::size_t kFirstBody = 64;
+  constexpr std::size_t kSecondBody = 128;
+
+  std::string why;
+  TestUpstream first;
+  TestUpstream second;
+  ASSERT_TRUE(start_sized_upstream(&first, kFirstBody, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&second, kSecondBody, &why)) << why;
+
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", first.port()});
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", second.port()});
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::vector<Client> clients(kWorkers);
+  std::vector<std::size_t> sizes;
+  ASSERT_TRUE(drive_one_request_each(&harness, &clients, &sizes, &why)) << why;
+
+  ASSERT_EQ(sizes.size(), static_cast<std::size_t>(kWorkers));
+  for (int i = 0; i < kWorkers; ++i) {
+    const std::size_t expected = (i % 2 == 0) ? kFirstBody : kSecondBody;
+    EXPECT_EQ(sizes[static_cast<std::size_t>(i)], expected)
+        << "worker " << i << " 应该用第 " << (i % 2) << " 个端点";
+  }
+  EXPECT_EQ(first.requests_served(), 2u);
+  EXPECT_EQ(second.requests_served(), 2u);
+
+  for (auto& c : clients) c.close();
+  harness.stop_loop();
+  harness.group()->stats();
+  harness.shutdown_all();
+  first.stop_and_join();
+  second.stop_and_join();
+}
+
+// 三、容量公式里那个不好看的边界：**端点数超过 worker 数时，多出来的端点一条都收不到**。
+// 2 worker × 3 端点 → 第 3 个端点服务数必须为 0（"配了但用不上"这件事要有账，否则报告里
+// 写 E=3 会让人以为容量是 3×28,232，而实际按 min(N, E) 算）。
+TEST(S2_06a_MultiEndpoint, EndpointsBeyondWorkerCountAreNeverUsed) {
+  constexpr int kWorkers = 2;
+  constexpr std::size_t kFirstBody = 64;
+  constexpr std::size_t kSecondBody = 128;
+  constexpr std::size_t kThirdBody = 192;
+
+  std::string why;
+  TestUpstream first;
+  TestUpstream second;
+  TestUpstream third;
+  ASSERT_TRUE(start_sized_upstream(&first, kFirstBody, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&second, kSecondBody, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&third, kThirdBody, &why)) << why;
+
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(kWorkers);
+  options.with_upstream = false;
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", first.port()});
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", second.port()});
+  options.config.upstream_endpoints.push_back(
+      ReactorGroup::Config::UpstreamEndpoint{"127.0.0.1", third.port()});
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  std::vector<Client> clients(kWorkers);
+  std::vector<std::size_t> sizes;
+  ASSERT_TRUE(drive_one_request_each(&harness, &clients, &sizes, &why)) << why;
+
+  ASSERT_EQ(sizes.size(), 2u);
+  EXPECT_EQ(sizes[0], kFirstBody);
+  EXPECT_EQ(sizes[1], kSecondBody);
+  EXPECT_EQ(third.requests_served(), 0u)
+      << "端点数 > worker 数时第 3 个端点不该被用到：容量按 min(N, E) 算，这条就是那句边界";
+  std::printf("[S2-06a capacity] workers=%d endpoints=3 → 只用上第 %d 个，第 3 个收到 %llu 条\n",
+              kWorkers, kWorkers, static_cast<unsigned long long>(third.requests_served()));
+
+  for (auto& c : clients) c.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  first.stop_and_join();
+  second.stop_and_join();
+  third.stop_and_join();
+}
+
 }  // namespace l7gate::net
 
