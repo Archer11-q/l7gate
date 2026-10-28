@@ -6,3 +6,8 @@
 
 add_executable(l7gate_bench_upstream bench_upstream_main.cc)
 target_link_libraries(l7gate_bench_upstream PRIVATE l7gate_core)
+
+# S2-06 / ADR-17：SLO #2 的 100k 长连接客户端。和上面同一个理由待在这里——它被构建、
+# 不被断言；契约 1.3 只允许"长连接场景"自研压测客户端，这一条就是那唯一一处许可的落地。
+add_executable(l7gate_c100k c100k_main.cc)
+target_link_libraries(l7gate_c100k PRIVATE l7gate_core)

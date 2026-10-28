@@ -14,6 +14,13 @@
 // 与网关同一条 ET 契约：读到一个 EAGAIN 才算这次可读事件处理完；写撞 EAGAIN 才挂
 // EPOLLOUT，刷完立刻摘掉。摘不干净的话 1000 条空闲连接会让这个进程自旋，
 // 而我把"上游 CPU 可忽略"当成压测结论的前提用着——前提必须由代码保证，不能由希望。
+//
+// `--upgrade`（S2-06，ADR-17）是 SLO #2 需要的另一种形态：**回一条完整的 101 头，然后
+// 这条连接上不再解析、不再回话**。SLO #2 的口径是"握手完成后进入空闲、不发业务帧"，
+// 只有隧道态能让两侧都真的什么都不做——普通 keep-alive 下网关还要跑响应框架泵，
+// 测出来的每连接内存就混进了"正在服务请求"的状态。默认（不加这个开关）与 S1 起
+// 每一轮 B-001…B-005 逐字节相同：这是可比性的前提，所以它是一条**新增的、必须显式
+// 选择的**分支，不是把原分支改个形状。
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -61,6 +68,10 @@ struct Client {
   std::size_t offset_in_response = 0;
   std::uint8_t match_state = 0;
   bool write_armed = false;
+  // --upgrade：101 头已排出。置了它之后这条连接只做两件事——把入向字节读干（ET 契约，
+  // 不读就是把自己灌爆）和在对端消失时收工。它不再数请求，因为隧道里的字节是 WS 帧，
+  // 拿 CRLFCRLF 去数等于伪造"还有请求要回"。
+  bool upgraded = false;
   // 一批事件里同一个 fd 可能出现两次（EPOLLIN|EPOLLOUT 合成一条，也可能被拆成
   // 两条）。中途 erase 会让后面那条拿着已析构的 Client* ——这是真 UAF，
   // 不是理论问题。所以这里只置 dead，退出事件批之后再统一 erase。
@@ -94,6 +105,7 @@ struct Options {
   std::size_t body_bytes = 1024;
   int max_clients = 4096;
   int backlog = 4096;
+  bool upgrade = false;  // true = 每条连接回一次 101 头后转为隧道态（SLO #2，ADR-17）
 };
 
 bool parse_addr_port(std::string_view spec, std::string* addr, std::uint16_t* port) {
@@ -145,6 +157,16 @@ class BenchUpstream {
                 "\r\nConnection: keep-alive\r\n\r\n";
     response_.append(options_.body_bytes, 'x');
 
+    // 101 头带合法的 Sec-WebSocket-Accept（RFC 6455 附录里的样例键值），网关的隧道判定
+    // 只看状态行（ADR-09：透传不裁决），但**对端**看的是整套——头不齐的话 c100k 那条
+    // "等 CRLFCRLF" 的判据永远不成立，测出来的是握手上限而不是隧道。
+    upgrade_response_ =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+        "\r\n";
+
     int error = 0;
     if (!epoll_.add(listener_.get(), EPOLLIN | EPOLLET, &listener_tag_, &error)) {
       *why = "epoll add listener errno=" + std::to_string(error);
@@ -186,15 +208,18 @@ class BenchUpstream {
   }
 
   void print_summary() const {
-    std::printf("[bench-upstream] accepted=%llu refused_over_capacity=%llu refused_addfail=%llu "
-                "peak_clients=%d max_clients=%d requests=%llu responses_written=%llu bytes_written=%llu\n",
+    std::printf("[bench-upstream] mode=%s accepted=%llu refused_over_capacity=%llu refused_addfail=%llu "
+                "peak_clients=%d max_clients=%d requests=%llu responses_written=%llu bytes_written=%llu "
+                "upgrades=%llu\n",
+                options_.upgrade ? "upgrade" : "normal",
                 static_cast<unsigned long long>(accepted_),
                 static_cast<unsigned long long>(refused_full_),
                 static_cast<unsigned long long>(refused_addfail_),
                 peak_clients_, options_.max_clients,
                 static_cast<unsigned long long>(requests_),
                 static_cast<unsigned long long>(responses_written_),
-                static_cast<unsigned long long>(bytes_written_));
+                static_cast<unsigned long long>(bytes_written_),
+                static_cast<unsigned long long>(upgrades_));
   }
 
  private:
@@ -239,9 +264,21 @@ class BenchUpstream {
         const ssize_t n = ::recv(client->fd.get(), buf, sizeof(buf), MSG_DONTWAIT);
         if (n > 0) {
           const std::size_t got = static_cast<std::size_t>(n);
+          // 隧道态：进来的字节按 WS 帧算，不是 HTTP 请求。数它会伪造出"还欠一条响应"，
+          // 而这条连接从此没人回话——那是最难查的一种"上游静默丢负载"。
+          if (client->upgraded) continue;
           const std::size_t found = client->count_requests(buf, got);
-          client->queued_responses += found;
-          requests_ += found;
+          if (options_.upgrade && found > 0) {
+            // 只兑现**第一条**：101 之后这条连接的角色就换成隧道了（ADR-09 不解析帧，
+            // 所以"第二条请求"在隧道里没有意义）。requests_ 因此按升级请求计一条。
+            client->upgraded = true;
+            client->queued_responses += 1;
+            ++upgrades_;
+            ++requests_;
+          } else {
+            client->queued_responses += found;
+            requests_ += found;
+          }
           continue;  // ET：读到 EAGAIN 才算这次可读事件处理完
         }
         if (n == 0) {
@@ -263,15 +300,17 @@ class BenchUpstream {
   void flush(Client* client) {
     if (client->dead) return;
     const int fd = client->fd.get();
+    // 载荷随角色换：升级态只有一张 101 头（无 body），普通态是那固定的 1 KiB 响应。
+    const std::string& payload = client->upgraded ? upgrade_response_ : response_;
     while (client->queued_responses > 0) {
-      const std::size_t remain = response_.size() - client->offset_in_response;
-      const ssize_t n = ::send(fd, response_.data() + client->offset_in_response, remain,
+      const std::size_t remain = payload.size() - client->offset_in_response;
+      const ssize_t n = ::send(fd, payload.data() + client->offset_in_response, remain,
                                MSG_NOSIGNAL | MSG_DONTWAIT);
       if (n > 0) {
         const std::size_t wrote = static_cast<std::size_t>(n);
         client->offset_in_response += wrote;
         bytes_written_ += wrote;
-        if (client->offset_in_response == response_.size()) {
+        if (client->offset_in_response == payload.size()) {
           client->offset_in_response = 0;
           --client->queued_responses;
           ++responses_written_;
@@ -312,6 +351,7 @@ class BenchUpstream {
 
   Options options_;
   std::string response_;
+  std::string upgrade_response_;  // --upgrade 时唯一排出的字节：那张 101 头
   net::UniqueFd listener_;
   net::Epoll epoll_;
   std::unordered_map<int, std::unique_ptr<Client>> clients_;
@@ -328,14 +368,17 @@ class BenchUpstream {
   std::uint64_t requests_ = 0;
   std::uint64_t responses_written_ = 0;
   std::uint64_t bytes_written_ = 0;
+  std::uint64_t upgrades_ = 0;  // --upgrade 下已兑现的 101 条数（应等于隧道连接数）
 };
 
 void usage(std::FILE* out) {
   std::fprintf(out,
-      "l7gate_bench_upstream —— SLO #1 的压测上游（固定 1 KiB 响应、单线程 epoll ET）\n"
+      "l7gate_bench_upstream —— 压测上游（固定 1 KiB 响应、单线程 epoll ET）\n"
       "用法: l7gate_bench_upstream [--listen <ipv4:port>] [--body-bytes N]\n"
-      "               [--max-clients N] [--backlog N]\n"
+      "               [--max-clients N] [--backlog N] [--upgrade]\n"
       "它只有一个能力：按请求回一段**每次一样**的字节。没有解析、没有按需分配、没有线程。\n"
+      "--upgrade 改的是回什么：每条连接的第一条请求回一张完整 101 头，之后只排空入向、\n"
+      "  不再按 HTTP 数（SLO #2 要的「握手后空闲」，ADR-17）。不加它时行为逐字节不变。\n"
       "不要拿它当功能测试的对端——故障形态（断在半路/坏框架/永不齐的头）在 tests/ 那个里。\n");
 }
 
@@ -362,8 +405,11 @@ int main(int argc, char** argv) {
       ++i;
     } else if (flag == "--max-clients" && value != nullptr) {
       long n = 0;
-      if (!parse_bounded(value, 1, 100000, &n)) {
-        std::fprintf(stderr, "参数错误: --max-clients 要的是 1..100000，收到 %s\n", value);
+      // 上限 1,048,576 = 本机 fd hard limit（实测），和它对齐是因为 SLO #2 要的就是
+      // 100k 条连接挂在这个上游上；卡在 100000 的话，脚本传 CONNECTIONS+4096 会被
+      // 参数校验拒掉，而"拒掉"看起来像工具坏了，不像"容量不够"。
+      if (!parse_bounded(value, 1, 1048576, &n)) {
+        std::fprintf(stderr, "参数错误: --max-clients 要的是 1..1048576，收到 %s\n", value);
         return 2;
       }
       options.max_clients = static_cast<int>(n);
@@ -376,6 +422,8 @@ int main(int argc, char** argv) {
       }
       options.backlog = static_cast<int>(n);
       ++i;
+    } else if (flag == "--upgrade") {
+      options.upgrade = true;
     } else if (flag == "--help" || flag == "-h") {
       usage(stdout);
       return 0;
@@ -398,8 +446,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "压测上游启动失败: %s\n", why.c_str());
     return 1;
   }
-  std::printf("[bench-upstream] 监听 %s:%u body=%zu\n", options.address.c_str(),
-              static_cast<unsigned int>(upstream.port()), options.body_bytes);
+  std::printf("[bench-upstream] 监听 %s:%u body=%zu max_clients=%d mode=%s\n",
+              options.address.c_str(), static_cast<unsigned int>(upstream.port()),
+              options.body_bytes, options.max_clients, options.upgrade ? "upgrade" : "normal");
   std::fflush(stdout);
   upstream.run();
   upstream.print_summary();

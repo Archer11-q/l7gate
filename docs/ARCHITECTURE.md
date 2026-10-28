@@ -50,8 +50,14 @@ l7gate/
 │       ├── response_framing.h  七种响应框架 + chunked 边界游标 + reject→状态码映射 + 自产响应字节
 │       └── response_framing.cc 校验 + 定位，不解码框架：chunked 的 body 一字节不重组（S1-06）
 ├── tools/
-│   └── bench_upstream_main.cc  SLO #1 的压测上游（单线程 epoll ET、1000+ 并发、固定体）
-│                             **不进 ctest**：它是被构建的工具，不是被断言的代码
+│   ├── bench_upstream_main.cc  SLO #1 的压测上游（单线程 epoll ET、1000+ 并发、固定体）
+│   │                        **不进 ctest**：它是被构建的工具，不是被断言的代码
+│   │                        S2-06 起多一个 `--upgrade` 形态：每条连接回一次完整 101 头后
+│   │                        只排空入向、不再按 HTTP 数（SLO #2 要的"握手后空闲"）；
+│   │                        **不加这个开关时逐字节和 S1 起每一轮一样**，B-001…B-005 不作废
+│   └── c100k_main.cc       S2-06 的自研长连接客户端（ADR-17）：多目标地址 + HDR 风格分位 +
+│                            两种形态（隧道空闲测 #2 / 闭环请求测 #1 的 p999）+
+│                            自己那栏 RSS/fd/CPU + 按经过时间摊开的建连限速
 └── tests/
     ├── CMakeLists.txt      gtest_discover_tests：标签按阶段打（s1），任务级筛选靠套件名，TIMEOUT 30
     ├── pipe_fixture.h      非阻塞管道夹具，S1-02/03/05 共用（S1-05 起 PipePair 从 connection_test 上移在此）
@@ -411,7 +417,7 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | `drain_forced_timeout` | 兜底强关的条数 | **这条不为 0 就意味着有客户端卡死**，是兜底生效的证据不是正常路径 |
 | `drain_rejected_new_connections` | 排水期间 accept 到、没构造连接对象就关掉的 fd 数 | "停止接受新连接"发生在连接对象这一层（监听 fd 留到析构），没这个计数就只剩我一句"我拒了" |
 
-**已知边界，照记不藏**：① `--serve-requests N` 仍是硬 break（它可能抢在最后一条响应送达之前退出，帮助文本一直明写着），排水只挂在信号/`request_drain()` 上；② 强关丢的是网关**出向里还没发出去的字节**，客户端看到截断——这是兜底的代价，写在上面那段而不是粉饰；③ 排水期间到达的新连接是**"连上就被关"**而不是 `ECONNREFUSED`（监听 fd 按设计留到析构，理由见上面 `fd_start == fd_end` 那一段）——`refused` 要等进程退出才成立，这一层差别是取舍的结果，不是遗漏；也没有"接进来再温柔地告诉它下线中"这一层，那是 S3 之后 connection draining 的事；④ 排水利弊的量化（排水耗时、100k 连接下排水要多久）归 S2-06/S2-07 的 `c100k.sh`，本任务只交正确性与可断言形状。
+**已知边界，照记不藏**：① `--serve-requests N` 仍是硬 break（它可能抢在最后一条响应送达之前退出，帮助文本一直明写着），排水只挂在信号/`request_drain()` 上；② 强关丢的是网关**出向里还没发出去的字节**，客户端看到截断——这是兜底的代价，写在上面那段而不是粉饰；③ 排水期间到达的新连接是**"连上就被关"**而不是 `ECONNREFUSED`（监听 fd 按设计留到析构，理由见上面 `fd_start == fd_end` 那一段）——`refused` 要等进程退出才成立，这一层差别是取舍的结果，不是遗漏；也没有"接进来再温柔地告诉它下线中"这一层，那是 S3 之后 connection draining 的事；④ 排水利弊的量化（排水耗时、100k 连接下排水要多久）归 S2-06/S2-07 的 `c100k.sh`，本任务只交正确性与可断言形状 ——**S2-06 已经把这一格填上：25,000 条空闲隧道 `SIGTERM`→进程退出 0.5 s、`live=0`、`constructed==destructed==50000`、`fd 39→39`、`drain_forced_timeout=0`；100k 接入规模（`downstream_accepted=100000`，其中 28,231 条配成隧道）排水 1.0 s、`constructed==destructed==128231`、`fd 39→39`（`build/bench/tier-25k-final/`、`build/bench/tier-100k/`，数字在 BENCHMARK B-006）**。
 
 
 ## 2. 构建契约（这几条是有理由的，不是风格）
@@ -517,6 +523,11 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | 一条从没核验过的断言活了半天，还复制进了十处文档："`ulimit -n`=10240 是 100k 的硬前置，要环境侧解决" | 只读了 `ulimit -n` 的 **soft** 值，没读 hard、没读 `fs.file-max`、**没试过一次抬升**；`ENVIRONMENT.md` 第 2 节的快照里本来就有 `ip_local_port_range=32768–60999`，我也没把它算成端口数 | 2026-10-27 实测：`ulimit -Hn`=1048576、`bash -c 'ulimit -n 300000'` **当场成功**、`fs.file-max`=9.2e18 → soft 可自抬，**它不是环境阻塞项**；100k 的真前置是**临时端口只有 28,232 个**。十处措辞已就地更正并留删除线，取证在 `ENVIRONMENT.md` 第 7 节。**这一条的第三条缺**——没有断言管"文档里的环境断言核验过没有"；防复发的规矩：写"必须由环境侧解决"之前，必须同时给出 soft/hard 两个值和一次真实的抬升尝试结果 |
 | "ASan/TSan 干净"其实是构建没开 sanitizer，或优化把坏写入消掉了 | `-O1` 起 dead store elimination 会删掉可证明无副作用的坏写入 | preset 强制 `-O0 -g` + `S1_01_Toolchain.RequestedSanitizersAreActuallyCompiledIn` + 阳性样本（ENVIRONMENT 2.2） |
 | 一个没人引用的常量活了两个 preset 才被抓到 | gcc 的 debug 不报 `-Wunused-const-variable`，clang 才报 | `verify-all-presets.sh` 的「非 gtest 警告 = 0」门禁（FAULT-INJECTION 第 3 节反证） |
+| C100K 客户端的握手 p50 随**连接数**线性增长（250→18.0 ms、500→33.8、1000→71.7、2000→143.4），而把建连窗口从 2 s 拉到 10 s **数字一模一样**；我第一反应是"网关有 O(n²)" | 限速配额写成 `remaining × 50ms / 剩余窗口`，它假设每轮循环都睡满 `kTickMs`；可 `epoll_wait` 一有事件就立刻返回，于是整批 connect 在最初几十毫秒里一次性砸出去——**ramp 形同不存在**。"速率无关"就是"没有速率"这条签名 | 配额改成按**经过的时间**线性算 + 每轮封顶 `kMaxOpenPerIteration`（`tools/c100k_main.cc`）。修后延迟重新跟着速率走：500 条/2 s→1.25 ms、500 条/10 s→422 µs、4000 条/8 s→1.82 ms（同一台机、同一份 binary）。控制实验也要做：500 条**直连上游**（不经网关）p50 152 µs → 排除"网关侧"那句归因，代价是让我先追错方向一次 |
+| `--report-every-seconds 5` 把握手 p50 打成 62 ms | 秒赋给了毫秒字段 → 进度行每 **5 ms** 打一次，而每条进度都要 `opendir(/proc/self/fd)` + 读 `VmRSS`：**观测输出自己把事件循环压死**，在被测进程旁边造出一个负载 | 单位换算写在解析点旁边（同一条注释还写着这次实测）；工具一律**自报** RSS/fd/CPU，观测者的成本不进被测进程的账（ADR-17 后果段） |
+| 闭环形态每请求延迟 mean **4.2 µs**，而同一个窗口里每条请求的平均周期是 **468 µs**——两个数互相打脸 | 注册时为了拿 connect 结果带上 `EPOLLOUT`，请求写完后**没摘**；电平意义下它永远就绪，于是每一轮事件都再走一次"写完了"分支，把计时起点重打在**读响应的前一微秒**上——量出来的是"从缓冲区取数的耗时"，不是往返 | 三层：① 写完即摘 `EPOLLOUT`（`Conn::mask_has_write`）；② 计时起点每条请求只打一次（`request_written`）；③ **真正拦住它的是自洽等式而不是注释**——`requests_done` == 网关 `requests_parsed` == `responses_completed` == 上游 `requests`（实测 12000/12000/12000/12000），字节等式 `bytes_down=条数×60`、`bytes_up=条数×1089`（720000 / 13068000 精确相等），再加"mean × 连接数 ≈ 窗口 ÷ 请求数"这条量纲口算。4 µs 那一版过不了第三条 |
+
+| 一个从没存在过的数字被我说了出来：**"增量 p99 = 0.540 ms、全绿"** | `nohup … &` 起的复跑随父 shell 退出被 WSL 回收，日志停在 `[proxy] 稳态 60s`、终局与 summary 文件都没写，而后台任务回报 **completed exit 0**——我把"任务结束"当成了"测量跑完"，又把"我记得的输出"当成了"读过的输出" | 真值是 **31.150 ms**（B-006 附，同参复跑完成版）。防复发的两条都是形式而非决心：**数字只从落盘的 summary 文件取**（`s1-p99.summary.txt` 存在且 `canonic=1` 才算这一轮跑完），以及**后台任务的退出码不作为完成证明**（它只说明那条 shell 命令链结束了） |
 
 ### 索引之外还欠的两类记录
 

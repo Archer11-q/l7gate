@@ -14,16 +14,16 @@
 
 | # | 数字 | 目标 | 当前读数 | 判定 |
 |---|---|---|---|---|
-| 1 | 转发增量 p99（1 KiB / 1000 并发 / 60 s / 同机回环） | ≤ 1.0 ms | **29.720 ms**（四份取样 57.540 / 36.420 / 37.890 / 29.720） | ❌ 未达标 |
-| 1b | 转发增量 p999 | ≤ 5.0 ms | 取不到——wrk 4.1.0 / hey 0.1.4 分位表只到 99% | ⚪ 无法判定（方案已裁：自研 C100K 客户端做 HDR 分位） |
-| 2 | 100k 长连接每**连接对**内存 | ≤ 20 KB | 空闲 5.81 KiB/对象、负载 ≈19.7 KiB/对；100k 未测 | ⚪ 未到测量条件 |
+| 1 | 转发增量 p99（1 KiB / 1000 并发 / 60 s / 同机回环） | ≤ 1.0 ms | **31.150 ms**（五份取样 57.540 / 36.420 / 37.890 / 29.720 / **31.150**；第五份是 S2-06 收尾时同参复跑，落在 S1 那 30–38 ms 同一条带里 → **多 Reactor 至今没有证据说它把这一格打下来了**） | ❌ 未达标 |
+| 1b | 转发增量 p999 | ≤ 5.0 ms | **取数手段已到位**（`l7gate_c100k --requests-per-conn` 的 HDR 分位，2026-10-28）；已有的两份是 334 µs（1 并发）/ 490 µs（50 并发），都是**经网关一侧的原始值**，不是 #1 定义的增量、也不是 1000 并发 | ⚪ 手段到位，**判定待 S2-07**（要 ≥2 轮报极差） |
+| 2 | 100k 长连接每**连接对**内存 | ≤ 20 KB | **17.47 KiB/对** @ 25,000 连接对（今天拓扑下的最大可测档，稳态 30 s 散布 **0 KiB**、空闲 CPU 占单核 **0.17%**）；100k 名义档实测 `established=28231/100000` → **未达标（测量条件不齐）**，卡点是网关回源那一跳的单元组容量 28,232，不是内存 | ❌ 100k 未达标（归因明确）；25k 档两格都在目标内 |
 | 3 | QPS ≥ Nginx 同环境实测值的 60% | ≥ 60% | **206.11% / 203.74%**（两轮复现，差 1.2%；第二轮 nginx 原始态 9,184.79 / l7gate 18,713.55） | ⏳ 有读数，**终判推到 S5**（已裁） |
 
 三格非绿图标（⚪ 与 ⏳）的含义各不相同，我不想被读成同一个意思：#1b 是**工具取不到那个分位**——已裁决在自研 C100K 客户端里做 HDR 分位，不引第三方工具；#2 是**测量条件还不存在**（100k 长连接要 S2 的连接模型与自研客户端；原先写的"`ulimit -n`=10240 是硬前置"已于 2026-10-27 实测推翻——soft 可自抬到 hard=1048576，**真前置是临时端口只有 28,232 个**，见 `ENVIRONMENT.md` 第 7 节）；#3 是**数拿到了，但按裁决把终判推到 S5**——nginx 在容器里只能走端口发布，分母被压到同一上游天花板（56,332.52 QPS）的 16%，比值两轮复现是 206.11% 与 203.74%（差 1.2%，见 B-005 附），契约要求的「同一分配器记录」也没满足；更要紧的是 S1 的单 Reactor 对 16 worker 的 nginx，**赢的是对照组而不是实现**。**拿一个被削弱的分母给自己发达标证明，正是 SLO 里那句"最容易造假的点在于和谁比"。**
 
 第三个数还有附加产出：与 Nginx 的差值必须定位到 HTTP 解析、内存分配、连接管理、日志写盘、系统调用次数中的哪几项。「差多少」谁都能测，**「差在哪」才是这个项目**。
 
-> 证据：[docs/BENCHMARK.md](docs/BENCHMARK.md) B-001…B-005（含每轮环境快照、原始 wrk/hey 输出、#3 第二轮复现的 B-005 附、口径变更节）。
+> 证据：[docs/BENCHMARK.md](docs/BENCHMARK.md) B-001…B-006（含每轮环境快照、原始 wrk/hey 输出、#3 第二轮复现的 B-005 附、SLO #2 第一份取数与它的失真归因 B-006、夹具改动后的同参复跑 B-006 附、口径变更节）。
 
 ---
 
@@ -69,6 +69,7 @@
 | 上游连接池（S2-02） | **per-worker**（ADR-15，项目所有人裁决）：下游关闭时干净的上游**归还进池**、被下一条下游借走复用，而不是随之销毁（上游活得比下游久）。`ShortLivedDownstreamsReuseOnePooledUpstream`：20 条短命下游 → `upstream_opened=1`、`pool_borrows=19`；生产路径 4-worker + 20 条短命真 curl → **`upstream_opened=4`（每 worker 1 条）而非 20**、省 16 次握手。ADR-15 点名的边界由 `IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation` 钉死：空闲上游被对端关是**正常回收**（`pool_evictions_eof`），绝不误计成截断、不发 502。**诚实边界**：wrk 闭环基准下池不减少上游连接数，S2-07 不声称它有收益 |
 | 配对模型（S2-04） | 支持 HTTP/1.1 pipeline：一条下游的多个在飞请求按 FIFO 回送；`Connection: close` 在**它自己那条**请求的响应后兑现（不是在第一条）——修掉 S1-07 的"400 条只回 1 条"债。靠 `Connection` 的在飞计数（转发 +1 / 响应完结 −1，close 归零才关）。`S2_04_Pairing` 三条 + 旧条件阳性验证会红（ADR-16）。`sizeof(Connection)` 520→528 |
 | 优雅停止／排水（S2-05） | SIGTERM/SIGINT 从"停止接受 + 退出循环"改成**按请求排水**：排水线 = `in_flight_requests_ > 0`（已转发给配对上游的才算已接受），空闲（在飞归零）立即关、在飞的逐条答完 + 刷完出向再关、半包交给 `--drain-timeout-ms`（默认 5000，**兜底不是承诺**）、**隧道只能硬关**（ADR-09 不解析帧 → 发不出 WS close 握手）。多 worker 协调：accept 循环把排水下发给每条 worker、**非阻塞地**读到"每条 worker 都自行报了停止"才 join。实测（`scripts/smoke-s2-05.sh` 五阶段）：阶段一 elapsed 里在飞那条**答完才退**（`drain_in_flight_at_entry=1`、`drain_forced_timeout=0`、76 字节=头 63+体 13 完整）；阶段二 3 条空闲连接 **0.11s** 退干净（兜底写着 60000ms，没用上）；阶段三半包 **0.81s** 走兜底（deadline 800ms，早于它关就算红）；阶段四隧道 **2189 字节 = 101 头 141 + 帧 2048 恰好相等**（不多一个伪造字节、不少一个缓冲字节）；阶段五 3 worker 各排各的（`drain_requested=3`、`in_flight_at_entry=3`、新连接被拒 1 条且 `requests_parsed` 停在 3）。五阶段生命周期三项全部归零（`live=0`、`constructed==destructed`、`fd_start==fd_end`）。一处不那么好看的取舍也写在这里而不是藏起来：**监听 fd 留到析构才关**，所以排水期间的新连接是"连上就被关"而不是 ECONNREFUSED——因为 `fd_start == fd_end` 是全项目生命周期证据的地基，而 `fd_start` 是在 `start_listen()` 之后量的（完整理由与代价见 ARCHITECTURE 1.20） |
+| 测量手段／SLO #2 取数（S2-06） | 自研长连接客户端 `tools/c100k_main.cc`（契约 1.3 唯一许可自研的场景，手段变更记录在 [ADR-17](docs/adr/ADR-17-c100k-hdr-measurement.md)）+ `scripts/bench/c100k.sh`。**两种形态**：默认「握手后空闲」测 #2（每连接对内存、稳态散布、空闲 CPU 两栏分母），`--requests-per-conn` 测**每请求**延迟——#1 的 p999 只有后者能给。分位数是 HDR 风格两级直方图（1 µs 桶到 1 ms，其后每倍频程 16 桶）**带误差棒**，不报单点；100k 条连接靠 **4 个目标地址**（实测单元组上限 28,232，目标地址数与每地址连接数一律写进报告）。**工具自己要有等式**：客户端条数 == 网关 `requests_parsed` == `responses_completed` == 上游 `requests`，外加两条字节等式与一条量纲口算——就是这套东西抓出了我自己的三个错（限速其实没限速、观测打印压死事件循环、`EPOLLOUT` 没摘把延迟读成 4 µs），逐条在 [FAULT-INJECTION 第 7 节](docs/FAULT-INJECTION.md) |
 | sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **132/132**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过三次：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn → 报 **14 处**，S2-05 把排水的跨线程标志做成普通 `bool` → 6 条排水用例里 **5 处 data race**，每次都还原后全绿——"TSan 干净"是能红的绿。排水机制另有三次逻辑阳性验证（摘守卫→3 条红、摘隧道分支→1 条红、关 accept 拒绝→1 条红），以及**一次"拆了也不红"的诚实记录**：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条 |
 | 跨线程销毁（S2-03） | per-worker 池让"连接被非 owner 线程持有"的 harder 竞态**没出现**（所有 `shared_ptr` 持有者都在同一 worker 线程内，析构必在 owner 线程，跨线程只流动裸 fd）。红队三条 `S2_03_CrossThreadDestruction`：负载活跃时 stop、handoff 的 fd 注册前被对端关、连接风暴——tsan 零 race、asan/LSan 零 UAF 零泄漏。销毁协议定稿在 ADR-14 |
 
@@ -164,6 +165,8 @@ PRESET=debug bash scripts/smoke-s1-07.sh  # 四阶段：慢客户端 / 慢上游
 PRESET=debug bash scripts/smoke-s2-05.sh  # 五阶段优雅停止：在飞答完才退 / 空闲立即关 / 半包走兜底 / 隧道硬关不伪造 / 3 worker 各排各的
 scripts/bench/s1-p99.sh                   # SLO #1 标准口径（canonic 由参数自己判，非标那轮不进文档）
 scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网关 + 直连天花板
+scripts/bench/c100k.sh                    # SLO #2：多目标地址长连接稳态 + 每连接对内存 + HDR 分位
+                                          # 非标准口径跑法：CONNECTIONS=25000 TARGETS=4 bash scripts/bench/c100k.sh
 ```
 
 「ASan 干净」这句话不该靠我手敲，所以有一条命令能复现它；同理每个数字都能一键重跑，这是契约第 7 节对这几份文档的完成判据。
