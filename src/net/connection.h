@@ -247,6 +247,20 @@ class Connection {
     head_scan_pos_ = 0;
   }
 
+  // --- 在飞请求计数（S2-04，ADR-16）--------------------------------------
+  // 这条配对上游"已转发、尚未完结"的请求条数。上游按 FIFO 收响应，而带
+  // `Connection: close` 的那条是**最后转发**的一条（close 之后的请求不再转发，见
+  // forward_pending_requests_body 的循环内检查），所以"在飞数归零"恰好等价于
+  // "close 请求的响应完结了"——这就是把 close 从"第一条响应后兑现"修正到"它自己那条
+  // 响应后兑现"所需的唯一信息。只在 owner worker 线程读写（ADR-14 单线程拥有），非原子。
+  void note_request_forwarded() noexcept { ++in_flight_requests_; }
+  // 返回递减后的在飞数。夹到 0：宽松/坏上游多回一条响应时不让 size_t 下溢成天文数字，
+  // 那会让"in_flight==0 才关"的判据永远不成立、配对关不掉。
+  std::size_t note_response_completed() noexcept {
+    return in_flight_requests_ == 0 ? 0 : --in_flight_requests_;
+  }
+  std::size_t in_flight_requests() const noexcept { return in_flight_requests_; }
+
   // 通用响应头检测（任何状态行）：可读区开头存在完整头（CRLFCRLF 恰好闭合）
   // 时返回含终止串的头字节数，未齐返回 npos。与 detect_response_head_101 共用
   // 同一个游标——它们回答的是同一个问题的两种收尾："头在哪结束"。
@@ -309,6 +323,10 @@ class Connection {
   bool read_stopped_at_line_ = false;
   // 响应跟踪（S1-06）：纯数据，判定与推进全在 reactor 的上游路径（见上面注释）。
   ResponseTracking resp_;
+  // 在飞请求计数（S2-04，ADR-16）：见上面的接口注释。它和 resp_ 分开存是有意的——
+  // resp_ 每条响应完结就 reset_response_tracking()，而在飞计数要跨整条配对存活期累加，
+  // 不能跟着单条响应一起清零。只在 owner worker 线程读写。
+  std::size_t in_flight_requests_ = 0;
   // 已解析出一个完整请求、但调用方还没 finish_request。挡住重复解析，
   // 否则 requests_parsed 会随下一批字节到达而虚高。
   bool request_ready_ = false;

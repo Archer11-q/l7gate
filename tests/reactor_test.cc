@@ -2650,6 +2650,117 @@ TEST(S2_03_CrossThreadDestruction, ConnectDisconnectStormIsRaceFreeAndLeavesNoth
   EXPECT_EQ(count_open_fds(), fd_before) << "fd 没回基线";
 }
 
+// ===========================================================================
+// S2-04：请求-响应配对模型 —— pipeline + Connection: close 的兑现时机（ADR-16）
+// ===========================================================================
+//
+// S1-07 的债：一批 pipelined 请求里带 `Connection: close` 的那条会在**第一条响应**完结时
+// 就兑现（400 条只回 1 条）。ADR-16 把它修正到"close 在它自己那条请求的响应之后兑现"，
+// 靠的是给每条配对加一个在飞请求计数（转发 +1 / 响应完结 −1），close 请求是最后转发的
+// 那条，所以"在飞归零"就是它的响应完结点。这三条分别打：close 在批次中间、close 在最后、
+// 整批无 close。
+
+// close 在 pipeline 中间：r1 keep-alive、r2 close、r3/r4 跟在 close 之后。
+// 修复前 → 客户端只读得到 1 条响应（r1 完结就关）。修复后 → r1、r2 两条都完整回来，
+// close 兑现后连接收尾，r3/r4 因落在 close 边界之后不回源、随关闭丢弃（客户端违规）。
+TEST(S2_04_Pairing, CloseInMiddleOfPipelineDeliversUpToAndIncludingThatResponse) {
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string r1 = request_text(1);
+  const std::string r2 = close_request_text(2);  // 这条带 Connection: close
+  const std::string batch = r1 + r2 + request_text(3) + request_text(4);
+  ASSERT_TRUE(client.write_all(batch)) << "整批 pipeline 写不出去";
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << "r1 响应：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  // 关键：close 那条（r2）的响应也要完整回来——这正是 S2-04 前会被提前砍掉的第二条。
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "r2（close 请求）的响应没回来，close 仍兑现得太早：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  // 之后配对收尾：客户端读到 EOF。
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "close 兑现后连接没关：" << why;
+
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == 2u; }, 3000))
+      << "该兑现 2 条响应（r1、r2）";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 2u)
+      << "close 之后的 r3/r4 不该被解析/转发（落在 close 边界后，随关闭丢弃）";
+  EXPECT_EQ(stats.load(stats.bytes_down_to_upstream),
+            static_cast<std::uint64_t>(r1.size() + r2.size()))
+      << "只该把 r1、r2 两条转给上游";
+  EXPECT_EQ(stats.load(stats.close_headers_honored), 1u);
+  harness.shutdown_all();
+}
+
+// close 在 pipeline 末尾：r1/r2/r3 全 keep-alive 语义、只有最后一条 r3 带 close。
+// 三条响应都要完整回来，之后才关。这条锁"在飞计数对每一条都 −1、只在最后归零时关"。
+TEST(S2_04_Pairing, CloseAtEndOfPipelineDeliversEveryResponseThenCloses) {
+  constexpr int kN = 3;
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::string batch =
+      request_text(1) + request_text(2) + close_request_text(3);  // close 在最后
+  ASSERT_TRUE(client.write_all(batch));
+
+  for (int i = 1; i <= kN; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条响应没回来：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << "第 " << i << " 条";
+  }
+  ASSERT_TRUE(client.wait_for_eof(&why)) << "close（最后一条）的响应回来后连接才该关：" << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == kN; }, 3000));
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kN));
+  harness.shutdown_all();
+}
+
+// 整批无 close：全部转发、全部回响应、连接不因 close 逻辑被提前关。这条是 ADR-16 的
+// 负向守卫——证明"close 兑现"只在真有 close 时才砍管线，在飞计数不会误伤普通 pipeline。
+TEST(S2_04_Pairing, PipelineWithoutCloseDeliversAllAndKeepsConnectionOpen) {
+  constexpr int kN = 4;
+  Harness harness;
+  std::string why;
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string batch;
+  for (int i = 1; i <= kN; ++i) batch += request_text(static_cast<std::size_t>(i));
+  ASSERT_TRUE(client.write_all(batch));
+
+  for (int i = 1; i <= kN; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << "第 " << i << " 条";
+    EXPECT_EQ(body, expected_body(static_cast<std::size_t>(i))) << "第 " << i << " 条串号";
+  }
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == kN; }, 3000));
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kN))
+      << "无 close 时整批都该被解析转发";
+  EXPECT_EQ(stats.load(stats.close_headers_honored), 0u) << "没有 close 却兑现了关闭意图";
+
+  // 连接还活着（没被 close 逻辑误砍）：再发一条仍能拿到响应。
+  ASSERT_TRUE(client.write_all(request_text(99)));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << "close 之后连接被误关了：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  harness.shutdown_all();
+}
+
 }  // namespace
 }  // namespace l7gate::net
 

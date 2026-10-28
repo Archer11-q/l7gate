@@ -62,7 +62,7 @@ l7gate/
     └── upgrade_test.cc     5 条 101 判定纯函数断言（S1_05_ResponseHead），含全称前缀断言与近邻误拒样本
 ```
 
-套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**，S2-03 加 **3** 条 `S2_03_CrossThreadDestruction`（负载活跃时 stop / handoff fd 注册前被对端关 / 连接风暴）→ **123**。
+套件计数是 `ctest --test-dir build/debug -N` 数出来的，不是我从文件里点出来的：**6 工具链 + 9 Buffer + 21 解析 + 3 Buffer 写入侧 + 11 连接 + 4 连接层隧道 + 10 事件循环 + 5 握手闭环 + 5 101 判定 + 19 响应框架 + 7 响应语义闭环 = 100**（S1-06 为止）。S1-04 交出去 24 条，S1-05 交出去 14 条（4 连接 + 5 reactor + 5 纯函数），S1-06 交出去 26 条（19 纯函数 + 7 reactor 闭环），S1-07 加 4 条背压、S1-08 加 8 条 filter（6 纯链 + 2 reactor）→ **112**，S2-01 加 **5** 条 `S2_01_MultiReactor`（派发均衡 / 10000 请求跨 worker / 并发 TSan / stop / handoff 探测读）→ **117**，S2-02 加 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / 池满则关）→ **120**，S2-03 加 **3** 条 `S2_03_CrossThreadDestruction`（负载活跃时 stop / handoff fd 注册前被对端关 / 连接风暴）→ **123**，S2-04 加 **3** 条 `S2_04_Pairing`（close 在 pipeline 中间 / 末尾 / 整批无 close）→ **126**。
 
 ### 1.1 `core/build_info`
 
@@ -199,7 +199,7 @@ TSan 那个数超过预算不是无害的信息，它告诉我一件事：**如�
 
 ### 1.11 关于「每连接内存」目前能说到哪一步
 
-S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲连接摊出来的每连接增量在 debug 下是 4.47–5.72 KiB（含测试夹具自身），`sizeof(Connection)=400`，出向 Buffer 与 scratch 都没建（`outbound_buffers_created`/`scratches_created` 在纯空闲场景为 0）。不能说的：100k 连接下的每连接内存——那是 S2 之后的实测项，`TASKS.md` 那一行仍然写"未测"，我不打算用 128 条的数外推 1000 倍。**S1-06 之后这条口径的基数变了**：`ResponseTracking` + `ChunkedProgress` 把 `sizeof(Connection)` 抬到 **512**（+112 B，+28%），128 条空闲连接本轮实测 5.31 KiB/连接（仍在同一区间内，因为 4 KiB 入向 buffer 才是大头）。**S1-07 又抬了一次**：`armed_events_`（uint32_t）+ `read_stopped_at_line_`（bool）= 5 字节净新增，被 8 字节对齐吃掉，实测 `sizeof(Connection)=520`（+8 B，+1.6%）；同一条空闲用例本轮三次跑出同一个数 **5.81 KiB/连接**（RSS 5,720→6,464、增量 744 KiB）。**这 +0.50 KiB/连接 我归不到 S1-07 头上，也没有解释，照记**：对象只涨 8 B/连接，128 条总共 1 KiB，撑不起 64 KiB 的增量；三次同值说明它不是采样噪声，而是这条路径上的分配形状确实和 S1-06 那轮不同（同一次运行的基线 RSS 也从 5,640 抬到 5,720，即进程自身也涨了）。裁决它的成本很低——一次 `ldd`/`malloc` 层面的对照留给 S2 的 100k 稳态实测一起做，那时这 0.5 KiB 摊到 100k 条是 **≈49 MiB**（相对 100k 规模应有的 ≈1.9 GiB 占 2.5%——2026-10-27 重算，原文写"决定 50 GB 还是 51 GB"错了三个数量级，已改；**要紧的不是量级，是构成表上有个空项，而这条 SLO 判的就是构成**）。这正是把口径写成"哪个数怎么算"而不是"一个数"的理由——加字段的人不必回来重写这段，但读的人能看出自己读在哪一年的口径上。
+S1-04 交的是**口径**，不是 SLO #2 的判定。能说的：128 条空闲连接摊出来的每连接增量在 debug 下是 4.47–5.72 KiB（含测试夹具自身），`sizeof(Connection)=400`，出向 Buffer 与 scratch 都没建（`outbound_buffers_created`/`scratches_created` 在纯空闲场景为 0）。不能说的：100k 连接下的每连接内存——那是 S2 之后的实测项，`TASKS.md` 那一行仍然写"未测"，我不打算用 128 条的数外推 1000 倍。**S1-06 之后这条口径的基数变了**：`ResponseTracking` + `ChunkedProgress` 把 `sizeof(Connection)` 抬到 **512**（+112 B，+28%），128 条空闲连接本轮实测 5.31 KiB/连接（仍在同一区间内，因为 4 KiB 入向 buffer 才是大头）。**S1-07 又抬了一次**：`armed_events_`（uint32_t）+ `read_stopped_at_line_`（bool）= 5 字节净新增，被 8 字节对齐吃掉，实测 `sizeof(Connection)=520`（+8 B，+1.6%）；同一条空闲用例本轮三次跑出同一个数 **5.81 KiB/连接**（RSS 5,720→6,464、增量 744 KiB）。**S2 系列对连接对象本身只动了一次**：S2-01/02/03 的多 Reactor 状态、上游池、销毁协议全挂在 reactor/group 上、不碰 `Connection`（`sizeof` 仍是 520，这也是"每连接内存没被线程模型意外抬高"的一个检查点）；直到 **S2-04** 给 `Connection` 加了在飞请求计数 `in_flight_requests_`（一个 `size_t`），实测 `sizeof(Connection)=528`（+8 B）。1.19 口径同步。**这 +0.50 KiB/连接 我归不到 S1-07 头上，也没有解释，照记**：对象只涨 8 B/连接，128 条总共 1 KiB，撑不起 64 KiB 的增量；三次同值说明它不是采样噪声，而是这条路径上的分配形状确实和 S1-06 那轮不同（同一次运行的基线 RSS 也从 5,640 抬到 5,720，即进程自身也涨了）。裁决它的成本很低——一次 `ldd`/`malloc` 层面的对照留给 S2 的 100k 稳态实测一起做，那时这 0.5 KiB 摊到 100k 条是 **≈49 MiB**（相对 100k 规模应有的 ≈1.9 GiB 占 2.5%——2026-10-27 重算，原文写"决定 50 GB 还是 51 GB"错了三个数量级，已改；**要紧的不是量级，是构成表上有个空项，而这条 SLO 判的就是构成**）。这正是把口径写成"哪个数怎么算"而不是"一个数"的理由——加字段的人不必回来重写这段，但读的人能看出自己读在哪一年的口径上。
 
 ### 1.12 「零泄漏」这句话是有反证的
 
@@ -329,6 +329,23 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 
 实测：本任务新增 **3** 条 `S2_02_UpstreamPool`（churn 复用 / 空闲 EOF 淘汰不误计截断 / `pool_max_idle` 满则关），总数 117→**120**；三 preset 各 **120/120**、非 gtest 警告 **0 条**、**tsan 零 data race**（池 per-worker 无新增跨线程面，共享的只有那几个原子计数）、asan/ubsan/LSan 零报告零泄漏。`sizeof(Connection)` 不变（**520**，池挂在 Reactor 上）。**改了 4 条既有生命周期用例的期望值**（`S1_04_Reactor` 的 TenThousand / IdleConnectionDoesNotSpinOnEpollOut、`S2_01_MultiReactor` 的 TenThousand / ConcurrentLoad）：它们原先断"下游关后 `live==0`"，池化后改成"下游关后上游进池（`pool_returns` 计数）、`stop` 排空池后才 `live==0`/`constructed==destructed`"——改的是对新合法行为的期望，每条旁边都写了为什么，不是为了绿。
 
+### 1.19 请求-响应配对模型（S2-04，ADR-16）：pipeline 支持，close 在它自己那条响应后兑现
+
+这条还的是 S1-07 记下、2026-10-26 裁决"归 S2 配对模型"的债：一批 pipelined 请求里带 `Connection: close` 的那条，S1/S2-03 会在**第一条响应**完结时就把配对关掉（`pump_response` 的 `kComplete` 只看一个 `close_after_response()` 布尔），于是一批 400 条只兑现 1 条响应。
+
+**模型**：一条下游是一个有序的请求-响应管线。多条在飞请求按到达顺序转发到它独占的那条上游、响应按 FIFO 原样回送（不乱序，这是 HTTP/1.1 pipelining 的硬要求）。close 记在它所属的那条请求上，网关**数在飞请求**决定兑现时机：
+
+- `Connection` 加一个 `in_flight_requests_`（`note_request_forwarded` 在 `forward_request` 排队成功时 +1，`note_response_completed` 在 `pump_response` 的 `kComplete` −1）。
+- close 请求是**最后转发**的那条（见下条），它的响应也就是最后到的那个，所以 `kComplete` 里的条件从"close 布尔为真就关"改成"close 布尔为真 **且 在飞数归零** 才关"。
+- `forward_pending_requests_body` 的 `close_after_forward` 检查从**函数入口**移进**循环体每次迭代开头**：转发完带 close 的那条，下一轮立刻停，同一批次里它后面的请求**不再转发**（RFC 9112：发了 close 记号就不得再 pipeline，那是客户端违规，字节随配对关闭丢弃，不回源、不伪造响应）。
+- `upstream_reusable`（池回收判据，ADR-15）加一条"在飞 == 0"：还在等响应的上游不能被回收进池配给下一条下游，否则响应会配错人。
+
+**改动很小、全在 owner worker 线程内**：三处 reactor 逻辑 + 一个 `Connection` 成员，无新锁、无新跨线程面（在飞计数是单线程拥有的普通 `size_t`）。`sizeof(Connection)` 因此 520 → **528**（+8 B）。
+
+可断言的验收（`S2_04_Pairing` 三条）：close 在批次中间 → 客户端拿到 close 那条**及其之前**的每条响应、之后 EOF，`requests_parsed` 停在 close 边界（后面的不解析）、`bytes_down_to_upstream` 只含已转发的那几条；close 在末尾 → 全部响应回来才关；整批无 close → 全部转发全部回、连接不因 close 逻辑被误砍。**阳性验证（能红才叫绿）**：把 `kComplete` 的条件临时退回旧的"只看布尔、忽略在飞数"，`CloseInMiddle` 与 `CloseAtEnd` 两条当场变红（旧逻辑在第一条响应就关，与 close 在第几条无关），改回后 126/126 全绿。
+
+已知边界：不支持服务端对 pipelined 请求的并行回源 + 按序重排（那是吞吐优化，且要先有 shared 池或每请求借还，撞 ADR-15 的下游生命周期独占——无 SLO 证据不做，契约 3.2）；不定义"一条配对上普通请求与 upgrade 混 pipeline"的行为（真实客户端不这么发）。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -395,6 +412,7 @@ S1 的 `Reactor` 是一条循环线程干全部活：accept、配对、双向 pu
 | view 在下一次读之后被继续引用 | `consume`/扩容使 view 作废，而调用方不知道 | `ConsumeInvalidatesParsedViews`、`ReleaseScratchInvalidatesViews`、`InvalidatedViewsAreReparsedNotDropped`、`RepeatedParseDoesNotDoubleCountRequests` |
 | 级联关闭把刚排进配对的 502 当残留字节丢掉 | `kDiscardOutbound` 的传染性；`close_connection` 的"同一种 why"会传给对端 | `fail_pair_with_reply` 先手工解链再分别关；`S1_06_Reactor.UpstreamDyingBeforeAnyResponseGetsDefined502`（ARCH 1.14） |
 | 空闲池内上游被对端正常关闭，却被计成 `upstream_truncated_before_head` 还朝不存在的下游发 502 | `on_upstream_event` 的 EOF 分支默认"上游总有配对下游"；池化后空闲上游 `peer_fd` 无效、没有下游可表态 | EOF 分支开头 `peer_fd==kInvalidFd` 短路成"淘汰"；`S2_02_UpstreamPool.IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation`（ARCH 1.18） |
+| 一批 pipelined 请求里带 `Connection: close` 的那条在**第一条**响应完结就把配对关了，400 条只兑现 1 条响应 | `pump_response` 的 `kComplete` 只读一个 `close_after_response()` 布尔，不区分"完结的是第几条响应"；且 `forward_pending_requests_body` 的 close 检查只在入口、一批里 close 之后的请求还会被转出去 | 在飞请求计数（`in_flight_requests_`，转发 +1 / 完结 −1），close 只在"布尔为真且归零"时兑现 + 循环体内查 `close_after_forward`；`S2_04_Pairing.CloseInMiddle/CloseAtEnd`（旧条件下这两条会红，ADR-16） |
 
 ### 测试自己写的错，比实现的错更难发现
 

@@ -4,7 +4,7 @@
 
 不是"又一个高性能 Web 服务器"，不是框架，也不是功能清单。对外形态是一个 `docker compose up` 起来、顶替 Nginx 位置的网关。
 
-**S1 完成 · S2 进行中（S2-01 多 Reactor + S2-02 上游连接池 + S2-03 跨线程销毁 TSan 攻坚 已 DONE）** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 123/123 ｜ MIT
+**S1 完成 · S2 进行中（S2-01 多 Reactor + S2-02 上游连接池 + S2-03 跨线程销毁 + S2-04 配对模型 已 DONE）** ｜ C++20 ｜ Linux / WSL2 ｜ 单测 126/126 ｜ MIT
 
 ---
 
@@ -67,7 +67,8 @@
 | filter 链（S1-08） | 顺序＝添加顺序（用例故意按 c、a、b 添加）、第一个 `kStop` 之后不再调用后面的、filter 状态跨请求存活；主路径上只有一处链调用；「不改主路径」的可执行形式＝空链与两条放行 filter 下响应内容与七项计数**逐项相等**。TSan 这轮抓到的是我自己写的第一版（循环还在跑时读非原子计数器） |
 | 多 Reactor（S2-01） | 一个 acceptor + N 个 worker、round-robin 派发、**连接单线程拥有、跨线程只传裸 fd**（ADR-14）。`DispatchIsRoundRobinBalanced`：8 连接派发到 4 worker 每个恰好 2 条；`TenThousandRequests...`：10000 请求跨 4 worker，`constructed==destructed==16`、`fd 5→5`、聚合 `epoll 注册 20（=4 wake_fd+16 连接）/注销 16`；`ConcurrentLoad...`：16 线程 × 50 请求并发穿 4 worker，**tsan preset 零 data race**（S2 门禁硬条件）。生产路径 `--serve --workers 4` + 真 curl 20/20 200、`fd 15→15` |
 | 上游连接池（S2-02） | **per-worker**（ADR-15，项目所有人裁决）：下游关闭时干净的上游**归还进池**、被下一条下游借走复用，而不是随之销毁（上游活得比下游久）。`ShortLivedDownstreamsReuseOnePooledUpstream`：20 条短命下游 → `upstream_opened=1`、`pool_borrows=19`；生产路径 4-worker + 20 条短命真 curl → **`upstream_opened=4`（每 worker 1 条）而非 20**、省 16 次握手。ADR-15 点名的边界由 `IdlePooledUpstreamClosedByPeerIsEvictedNotTruncation` 钉死：空闲上游被对端关是**正常回收**（`pool_evictions_eof`），绝不误计成截断、不发 502。**诚实边界**：wrk 闭环基准下池不减少上游连接数，S2-07 不声称它有收益 |
-| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **123/123**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过两次摘锁阳性验证：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn 用例 → 报 **14 处**，还原后全绿——"TSan 干净"是能红的绿 |
+| 配对模型（S2-04） | 支持 HTTP/1.1 pipeline：一条下游的多个在飞请求按 FIFO 回送；`Connection: close` 在**它自己那条**请求的响应后兑现（不是在第一条）——修掉 S1-07 的"400 条只回 1 条"债。靠 `Connection` 的在飞计数（转发 +1 / 响应完结 −1，close 归零才关）。`S2_04_Pairing` 三条 + 旧条件阳性验证会红（ADR-16）。`sizeof(Connection)` 520→528 |
+| sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **126/126**，非 gtest 警告 **0 条**；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过两次摘锁阳性验证：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn 用例 → 报 **14 处**，还原后全绿——"TSan 干净"是能红的绿 |
 | 跨线程销毁（S2-03） | per-worker 池让"连接被非 owner 线程持有"的 harder 竞态**没出现**（所有 `shared_ptr` 持有者都在同一 worker 线程内，析构必在 owner 线程，跨线程只流动裸 fd）。红队三条 `S2_03_CrossThreadDestruction`：负载活跃时 stop、handoff 的 fd 注册前被对端关、连接风暴——tsan 零 race、asan/LSan 零 UAF 零泄漏。销毁协议定稿在 ADR-14 |
 
 </details>
@@ -79,7 +80,7 @@
 | 阶段 | 目标 | 状态 | 门禁 |
 |---|---|---|---|
 | **S1** | 单连接转发 + 第一份 p99 | ✅ 八个任务全 DONE | 四件套：#2/#3/#4 齐，#1 的 #3 半边按裁决**推到 S5 终判**（理由见上表） |
-| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 🔨 进行中（S2-01 多 Reactor + S2-02 连接池 + S2-03 跨线程销毁 DONE，TSan 123/123 零 race；S2-04…07 待做） | TSan 干净 |
+| **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | 🔨 进行中（S2-01 多 Reactor + S2-02 连接池 + S2-03 跨线程销毁 + S2-04 配对模型/pipeline-close DONE，TSan 126/126 零 race；S2-05…07 待做） | TSan 干净 |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 摘除安全阀 | 未开始 | 摘除耗时、误摘率、故障注入实测 |
 | **S4** | 限流 + 熔断 + 超时重试防放大 | 未开始 | 429 生效数据、熔断时间线、Redis 降级 |
 | **S5** | 热重载 + 指标 + 面板 + vs Nginx 归因 | 未开始 | 三个数字终稿、归因报告、故障注入全表 |
@@ -135,7 +136,7 @@ client ──epoll ET──▶ acceptor ──round-robin──▶ N×worker Rea
 
 ```bash
 cmake --preset debug && cmake --build --preset debug
-ctest --preset debug                      # 123/123（17 个套件，构成见 TASKS.md 交接段）
+ctest --preset debug                      # 126/126（18 个套件，构成见 TASKS.md 交接段）
 ./build/debug/l7gate --self-check         # version / compiler / gtest / sanitizers / build_type / malloc
 
 # 手动跑一遍透传：起上游 → 把网关架在中间 → 用真 curl 打一发
@@ -212,7 +213,7 @@ scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网�
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录：B-001…B-005 + 口径变更节，**未达标照记** |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障注入的预期 vs 实测 + sanitizer 结论（每条"干净"都带反证） |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**：S1 四件套对账、一键复现、留给 S2 的九条债、待答复事项 |
-| [docs/adr/](docs/adr/) | 15 条决策记录（ADR-14 连接所有权、ADR-15 per-worker 上游连接池随 S2 新增） |
+| [docs/adr/](docs/adr/) | 16 条决策记录（ADR-14 连接所有权、ADR-15 per-worker 上游连接池、ADR-16 请求-响应配对模型随 S2 新增） |
 
 ---
 

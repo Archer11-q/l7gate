@@ -636,10 +636,11 @@ std::shared_ptr<Connection> Reactor::take_pooled_upstream() {
 bool Reactor::upstream_reusable(const Connection& upstream) const noexcept {
   // 全部满足才值得留：kOpen（没在收尾/没死）、非隧道（隧道是专用双向流，无法共享）、
   // 非一次性配对（close_after_response 的语义就是不复用）、出向空（没有在飞请求字节）、
-  // 响应跟踪停在 kHead（上一条响应已完整完结并复位，没有半条响应挂在游标上）。
+  // **没有在飞请求**（S2-04：请求都转出去了但响应还没全回来的上游不能回收，否则响应会
+  // 配错人）、响应跟踪停在 kHead（上一条响应已完整完结并复位，没有半条响应挂在游标上）。
   return upstream.role() == Role::kUpstream && upstream.state() == State::kOpen &&
          !upstream.tunneling() && !upstream.close_after_response() &&
-         upstream.outbound_pending() == 0 &&
+         upstream.outbound_pending() == 0 && upstream.in_flight_requests() == 0 &&
          upstream.response_tracking().phase == Connection::ResponsePhase::kHead;
 }
 
@@ -769,13 +770,17 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
     (void)downstream->take_upgrade_pending();
     return ForwardOutcome::kDrained;
   }
-  if (downstream->close_after_forward()) {
-    // close 是一次性配对：不再往这条连接对转发第二条请求。
-    // 留在缓冲里的字节不归本函数处置——它们要么随连接收尾一起结束，要么
-    // 在 S1-06 的语义面里被判定（close 之后还发请求的客户端就是畸形流量）。
-    return ForwardOutcome::kBlocked;
-  }
   for (;;) {
+    // close 是一次性配对的边界（S2-04，ADR-16）：转发过一条带 `Connection: close` 的请求
+    // 之后，这条连接对不再转发任何后续请求——即使它们和 close 请求在同一次可读里到达。
+    // 检查必须放在循环体每次迭代的开头（原来只在函数入口查一次），否则一批 pipelined 里
+    // close 之后的请求会被同一次调用一股脑转出去、然后又被下面 pump_response 的 close 兑现
+    // 提前砍掉。那些字节按 RFC 9112 是客户端违规（发了 close 记号就不得再 pipeline），
+    // 随配对关闭一起丢弃，不回源、不伪造响应。返回 kBlocked 而非 kFailed：连接还活着，
+    // 要等它已转出的那些请求的响应逐条回完（close 请求是最后转出的那条，它的响应到了才关）。
+    if (downstream->close_after_forward()) {
+      return ForwardOutcome::kBlocked;
+    }
     const http::ParsedRequest* pending = downstream->request();
     if (pending != nullptr) {
       // 意图必须在看板还有效的这一刻取（view 指向入向缓冲，finish_request 一消费
@@ -871,6 +876,9 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
   if (!upstream->queue_bytes(downstream->inbound().readable_data(), request_bytes)) {
     return false;
   }
+  // S2-04（ADR-16）：字节成功排队 = 这条请求已转发、开始占用上游一个在飞位。
+  // 与 pump_response 的 note_response_completed 配平；close 兑现时机靠它判"归零没"。
+  upstream->note_request_forwarded();
 
   // 意图落在连接上，必须赶在 finish_request 作废 view 之前（此刻 pending 还有效，
   // 而上面一次字节都没动过状态——这个顺序是刻意的，转发失败时意图也不会残留）。
@@ -1052,11 +1060,15 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
 
     // kComplete：这条响应对下游已经（或即将，由 flush 负责）完整交付。
     stats_.responses_completed.fetch_add(1, std::memory_order_relaxed);
-    if (upstream->close_after_response()) {
-      // S1-05 留的口子在这里兑现：一次性配对的响应**完结**了（不是猜边界，
-      // 是框架判定给出的完结点），现在关上游是安全的——它出向没有货，入向的
-      // 残字节属于"这条连接不再复用"之后的世界。级联把下游也带向收尾，
-      // 下游出向里的响应字节由 kFlushThenClose 保证发完。
+    // S2-04（ADR-16）：这条响应完结 = 一个在飞请求走完了，先把数减下去。
+    const std::size_t remaining_in_flight = upstream->note_response_completed();
+    if (upstream->close_after_response() && remaining_in_flight == 0) {
+      // S1-05 留的口子在这里兑现，S2-04 修正了它的时机：**不是第一条响应一完结就关**，
+      // 而是"带 close 的那条请求"的响应完结才关。close 请求是最后转发的那条（它的后面
+      // 不再转发，见 forward_pending_requests_body 的循环内检查），所以它的响应也就是最后
+      // 到达的那个——在飞数归零正是它的完结点。到这里关上游是安全的：它出向没有货、手上
+      // 每一条已转发请求的响应都已完整交给下游。级联把下游也带向收尾，下游出向里的响应
+      // 字节由 kFlushThenClose 保证发完。
       close_connection(upstream);
       return;
     }
