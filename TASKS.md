@@ -27,35 +27,30 @@
 
 ## 交接 —— 新会话从这里接
 
-> 这一段是契约第 6 节阅读顺序的第 1 步补充：读完 CLAUDE.md 和本节，你就知道"现在在哪、下一步做什么、什么不许动"。第 2–6 步照契约原文走，**不要跳过 ADR**。
+> **这一段只指路，不解释术语。**每个名词的准确定义都在下面指向的那一节里；我不在这里抄一份——抄了就有第二份会分叉。
 
-**仓库状态（S2 已关门，2026-10-29，接手从这里接）**：**S2 的八个任务（S2-01…S2-07 + S2-06a）全部 DONE，门禁四件套齐**——三 preset 各 **137/137**、非 gtest 警告各 **0 条**、**`tsan` 零 data race**（S2 唯一核心门禁）、四冒烟 `smoke-s1-04/06/07/s2-05` 全 `rc=0` 且 `✗=0`。**`main` 领先 `origin/main` 10 个提交 → 已于 2026-10-29 经用户授权推上去（`47bca67..dcccca5`），现在两边同步**。下一步不是写代码，是**一件事**：**S3 的拆解已成形并写进本文件「## S3」段**（契约 4：只在阶段门禁通过时才拆下一阶段）。三条岔路已由项目所有人 2026-10-29 裁死——**① per-worker 池加目标键但不 shared；② S3-01～S3-03 走文件配置、MySQL 节点表单独排 S3-04；③ 主动探活判据与归属**（path 可配默认 `/`；2xx/3xx/4xx 一律算活着，只有 5xx／连接失败／超时算失败；探活连接归 owner worker 的事件循环；探活不进业务计数）。**拆解已于 2026-10-29 经项目所有人确认，S3-01 由新会话认领并置 RUNNING**（契约 6：一次会话只推进一个任务，本会话已经推进完 S2-07）。**push 状态：S2 门禁的十提交已推（`47bca67..e54ae61`）；S3 拆解入表这两个提交按项目所有人 2026-10-29 的"不需要现在推"留在本地**，下一次推送的授权点在 S3 门禁收尾。
+**现在在哪**：S2 已关门（八条任务全 DONE、三 preset 各 **137/137**、`tsan` 零 data race、四冒烟全绿）。S3 六条任务全 PENDING。**下一个动作是 S3-01，由你这个新会话认领并置 RUNNING**（契约 6：一次会话只推进一个任务；S2-07 已在另一个会话推进完）。
 
-**S2 关门时三个数字的形状（全部落盘，逐条可在 BENCHMARK 复核）**：#1 增量 p99 = **4.160–6.290 ms @workers=16**（组内极差 2.130）vs **32.990–35.210 ms @workers=1**（极差 2.220），两系列不重叠 → **多 Reactor 有效，但未达标**（B-008）；#1 的 p999 在 SLO 写死的 1000 并发那一档**记"取不到"**，原因是观察者单核饱和而不是没有工具（B-009）；**#2 达标**：17.47 KiB/对 + 占单核 0.22% + 构成表逐项实测与它差 **0.16%**（B-007 + B-011）；#3 有 canonic 读数、**判定按 2026-10-26 的裁决推到 S5**；另外 100k 条隧道在负载下排水 **0.947 s**、默认 5000 ms 站得住（B-010）。
+**开工前按这个顺序读六份，别跳**（契约第 6 节的第 2–6 步）：
 
-**这一轮之后，下一个会话一定会撞上的五条新口径**（都是实测逼出来的，不是我加的习惯）：
-① **`s1-p99.sh` 现在认 `WORKERS` 这个因子**（缺省 1＝与 B-001…B-007 逐字同形）；**八份历史 canonic 档全部是单 Reactor**——以后凡说"多 Reactor 之后如何"必须指明臂，脚本按**横幅签名**当场判路径。
-② **`c100k.sh` 多了 `DRAIN_UNDER_LOAD=1` 这一档**，它的 `per_pair_kib` 与 `idle_cpu` 两栏是字面量 `not_applicable=drain-mode`——**不许引用**；每连接内存仍然只认主档（B-007）。本档的客户端退出码按设计是 1，不是丢负载。
-③ **`s1-p999.sh`（新脚本）两臂的 `REQUESTS_DIRECT` / `REQUESTS_PROXY` 分开是设计**：闭环下稳态窗口 = N ÷ 单请求延迟，而两臂差一个数量级，同一个 N 不可能两边都过 60 s 门。等式的正确形式是 **`direct + proxy == upstream`**（两臂共用同一个上游进程，它只在退出时打终局）。
-④ **构成表的数值判定只能在 debug/release 做**：sanitizer 换了分配器，`mallinfo2()` 一律报 0 → 那两条用例在 asan/tsan 里是 **Skipped＝不判**（打印明写），别把它们读成"通过"。
-⑤ **测量驱动一律跑在前台、由调用方持有**：`(...) &` / `nohup … &` 起的东西会随父 shell 被 WSL 整条回收，而通知照样回报 `completed exit 0`（**这一轮我又踩了一次**，两轮排水档根本没跑，见 ARCHITECTURE §5 第一条）；完成判据只看落盘的 `*.summary.txt`；取脚本退出码不许用 `… | tail; echo rc=$?`（那是 `tail` 的状态码）。
+1. **`CLAUDE.md` 全文**——铁律、禁令、提交格式都在这；尤其 8.2 的三条禁令（不在表里的功能不做／不改 SLO 目标值与口径迁就结果／不无端引依赖改版本）。
+2. **本文件 `## S3` 段**——六条任务的验收句、已裁的三条、S3 门禁硬条件、明确不做的事。**这是本阶段唯一的需求来源**，没写进那张表的就不做。
+3. **`docs/ROADMAP.md` 的 `## S2` 段**——S2 关门留下的债表；**债 3 就是 S3-01 第一天要还的那笔**（`RequestInfo` 缺"目标上游"字段，且必须与它的第一个读者同批进来）。
+4. **`docs/ARCHITECTURE.md` 1.16 / 1.17 / 1.18 / 1.19 / 1.20 / 1.21**——filter 链骨架、多 Reactor 与连接所有权、per-worker 池、请求-响应配对、优雅停止、回源多端点。S3-01 改的正是这几处的交界处。
+5. **`docs/adr/` 的 ADR-11 / ADR-14 / ADR-15 / ADR-16 / ADR-17**——链的可插入点、连接单线程拥有、池归属、配对模型、测量手段。红线：**S3 不许扩大 ADR-14 的跨线程接触面**；池加目标键但**仍 per-worker、不 shared**（已裁，见 `## S3`）。
+6. **`docs/SLO.md` 的 #1 段 + `docs/BENCHMARK.md` 的 B-008、B-009**——每请求 **≈8.7 µs** 的成本基线，以及"同机交替、≥2 轮、报极差、区间不重叠才许判"的取样规程。S3-01 那条"成本不退化"的验收照这两条做。
 
-**已裁、别重开**：ADR-14 连接单线程拥有 / ADR-15 per-worker 池 / ADR-16 pipeline 配对 / S2-05 按请求排水 + 隧道硬关 / ADR-17 测量手段 + 末条候选 A（回源多端点 per-worker `i mod E`，**按请求选端点归 S3**）/ #3 终判推 S5 / 分母按连接对 / 取样规程自 S2 强制。**S2-07 新立的依据一条**：`--drain-timeout-ms` 默认 5000 在 100k 下余量 5.3 倍 → **S4 定义请求超时时按"≤ drain"这条已经可执行**，不必为排水规模抬默认值。
+**第一个动作不是写代码**：起草 **ADR-18**（路由作为链上的一环 + `RequestInfo` 的"目标上游"字段 + per-worker 池按目标分桶，落成 ADR-15 的追加节）→ 写完 → 把本表 S3-01 置 RUNNING → 才动 `src/`。顺序反了就违反禁令一。
 
-**一条命令拿到 S2 关门的门禁证据**（必须在 WSL 原生 ext4 内跑）：
+**已裁、不要重新论证**：① 池加目标键但仍 per-worker；② S3-01～03 走文件配置、MySQL 节点表单独排 S3-04；③ 主动探活的请求形态、判据、归属与"不进业务计数"——**三条的原文全在 `## S3` 的"已裁的三条"**，这里不重述。更早的裁决（分母按连接对、#3 终判推 S5、取样规程自 S2 强制等）在 `docs/ROADMAP.md` 的裁决表和 `docs/adr/` 里。
 
-```bash
-cd /home/archer/workspace/l7gate
-WSL_UTF8=1 bash scripts/verify-all-presets.sh      # 三 preset 各 137/137 + 非 gtest 警告各 0 条（三行都看；asan/tsan 各 2 条 Skipped 是"不判"）
-WSL_UTF8=1 PRESET=debug bash scripts/smoke-s2-05.sh ; WSL_UTF8=1 PRESET=debug bash scripts/smoke-s1-04.sh
-WSL_UTF8=1 PRESET=debug bash scripts/smoke-s1-06.sh ; WSL_UTF8=1 PRESET=debug bash scripts/smoke-s1-07.sh
-WSL_UTF8=1 PRESET=release bash scripts/bench/s1-p99.sh                      # workers=1 臂
-WSL_UTF8=1 WORKERS=16 PRESET=release bash scripts/bench/s1-p99.sh           # workers=16 臂（B-008 的 A/B）
-WSL_UTF8=1 DRAIN_UNDER_LOAD=1 CONNECTIONS=100000 TARGETS=4 UPSTREAM_ENDPOINTS=4 WORKERS=16 \
-  RAMP_MS=300000 HANDSHAKE_TIMEOUT_MS=120000 HOLD_SECONDS=60 DRAIN_TIMEOUT_MS=5000 \
-  OUT_DIR=build/bench/drain-100k-e4-def5000 bash scripts/bench/c100k.sh     # B-010，约 8 分钟
-WSL_UTF8=1 bash scripts/bench/s1-p999.sh                                    # B-009：会自报观察者饱和
-```
+**状态与授权**：`main` 本地领先 `origin/main` **2 个提交**（S3 拆解入表 + 探活判据入表），按项目所有人 2026-10-29 的"不需要现在推"留在本地；**下一次 push 的授权点在 S3 门禁收尾，且每次先问**。S3-04 的硬前置 **Docker WSL Integration 开启**是项目所有人那侧的动作；没开之前 S3-01～03 照跑，别让整条路由线等它。
+
+**新会话一定会撞上的四条口径**（细节看指向的原文，这里不抄）：
+① 单 Reactor 与多 Reactor 是**两条臂**，任何结论必须指明哪一臂——见 `docs/BENCHMARK.md` 的「口径变更 · `s1-p99.sh` 从此带 `WORKERS` 因子」；八份历史 canonic 档全是单 Reactor。
+② **单轮读数不许判"改动有效"**——取样规程见 `docs/SLO.md` 测量条件；1000 并发那档 p999 目前判"取不到"，原因见 B-009，别用 100 并发的读数去填那一格。
+③ **sanitizer 下堆与 RSS 都不可判**（`mallinfo2()` 一律报 0，那两条用例是 Skipped＝不判）——见 `docs/ARCHITECTURE.md` 1.10 与 1.22；内存类判定只在 debug/release 做。
+④ **长任务驱动一律跑在前台、由调用方持有**，完成判据只看落盘 `*.summary.txt`；`(...) &`／`nohup … &` 会被 WSL 整条回收而通知照样报 `exit 0`——见 `docs/ARCHITECTURE.md` §5 第一条，这颗雷我踩过两次。
 
 **下面那段是 S2-06a 收尾时写的交接，照常留着当基线（它那三条口径变更一条没被 S2-07 改动，仍然生效）。**
 
