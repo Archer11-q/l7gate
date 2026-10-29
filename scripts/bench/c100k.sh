@@ -30,6 +30,14 @@
 # 用法：
 #   scripts/bench/c100k.sh                                   # 正式口径（100k 对 / 4 地址 / 静置 60s）
 #   CONNECTIONS=2000 TARGETS=1 scripts/bench/c100k.sh        # 冒烟档位：**非标准口径**，只验脚本自己
+#   DRAIN_UNDER_LOAD=1 CONNECTIONS=25000 ... scripts/bench/c100k.sh
+#       # **排水档**（S2-07 第六项）：established==planned 且静置窗口已经开始之后，脚本给网关
+#       # 发 SIGTERM，而**客户端仍持有全部连接**。量的就是"100k 条隧道在负载下排水要多久"。
+#       # 为什么必须由脚本发信号：脚本原来的顺序天然是"客户端先退、再 SIGTERM 网关"，那一轮
+#       # 的隧道是客户端退出时的 FIN 级联关掉的（实测三档 25k 的 drain_tunnels_hard_closed 全为
+#       # 0），所以它测不到排水。见 BENCHMARK B-006 结果一那格的更正。
+#       # 这一档**不产出**每连接内存与空闲 CPU（稳态窗口被信号打断），那两格在 summary 里明写
+#       # `not_applicable=drain-mode`，不让人抄一个没有口径的数。
 # 只在 release 上跑（同 s1-p99.sh：sanitizer 下的 RSS/CPU 不是被测行为）。
 set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
@@ -50,6 +58,12 @@ RAMP_MS="${RAMP_MS:-120000}"             # 建连窗口：somaxconn=4096，摊�
 WORKERS="${WORKERS:-$(nproc)}"
 GATEWAY_PORT="${GATEWAY_PORT:-18083}"
 DRAIN_TIMEOUT_MS="${DRAIN_TIMEOUT_MS:-30000}"   # 100k 条空闲连接的收尾也要时间（S2-05 排水）
+# 排水档开关（S2-07 第六项）。默认 0 = 原来的形状（客户端先退、再停网关），一条都不变。
+DRAIN_UNDER_LOAD="${DRAIN_UNDER_LOAD:-0}"
+# 从"看见 established==planned"到发信号之间的静置秒数。窗口是客户端自己起的（达标那一刻
+# 才 hold_end = now + HOLD_SECONDS），脚本只能靠进度行去追它，所以这里给的余量同时也是
+# 检测延迟的上界——把它写成参数而不是睡死，是因为报告要能说清"信号是在窗口的哪一刻打的"。
+DRAIN_SETTLE_IN_WINDOW="${DRAIN_SETTLE_IN_WINDOW:-10}"
 HANDSHAKE_TIMEOUT_MS="${HANDSHAKE_TIMEOUT_MS:-30000}"
 OUT="${OUT_DIR:-build/bench/c100k-$(date +%Y%m%d-%H%M%S)}"
 # 单元组实测天花板：任何"每地址连接数"超过它，这一轮就不是测量而是猜。
@@ -58,14 +72,24 @@ PER_TUPLE_CEILING=28232
 CANONIC=1
 [[ "$CONNECTIONS" == "100000" && "$TARGETS" == "4" && "$HOLD_SECONDS" == "60" && "$UPSTREAM_ENDPOINTS" == "4" ]] || CANONIC=0
 
-[[ "$UPSTREAM_ENDPOINTS" =~ ^[1-9][0-9]*$ ]] || fatal "UPSTREAM_ENDPOINTS 要是正整数，收到 '$UPSTREAM_ENDPOINTS'"
-
 mkdir -p "$OUT" || exit 1
 FAILED=0
 note() { echo "  $*"; }
 die() { echo "  ✗ $*" >&2; FAILED=1; }
 fatal() { echo "  ✗ $*" >&2; exit 1; }
 ok() { echo "  ✓ $*"; }
+
+# 参数校验必须排在 fatal() 定义**之后**。原来这几行在定义之前，而这个脚本没有 `set -e`：
+# 触发时只是 `fatal: command not found`，然后带着非法参数继续往下跑——一道看起来在锁、
+# 实际锁不上的门。改顺序不是整理代码，是把这条门的效力找回来（阳性验证：故意传
+# `DRAIN_UNDER_LOAD=2`，现在必须在第一行就退出码 1）。
+[[ "$UPSTREAM_ENDPOINTS" =~ ^[1-9][0-9]*$ ]] || fatal "UPSTREAM_ENDPOINTS 要是正整数，收到 '$UPSTREAM_ENDPOINTS'"
+[[ "$DRAIN_UNDER_LOAD" == "0" || "$DRAIN_UNDER_LOAD" == "1" ]] \
+  || fatal "DRAIN_UNDER_LOAD 只能是 0 或 1，收到 '$DRAIN_UNDER_LOAD'（这一档改的是取数顺序，不是一个可以调大小的旋钮）"
+[[ "$DRAIN_SETTLE_IN_WINDOW" =~ ^[0-9]+$ ]] || fatal "DRAIN_SETTLE_IN_WINDOW 要的是非负整数秒，收到 '$DRAIN_SETTLE_IN_WINDOW'"
+if [[ "$DRAIN_UNDER_LOAD" == "1" ]] && (( HOLD_SECONDS <= DRAIN_SETTLE_IN_WINDOW + 5 )); then
+  fatal "排水档要求 HOLD_SECONDS($HOLD_SECONDS) > DRAIN_SETTLE_IN_WINDOW($DRAIN_SETTLE_IN_WINDOW)+5：窗口还没开始就发信号，量的就不是'负载下的排水'"
+fi
 
 if [[ "$CANONIC" == "1" ]]; then
   note "口径：SLO #2 写死的那一套（$CONNECTIONS 连接对 / $TARGETS 个目标地址 / $UPSTREAM_ENDPOINTS 个回源端点 / 静置 ${HOLD_SECONDS}s）"
@@ -131,6 +155,10 @@ wait_for_line() { # pid logfile pattern [seconds]
   done
   return 1
 }
+
+# 网关自报的键值。定义放在这里（而不是只放在终局段）：排水档在网关退出之后立刻要读
+# drain_* 那几个计数，那时终局段还没执行到。函数定义本身没有副作用，两处使用共用一份。
+gval() { sed -n "s/^\[serve\] $1=\([0-9-]*\).*/\1/p" "$OUT/gateway.log" | head -1; }
 
 # 网关/上游/客户端都从子 shell 起，fd 软上限靠继承（脚本上面的 ulimit）。
 start_upstream() {
@@ -221,6 +249,118 @@ note "客户端目标地址（$TARGETS 个）：$TADDRS"
           --report-every-seconds 10 > "$OUT/client.log" 2>&1 &
 C_PID=$!
 
+# ===================== 排水档（S2-07 第六项，DRAIN_UNDER_LOAD=1）=====================
+# 这一档只回答一个问题：**N 条隧道在负载下排水要多久**，以及默认 `--drain-timeout-ms 5000`
+# 在这个规模下站不站得住。它不产出每连接内存与空闲 CPU——稳态窗口被 SIGTERM 打断了，那两格
+# 没有口径，summary 里明写 not_applicable。
+#
+# 为什么非得由脚本发信号：主档的顺序天然是"客户端先退、再停网关"，于是隧道是被客户端退出
+# 那一刻的 FIN 级联关掉的（三档 25k 实测 `drain_tunnels_hard_closed=0`），排水全程没活干。
+# 那句话我在 B-006 里写过、已在 S2-06a 撤掉。这一档就是把发信号挪到客户端还持有连接的时候。
+if [[ "$DRAIN_UNDER_LOAD" == "1" ]]; then
+  note "排水档：客户端仍持有全部连接时给网关发 SIGTERM。这一档不产出每连接内存/空闲 CPU。"
+  # 只取**最后一条** tag=progress 整行来解析：`established=` 同样出现在每个 target 行上，
+  # 按"最后一行匹配"会取到地址分账而不是总数（终局段那个坑在这里是同一个）。
+  pval() {
+    local lp
+    lp=$(grep '^\[c100k\] tag=progress' "$OUT/client.log" | tail -1)
+    awk -v k="$1" '{for (i = 1; i <= NF; ++i) {p = index($i, "="); if (p > 0 && substr($i, 1, p - 1) == k) print substr($i, p + 1)}}' <<<"$lp" | tail -1
+  }
+  DEADLINE=$(( (RAMP_MS / 1000) + HANDSHAKE_TIMEOUT_MS / 1000 + 120 ))
+  EST_AT_SIGNAL=""
+  for (( i = 0; i < DEADLINE * 2; ++i )); do
+    if ! kill -0 "$C_PID" 2>/dev/null; then note "客户端在达标之前就退出了（见 client.log 末尾）"; break; fi
+    E=$(pval established); FC=$(pval failed)
+    if [[ "$E" == "$CONNECTIONS" && "$FC" == "0" ]]; then EST_AT_SIGNAL="$E"; break; fi
+    sleep 0.5
+  done
+  [[ -n "$EST_AT_SIGNAL" ]] || fatal "排水档没等到 established==$CONNECTIONS 且 failed=0 → 前提不成立，这一轮量的不是「负载下的排水」。最后一条进度行：$(grep '^\[c100k\] tag=progress' "$OUT/client.log" | tail -1)"
+
+  # 发信号之前把网关当前的持有量拍一张照：这一行的作用是让"负载下"这三个字有据可查
+  # （fd ≈ 2×连接对 + 常驻项、RSS 到 MiB 级），而不是由我说"当时肯定还满着"。
+  FD_AT_SIGNAL=$(ls "/proc/$G_PID/fd" 2>/dev/null | wc -l | tr -d ' ')
+  RSS_AT_SIGNAL=$(gw_rss_kib "$G_PID")
+  note "发信号前：established=$EST_AT_SIGNAL 网关 fd=${FD_AT_SIGNAL:-?} VmRSS=${RSS_AT_SIGNAL:-?}KiB → 静置 ${DRAIN_SETTLE_IN_WINDOW}s（窗口共 ${HOLD_SECONDS}s）后打信号"
+  sleep "$DRAIN_SETTLE_IN_WINDOW"
+
+  # 采样线程先停：排水期间 fd 与 RSS 本来就要一路掉到底，那条 fd 污染门是给"空闲 CPU"
+  # 那一格设的，这一档没有那一格，留着它只会让脚本自己 die。
+  kill -TERM "$SAMPLE_PID" 2>/dev/null; wait "$SAMPLE_PID" 2>/dev/null; SAMPLE_PID=""
+
+  T_SIG=$(date +%s.%N)
+  note "SIGTERM → 网关 pid=$G_PID（--drain-timeout-ms=$DRAIN_TIMEOUT_MS）于 $(date -Is)"
+  kill -TERM "$G_PID" 2>/dev/null
+  # 0.05s 一轮：这一档的产出就是"从信号到自己退出"这个时长，0.5s 的粒度会把 0.11s 那种
+  # 形状读成 0.0s 或 0.5s，把小规模的形状抹平。
+  for (( j = 0; j < 6000; ++j )); do kill -0 "$G_PID" 2>/dev/null || break; sleep 0.05; done
+  if kill -0 "$G_PID" 2>/dev/null; then
+    fatal "网关收到 SIGTERM 后 300s 仍未退出，且 --drain-timeout-ms=$DRAIN_TIMEOUT_MS 的兜底也没接管：这一轮没有可报的排水时长"
+  fi
+  T_EXIT=$(date +%s.%N)
+  wait "$G_PID" 2>/dev/null; GW_RC=$?
+  DRAIN_SECONDS=$(awk -v a="$T_SIG" -v b="$T_EXIT" 'BEGIN{printf "%.3f", b - a}')
+
+  # 客户端此刻才退场。它的退出码**按设计**是非 0（网关先没了 → 它按"收到信号，提前结束"收工，
+  # 而 stop_reason 非 0 正是那个工具自己的"这一轮不进文档"标志）。这里不等它自然结束：等它
+  # 跑完 hold 就已经过了这一档要的那一瞬间。发信号那一刻的前提由上面那张快照负责证明。
+  kill -TERM "$C_PID" 2>/dev/null; wait "$C_PID" 2>/dev/null; CLIENT_RC=$?
+  kill -TERM "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null; UP_PID=""
+  note "网关从 SIGTERM 到自己退出：${DRAIN_SECONDS}s（退出码=$GW_RC）；客户端退出码=$CLIENT_RC（本档设计如此，不作判据）"
+
+  LIVE=$(gval live_connections)
+  CONSTRUCTED=$(gval connections_constructed); DESTRUCTED=$(gval connections_destructed)
+  FD_START=$(gval fd_start); FD_END=$(gval fd_end)
+  DOWN_ACCEPTED=$(gval downstream_accepted); UP_OPENED=$(gval upstream_opened)
+  UPGRADES=$(gval upgrades_101)
+  DRAIN_REQ=$(gval drain_requested); DRAIN_TUNNEL=$(gval drain_tunnels_hard_closed)
+  DRAIN_FORCED=$(gval drain_forced_timeout); DRAIN_IDLE=$(gval drain_closed_idle)
+  DRAIN_BUFFERED=$(gval drain_closed_buffered); DRAIN_REJ=$(gval drain_rejected_new_connections)
+  DRAIN_INFLIGHT=$(gval drain_in_flight_at_entry)
+  UPSTREAM_SERVED=$(sed -n 's/.*accepted=\([0-9]*\).*/\1/p' "$OUT/upstream.log" | tail -1)
+  UPSTREAM_BY_ADDR=$(sed -n 's/.*accepted_by_addr=\(.*\)/\1/p' "$OUT/upstream.log" | tail -1)
+
+  # ---- 验收句的六项，逐项断（TASKS S2-07 第六项）----
+  (( GW_RC == 0 )) || die "网关退出码 $GW_RC：优雅停止没生效"
+  [[ "$DRAIN_TUNNEL" == "$EST_AT_SIGNAL" ]] \
+    || die "drain_tunnels_hard_closed=${DRAIN_TUNNEL:-?} ≠ established=${EST_AT_SIGNAL}：排水没有把每一条隧道都按硬关收尾——这正是这一档要抓的那件事，不是这一档的失败"
+  [[ "$DRAIN_FORCED" == "0" ]] \
+    || die "drain_forced_timeout=${DRAIN_FORCED:-?} ≠ 0：兜底在 ${DRAIN_SECONDS}s 就接管了（--drain-timeout-ms=$DRAIN_TIMEOUT_MS）。$CONNECTIONS 条隧道的扫描成本超过了这个值 → 默认 5000 在这个规模下站不住，照记"
+  [[ "$LIVE" == "0" ]] || die "live_connections=${LIVE:-?}：排水没收干净（S2-05 的判据）"
+  [[ -n "$CONSTRUCTED" && "$CONSTRUCTED" == "$DESTRUCTED" ]] \
+    || die "constructed=${CONSTRUCTED:-?} / destructed=${DESTRUCTED:-?}：有对象没被释放"
+  [[ -n "$FD_START" && "$FD_START" == "$FD_END" ]] || die "fd ${FD_START:-?}→${FD_END:-?} 没回基线"
+  [[ -n "$FD_AT_SIGNAL" && "$FD_AT_SIGNAL" != "0" ]] || die "发信号前拍不到网关 fd：这一档证明不了「负载下」"
+  # 隧道档里这两格应当是 0；不是 0 不判失败，因为它有两种合法解释（有的连接还没进隧道），
+  # 报出来让人看见，不由我替它选一个解释。
+  note "排水分账：requested=${DRAIN_REQ:-?} 硬关隧道=${DRAIN_TUNNEL:-?} 空闲关=${DRAIN_IDLE:-?} 带缓冲关=${DRAIN_BUFFERED:-?} 兜底强关=${DRAIN_FORCED:-?} 拒绝新连接=${DRAIN_REJ:-?} 入场时在飞=${DRAIN_INFLIGHT:-?}"
+
+  SUMMARY="$OUT/c100k.summary.txt"
+  {
+    echo "# SLO #2 排水档（c100k.sh DRAIN_UNDER_LOAD=1）canonic=$CANONIC"
+    echo "date=$(date '+%Y-%m-%d %H:%M:%S') host=$(uname -r) nproc=$(nproc) mem_total_mib=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)"
+    echo "malloc=$("$BIN/l7gate" --self-check | sed -n 's/.*malloc=\([^ ]*\).*/\1/p')"
+    echo "mode=drain-under-load planned_pairs=$CONNECTIONS established_at_signal=$EST_AT_SIGNAL targets=$TARGETS upstream_endpoints=$UPSTREAM_ENDPOINTS workers=$WORKERS ramp_ms=$RAMP_MS hold_seconds=$HOLD_SECONDS settle_in_window=$DRAIN_SETTLE_IN_WINDOW"
+    echo "at_signal: gateway_fd=${FD_AT_SIGNAL:-?} gateway_rss_kib=${RSS_AT_SIGNAL:-?} downstream_accepted=$DOWN_ACCEPTED upstream_opened=$UP_OPENED upgrades_101=$UPGRADES"
+    echo "drain: timeout_configured_ms=$DRAIN_TIMEOUT_MS signal_ts=$T_SIG exit_ts=$T_EXIT drain_seconds=$DRAIN_SECONDS gw_rc=$GW_RC client_rc=$CLIENT_RC"
+    echo "drain_accounting: requested=${DRAIN_REQ:-?} tunnels_hard_closed=${DRAIN_TUNNEL:-?} closed_idle=${DRAIN_IDLE:-?} closed_buffered=${DRAIN_BUFFERED:-?} forced_timeout=${DRAIN_FORCED:-?} rejected_new=${DRAIN_REJ:-?} in_flight_at_entry=${DRAIN_INFLIGHT:-?}"
+    echo "lifecycle: live=${LIVE:-?} constructed=${CONSTRUCTED:-?} destructed=${DESTRUCTED:-?} fd=${FD_START:-?}->${FD_END:-?}"
+    # 这两格在排水档**没有口径**：稳态窗口被 SIGTERM 打断，算出来的任何数都不是"空闲"。
+    # 写成一行 not_applicable，是为了让下一轮有人 grep 到这一档时不会把空值读成 0。
+    echo "per_pair_kib=not_applicable=drain-mode idle_cpu_one_core_pct=not_applicable=drain-mode"
+    echo "upstream: accepted=${UPSTREAM_SERVED:-?} accepted_by_addr=${UPSTREAM_BY_ADDR:-?}"
+  } > "$SUMMARY"
+  echo
+  note "原始输出：$OUT/（client.log、gateway.log、upstream.log、gw-samples.log、env-snapshot.out）"
+  note "汇总：$SUMMARY"
+  if (( FAILED == 0 )); then
+    echo "c100k 排水档：全绿——$EST_AT_SIGNAL 条隧道在客户端仍持有时被硬关，SIGTERM→退出 ${DRAIN_SECONDS}s，兜底一次没用上"
+  else
+    echo "c100k 排水档：有 ✗，见上面（数字仍然落在 $SUMMARY，未达标照记）"
+  fi
+  exit "$FAILED"
+fi
+# ===================== 以下为主档（DRAIN_UNDER_LOAD=0），形状未变 =====================
+
 # 等客户端打印 established==planned（或失败）。总预算：ramp + hold + 握手超时 + 60s 余量。
 BUDGET=$(( (RAMP_MS / 1000) + HOLD_SECONDS + HANDSHAKE_TIMEOUT_MS / 1000 + 60 ))
 CLIENT_RC=0
@@ -248,7 +388,6 @@ note "客户端退出码=$CLIENT_RC（0 = 计划连接全部建立且零失败�
 #       起到文件尾"整块，再把 target 行剔掉——剔掉是因为它们也带 established= 这个键。
 FINAL_C100K=$(awk '/^\[c100k\] tag=final/{f=1} f && !/^\[c100k\] target=/{print}' "$OUT/client.log")
 cval() { awk -v k="$1" '{for (i = 1; i <= NF; ++i) {p = index($i, "="); if (p > 0 && substr($i, 1, p - 1) == k) print substr($i, p + 1)}}' <<<"$FINAL_C100K" | tail -1; }
-gval() { sed -n "s/^\[serve\] $1=\([0-9-]*\).*/\1/p" "$OUT/gateway.log" | head -1; }
 
 ESTABLISHED=$(cval established); FAILED_CONNS=$(cval failed)
 HANDSHAKE_P50=$(cval handshake_p50_us); HANDSHAKE_P99=$(cval handshake_p99_us)

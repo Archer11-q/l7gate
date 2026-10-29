@@ -30,6 +30,11 @@ BODY_BYTES="${BODY_BYTES:-1024}"          # SLO 写死 1 KiB
 CONNECTIONS="${CONNECTIONS:-1000}"        # SLO 写死 1000 并发
 DURATION="${DURATION:-60s}"               # SLO 写死稳态 60 s
 WARMUP="${WARMUP:-10s}"                   # 预热不计入
+# 网关的 worker 数（S2-01）。它**不是** SLO #1 的测量条件——契约那五条里没有任何一条提到
+# 线程数；worker 数属于**被测系统本身**，所以它可以是 A/B 的因子而不算改口径。缺省 1 = 单
+# Reactor = B-001…B-007 那八份的形状（`--workers 1` 在 main.cc 里就是缺省路径，横幅同形）。
+# S2-07 要判"多 Reactor 有没有把排队打下来"，就得让这一臂跑到 16，其余条件一个字不动。
+WORKERS="${WORKERS:-1}"
 WRK_THREADS="${WRK_THREADS:-8}"
 HEY_DURATION="${HEY_DURATION:-30s}"
 HEY_CONNS="${HEY_CONNS:-$CONNECTIONS}"
@@ -59,7 +64,10 @@ command -v wrk >/dev/null || { echo "本机没有 wrk：SLO #1 的主测量工�
 command -v hey >/dev/null || { echo "本机没有 hey：SLO #1 的交叉验证工具" >&2; exit 1; }
 
 # 经网关那一组要 2×并发 个 fd（一条客户端连接配一条回源连接），加上监听/epoll/eventfd。
-NEED_FD=$(( CONNECTIONS * 2 + 64 ))
+# worker 数也要进这个数：多 Reactor 路径下常驻项是 1 个监听 + (1+N) 个 epoll/eventfd，
+# 少了这一项，workers=16 那一臂可能不是"跑慢了"而是"第 2064 个 fd 起就失败"。
+[[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || { echo "WORKERS 要是正整数，收到 '$WORKERS'" >&2; exit 1; }
+NEED_FD=$(( CONNECTIONS * 2 + 64 + WORKERS * 2 ))
 HAVE_FD=$(ulimit -n)
 note "wrk: $(wrk --version 2>&1 | head -1)"
 note "hey: $(hey 2>&1 | grep -m1 -E 'hey version|^Usage' || true)"
@@ -90,6 +98,9 @@ wait_for_line() { # pid logfile pattern [seconds]
   return 1
 }
 
+# 取网关自报的键值。定义放在收尾段（那里是它唯一的使用点）；起跑时的路径核对不用它，
+# 因为 `[serve] workers=N` 那行是 run() 返回之后才打印的——起跑那一刻只有横幅可看。
+
 start_upstream() {
   # 容量要留**跨轮的余量**，不是刚好等于并发数：上一轮（wrk 预热）的连接在工具
   # 退出后才被事件批逐个回收，下一轮（wrk 稳态）可能已经带着 1000 条新连接进来了。
@@ -105,12 +116,26 @@ start_upstream() {
 
 start_gateway() {
   "$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" --upstream "127.0.0.1:$UP_PORT" \
+    --workers "$WORKERS" \
     > "$OUT/gateway.log" 2>&1 &
   G_PID=$!
   if ! wait_for_line "$G_PID" "$OUT/gateway.log" '\[serve\] 监听'; then
     die "网关起不来"; exit 1
   fi
-  note "网关 pid=$G_PID port=$GATEWAY_PORT"
+  # 这一臂到底走的是哪条路径，由**横幅签名**当场判，不由我口头记：
+  #   多 Reactor 横幅 = `（workers=N backlog=… max_connections_per_worker=… upstream_endpoints=…`
+  #   单 Reactor 横幅 = `（backlog=… max_connections=… upstream=127.0.0.1:PORT …`
+  # 两条各只有自己那一个键，所以"我传了 --workers 16 但其实跑的回退路径"是当场红，不是
+  # 事后读报告发现两臂其实是同一个形状。（`[serve] workers=N` 那行是 run() 返回之后才打印的，
+  # 起跑时读不到；它在下面收尾段与请求值再对一次账。）
+  if (( WORKERS >= 2 )); then
+    grep -q "^\[serve\] 监听 .*（workers=$WORKERS " "$OUT/gateway.log" \
+      || { die "请求 --workers $WORKERS，但网关横幅不是多 Reactor 路径：这一臂作废"; exit 1; }
+  else
+    grep -q "^\[serve\] 监听 .*max_connections=" "$OUT/gateway.log" \
+      || { die "请求 --workers 1，但网关横幅不是单 Reactor 路径：这一臂作废"; exit 1; }
+  fi
+  note "网关 pid=$G_PID port=$GATEWAY_PORT workers=$WORKERS（路径签名已核对）"
 }
 
 # wrk 跑一轮：预热一遍（结果丢掉）+ 正式一遍（存盘）。
@@ -257,6 +282,9 @@ kill -TERM "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
 gval() { sed -n "s/^\[serve\] $1=\(.*\)$/\1/p" "$OUT/gateway.log" | head -1; }
 uval() { sed -n "s/^\[bench-upstream\].*$1=\([0-9]*\).*/\1/p" "$OUT/upstream.log" | head -1; }
 LIVE=$(gval live_connections); FD0=$(gval fd_start); FD1=$(gval fd_end)
+GW_WORKERS=$(gval workers); [[ -n "$GW_WORKERS" ]] || GW_WORKERS=1   # 单 Reactor 路径不打印这一行
+[[ "$GW_WORKERS" == "$WORKERS" ]] \
+  || die "网关退出时自报 workers=$GW_WORKERS，请求的是 $WORKERS：这一臂的线程模型不是我要的那一个"
 REFUSED=$(uval refused_over_capacity); ADDFAIL=$(uval refused_addfail)
 PEAK=$(uval peak_clients)
 [[ "${LIVE:-x}" == "0" ]] || die "静置 ${SETTLE}s 后仍有存活连接 ${LIVE:-?}：这是真漏，不是杀太早"
@@ -284,6 +312,10 @@ REPORT="$OUT/s1-p99.summary.txt"
 {
   echo "# SLO #1 转发尾延迟 —— $(date -Is)"
   echo "口径 canonic=$CANONIC  preset=release  body=${BODY_BYTES}B  conns=${CONNECTIONS}  duration=${DURATION}  warmup=${WARMUP}  wrk_threads=${WRK_THREADS}"
+  # workers 单独一行、不进 canonic 的判据：SLO #1 写死的五条里没有线程数，它是被测系统的属性。
+  # 把它混进口径行会制造一个假等式——"workers 变了就不是标准口径"，而 S2-07 要的恰恰是
+  # 同一个标准口径下比两种线程模型。自报值一并列，读者不用信我说的是哪一臂。
+  echo "被测系统 workers=$WORKERS（网关自报 ${GW_WORKERS}；单 Reactor 路径不打印这一行，取 1）"
   echo "工具: $(wrk --version 2>&1 | head -1) / $(hey 2>&1 | grep -m1 'hey version' || echo hey)"
   echo "ulimit -n=${HAVE_FD}  nproc=$(nproc)  CPU=$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | head -1)"
   echo "绑核：未做（cpuset 方案按 ENVIRONMENT.md 第 7 节留到 S4 定稿；这条不是口径变更，是从未声明过绑核）"

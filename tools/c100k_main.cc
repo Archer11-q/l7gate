@@ -507,22 +507,40 @@ class Client {
     while (true) {
       const ssize_t n = ::recv(conn->fd.get(), scratch_.data(), scratch_.size(), MSG_DONTWAIT);
       if (n > 0) {
-        for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i) {
-          const char c = scratch_[i];
-          if (!conn->head_seen && conn->prefix_pos < prefix.size()) {
-            if (c != prefix[conn->prefix_pos]) conn->prefix_ok = false;
-            ++conn->prefix_pos;
-          }
+        const std::size_t got = static_cast<std::size_t>(n);
+        std::size_t i = 0;
+        while (i < got) {
           if (conn->head_seen) {
             // 头齐了之后按体计：完结 = 读满 `--expect-body-bytes` 个字节。这里**不解析
             // Content-Length**，因为那要把响应框架搬进测量工具（ADR-17：工具越薄，
             // 它自己的内存越不可能是被测对象的一部分）。代价写在用法里：这一段只对
             // 那个固定体夹具成立。
-            if (conn->body_remaining > 0) --conn->body_remaining;
+            //
+            // **整块数，不逐字节**。判据一个字没改，改的只是数法，理由在观察者自己：
+            // 1000 并发闭环下直连那一臂跑到 171,037 响应/秒，逐字节循环要 186 M 次/秒，
+            // 实测把客户端自己压到单核 1.00（`self_cpu_ticks=3097` ÷ `elapsed=31.0 s`）。
+            // 观察者顶满时，直连与经网关两条线都被我自己的排队抬高、而且抬的方式相同，
+            // **增量因此被压缩**——那就不再是"网关引入多少"这个量。ADR-17 要求观察者自报
+            // CPU 不只是"能看见"，它得能逼出这种修正。
+            const std::size_t take = std::min(got - i, conn->body_remaining);
+            if (take == 0) return;  // 配额跑完后 head_seen 还挂着而体已经数光：再转一圈就是死循环，
+                                    // 而且会把同一条响应第二次记进直方图
+            conn->body_remaining -= take;
+            i += take;
             if (conn->body_remaining == 0) {
-              if (!finish_response(conn)) return;  // 这条连接已收尾/失败
+              // 一条响应就是一次闭环的终点：本轮 recv 到此为止。夹具要先收到下一条请求才会
+              // 再写一条响应，而下一条请求是 finish_response 里刚发出去的，所以同一次 recv
+              // 不可能带着两条响应；继续数下去数到的是空手。
+              (void)finish_response(conn);
+              return;
             }
             continue;
+          }
+          const char c = scratch_[i];
+          ++i;
+          if (!conn->head_seen && conn->prefix_pos < prefix.size()) {
+            if (c != prefix[conn->prefix_pos]) conn->prefix_ok = false;
+            ++conn->prefix_pos;
           }
           switch (conn->match_state) {
             case 0:
