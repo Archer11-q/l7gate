@@ -41,16 +41,16 @@
 
 ## 现在能做什么
 
-`l7gate --serve --listen <ip:port> --upstream <ip:port>[,<ip:port>...] [--workers N]` 起事件循环（`--workers 1` 是缺省的单线程 epoll ET；`--workers N≥2` 起 N 条 worker 循环线程，主线程 accept 后 round-robin 派发，连接对象单线程拥有，ADR-03/ADR-14），已经能：
+`l7gate --serve --listen <ip:port> --upstream <ip:port>[,<ip:port>...] [--workers N] [--route <前缀>=<端点下标>]... [--route-regex <锚定正则>=<端点下标>]...` 起事件循环（`--workers 1` 是缺省的单线程 epoll ET；`--workers N≥2` 起 N 条 worker 循环线程，主线程 accept 后 round-robin 派发，连接对象单线程拥有，ADR-03/ADR-14），已经能：
 
 - 把下游解析出的完整请求按**原始字节**搬到上游，响应原样搬回，keep-alive 复用同一条回源连接
 - 认得一条响应在哪里结束：七种框架结论 + chunked 边界游标（只数边界、不重组 body）
 - 在头没出去时自产 502，头已出去时只以连接终止表态——**绝不给同一条请求发两条响应**
 - 双条件命中（`Connection` 含 `upgrade` 记号 **且** 有 `Upgrade` 头）后整条连接转纯字节隧道：帧不解析、不改写（ADR-09）
 - 撞停读线就摘掉这条 fd 的 `EPOLLIN`，水位回落时带一次主动探测读挂回来（边沿触发不为已经在里的字节负责）
-- 按配置顺序过 filter 链——**链已立，今天没有业务 filter**
+- 按配置顺序过 filter 链；**S3-01 起链上有第一个业务 filter：路由**（前缀取最长命中、正则全串锚定且优先于前缀，无匹配回 404 且**不回源**）。决策是纯函数（`src/route/`，不碰 fd），目的地通过 `RequestInfo` 的写回通道交给回源路径
 
-还没有的：路由、负载均衡、限流、熔断、指标暴露、配置热重载。（多 Reactor、上游连接池、配对模型与 pipeline/`close` 语义、优雅停止/排水都已落地——逐条证据在下面那张表。**`--upstream` 的端点列表不是负载均衡**：第 i 条 worker 只用第 `i mod E` 个端点，静态、按请求不选、不带健康检查（那三者仍归 S3），所以回源那一跳的容量 = `min(worker 数, 端点数) × 单元组容量`（本机实测 28,232）——`--workers 1` 时多给端点也用不上。）
+还没有的：负载均衡三策略、被动/主动健康检查与摘除安全阀、限流、熔断、指标暴露、配置热重载。（多 Reactor、上游连接池（**S3-01 起按目标分桶，仍 per-worker**）、配对模型与 pipeline/`close` 语义、优雅停止/排水都已落地——逐条证据在下面那张表。**`--route` / `--route-regex` 是 S3-01 的临时装配面**：路由与上游节点表的配置文件格式归 S3-02，届时这一对开关被文件取代、不留兼容层。**一条路由 = 一个目标下标**，一条路由配多个后端、按请求在轮询/最少连接/一致性哈希之间选，是 S3-02（ADR-19）。**回源容量公式分岔**：没装路由 filter 时仍是 `min(worker 数, 端点数) × 单元组容量`（本机实测 28,232，所以 B-007 那档要求 `--workers ≥ 4`）；装了路由之后每个 (worker, 目标) 元组各自有 28,232 的余量，`--workers 1` 也能按请求连多个端点。）
 
 <details>
 <summary><b>逐条验收证据（点开）</b>——每个数字都来自本轮重跑，不是记忆</summary>
@@ -72,6 +72,7 @@
 | 测量手段／SLO #2 取数（S2-06） | 自研长连接客户端 `tools/c100k_main.cc`（契约 1.3 唯一许可自研的场景，手段变更记录在 [ADR-17](docs/adr/ADR-17-c100k-hdr-measurement.md)）+ `scripts/bench/c100k.sh`。**两种形态**：默认「握手后空闲」测 #2（每连接对内存、稳态散布、空闲 CPU 两栏分母），`--requests-per-conn` 测**每请求**延迟——#1 的 p999 只有后者能给。分位数是 HDR 风格两级直方图（1 µs 桶到 1 ms，其后每倍频程 16 桶）**带误差棒**，不报单点；100k 条连接靠 **4 个目标地址**（实测单元组上限 28,232，目标地址数与每地址连接数一律写进报告）。**工具自己要有等式**：客户端条数 == 网关 `requests_parsed` == `responses_completed` == 上游 `requests`，外加两条字节等式与一条量纲口算——就是这套东西抓出了我自己的三个错（限速其实没限速、观测打印压死事件循环、`EPOLLOUT` 没摘把延迟读成 4 µs），逐条在 [FAULT-INJECTION 第 7 节](docs/FAULT-INJECTION.md) |
 | 回源多端点（S2-06a，ADR-17 候选 A） | `--upstream` 接受端点列表，**worker i 只用第 `i mod E` 个**（静态、按请求不选、无健康检查——那三者仍归 S3）。回源容量因此 = `min(worker, E) × 28,232`（实测单元组上限）。`S2_06a_MultiEndpoint` 三条用**不同体长的两个/三个 `TestUpstream`** 区分端点，断"各 worker 打各的端点""4 worker×2 端点按 `i mod 2` 各 2 条""**端点数 > worker 数时多出来的端点服务数 == 0**"；阳性验证：把 `i mod E` 改成常量 `0` → **三条同时红**，改回后三 preset 各 **135/135**、tsan 零 race。真进程侧由夹具自己打 `accepted_by_addr=`：2 worker×4 端点 400 条 → `127.0.0.1:200,127.0.0.2:200`（第 3、4 个地址 0 条）；25k 档 → 四地址各 **6,250**。顺带修掉一个取数定义：`c100k.sh` 的稳态窗口右界现在钉在客户端存活期，否则客户端退出那一刻的 FIN 风暴会被算进"空闲 CPU"（实测把 0.21% 抬成 1.57%）。详见 ARCHITECTURE 1.21 |
 | S2-07 · 三个数字按取样规程重测 | ① **#1 的线程模型 A/B**：`s1-p99.sh` 加 `WORKERS`（缺省 1＝与历史八份逐字同形），同机交替各 3 轮 → workers=1 的 32.990–35.210 ms 打到 workers=16 的 **4.160–6.290 ms**，组内极差 2.1–2.2 ms、两系列不重叠（B-008）。脚本现在按**横幅签名**当场判路径，防止"A/B 两臂其实跑的是同一个形状"。② **p999**：新脚本 `scripts/bench/s1-p999.sh`（两臂各自 ≥60 s 窗口门 + 每臂自报观察者 CPU + 等式 `direct+proxy == upstream`），1000 并发那一档**如实记"取不到"**——两臂都贴着单核上限，同一份分布的 p99 增量与 wrk 线差 6 倍（B-009）。③ **构成表**：2 条 `S2_07_MemoryComposition` 复刻生产的分配形状逐项量出来，堆实测 17,861 B/对 vs 生产 17,889 B/对（0.16%），并把 S1-07 那 0.50 KiB 空项归到"N=128 处 VmRSS 没有分辨率"（B-011）。④ **负载下的排水**：`c100k.sh` 加 `DRAIN_UNDER_LOAD=1`，客户端仍持有 100k 条连接时发 SIGTERM → **0.947 s** 收干净、`hard_closed == established`、兜底一次没用上，默认 5000 ms 站得住（B-010，S4 的"请求超时 ≤ drain"对齐由此有依据） |
+| 路由作为链上的一环（S3-01，ADR-18） | **链上第一个业务 filter**。决策是纯函数（`src/route/router.{h,cc}`：前缀**最长命中优先**、正则**全串锚定**且**优先于前缀**、匹配原始 origin-form 含 query 不解码不规范化）；无匹配 → **404** 走 S1-06 那张自产响应表的同一形状，且实测 `upstream_opened=0`（**拦下来就真的没回源**）。目标通过 `RequestInfo` 新加的 `upstream_target`/`reject_status` 交回主路径（`Decision` 没加第三个值、`ForwardOutcome` 没加第四个值）。**池按目标分桶但仍 per-worker 不 shared**（ADR-15 追加节）：`upstream_pool_` 是 `vector<vector<…>>`，`pool_max_idle` 变成**每 worker 每目标**，`pool_idle_count()` 改成各桶之和，`sizeof(Connection)` 仍 **528**（`static_assert` 钉住，因为 B-011 那张构成表按它算账）。**目标只在干净边界换**（`in_flight==0` + `outbound_pending==0` + `upstream_reusable`），换不动就压住这条请求，代价是 `pump_response` 的 `kComplete` 补一次重驱动——**不补是一条会挂死的环**（摘掉它：102 ms → 5,486 ms 红在读超时）。实测：三 preset 各 **164/164**、非 gtest 警告各 0 条、**tsan 零 data race**；`/b` 那条请求 `upstream_opened=1` 且另一个后端自报 `connections_accepted=0`；成本对照见 **B-012**（空链 vs 路由链，每请求 `epoll_ctl` 4.0000–4.0005 → **无可分辨成本**） |
 | sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **137/137**，非 gtest 警告 **0 条**（其中 `asan-ubsan` 与 `tsan` 各有 **2 条 Skipped**：构成表的数值判定——sanitizer 换了分配器后 `mallinfo2()` 一律报 0，所以**跳过＝不判，不是通过**，结构那一半照判）；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过三次：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn → 报 **14 处**，S2-05 把排水的跨线程标志做成普通 `bool` → 6 条排水用例里 **5 处 data race**，每次都还原后全绿——"TSan 干净"是能红的绿。排水机制另有三次逻辑阳性验证（摘守卫→3 条红、摘隧道分支→1 条红、关 accept 拒绝→1 条红），以及**一次"拆了也不红"的诚实记录**：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条 |
 | 跨线程销毁（S2-03） | per-worker 池让"连接被非 owner 线程持有"的 harder 竞态**没出现**（所有 `shared_ptr` 持有者都在同一 worker 线程内，析构必在 owner 线程，跨线程只流动裸 fd）。红队三条 `S2_03_CrossThreadDestruction`：负载活跃时 stop、handoff 的 fd 注册前被对端关、连接风暴——tsan 零 race、asan/LSan 零 UAF 零泄漏。销毁协议定稿在 ADR-14 |
 

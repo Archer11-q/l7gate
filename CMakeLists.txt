@@ -135,6 +135,7 @@ find_package(Threads REQUIRED)
 add_library(l7gate_core STATIC
   src/core/build_info.cc
   src/filter/chain.cc
+  src/filter/route_filter.cc
   src/net/buffer.cc
   src/net/connection.cc
   src/net/epoll.cc
@@ -145,6 +146,7 @@ add_library(l7gate_core STATIC
   src/http/request_parser.cc
   src/http/response_framing.cc
   src/http/response_head.cc
+  src/route/router.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
 target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers Threads::Threads)

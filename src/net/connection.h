@@ -78,6 +78,16 @@ class Connection {
   int peer_fd() const noexcept { return peer_fd_; }
   void set_peer_fd(int fd) noexcept { peer_fd_ = fd; }
 
+  // --- 这条上游连到的是哪一个目标（S3-01，ADR-18）------------------------------
+  // 它是一个**标签**，不是决策：路由决策在 filter 链和 reactor 手里，这里只回答
+  // "我这条热连接当初是连到第几号目标端的"，让 reactor 归还进池时能认出自己的桶
+  // （`close_connection` 的级联只交给我一条 `Connection`，不交给我目的地）。
+  // 顶部那句"它不做路由、不做转发决策"因此仍然成立——**存一个下标不等于做一次选择**。
+  // 只在 owner worker 线程读写（ADR-14），非原子。默认 0：与"单目标配置下只有一个桶"
+  // 同形，所以它不需要构造函数改动，也不给 S1/S2 的任何既有用例添噪声。
+  std::uint16_t upstream_target() const noexcept { return upstream_target_; }
+  void set_upstream_target(std::uint16_t target) noexcept { upstream_target_ = target; }
+
   // --- epoll 兴趣掩码的镜像（S1-07）---------------------------------------
   // 这里存的是**上一次成功交给 epoll_ctl 的那个 events 值**，不是"我认为应该是什么"。
   // 唯一写它的人是 Reactor 的 register_connection / modify_events（都只在成功分支里写），
@@ -321,6 +331,12 @@ class Connection {
   // 上一次读是否停在停读线上（S1-07）。和 armed_events_ 同一类：只有循环线程碰它，
   // 放在这片 bool 里是因为它们后面还有对齐空位——多一个布尔值不该多付 8 字节。
   bool read_stopped_at_line_ = false;
+  // 这条上游属于哪个目标桶（S3-01）。就是上面那句话兑现的地方：`uint32_t + bool` 之后
+  // 还剩 3 字节空位，一个 `uint16_t` 放进去**不改变 sizeof(Connection)**。
+  // 这条不是洁癖：B-011 的构成表把 `Connection`×2 = 1,056 B 逐条钉进了 17,861 B/对，
+  // 涨 8 字节就是 100k 对多 1.6 MiB，那格账要整张重写。用例 SizesDoNotGrowForTheTargetLabel
+  // 盯着它（能红的断言才算盯，见 528 那个字面量）。
+  std::uint16_t upstream_target_ = 0;
   // 响应跟踪（S1-06）：纯数据，判定与推进全在 reactor 的上游路径（见上面注释）。
   ResponseTracking resp_;
   // 在飞请求计数（S2-04，ADR-16）：见上面的接口注释。它和 resp_ 分开存是有意的——

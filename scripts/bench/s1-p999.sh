@@ -48,6 +48,12 @@ RAMP_MS="${RAMP_MS:-10000}"                # 1000 条摊到 10 s：somaxconn=409
 HANDSHAKE_TIMEOUT_MS="${HANDSHAKE_TIMEOUT_MS:-30000}"
 WORKERS="${WORKERS:-1}"                    # 被测系统的属性，不是 SLO 条件（与 s1-p99.sh 同一个理由）
 GATEWAY_PORT="${GATEWAY_PORT:-18084}"      # 避开 18081（s1-p99）与 18083（c100k）
+# S3-01 成本 A/B 的因子位：**只给经网关那一臂**追加网关参数（例如 "--route /=0"）。
+# 默认空 -> 下面 argv 的构造与 S2 时代逐字相同，所以 B-008/B-009 的可比性不作废。
+# 这里做的是词拆分而不是整串一个参数：值里的空格本来就该是多个 argv 项，
+# 打包成一项会被网关读成"无法识别的选项"，退化成"那一臂其实没配路由"那种安静错误。
+# A/B 的两臂必须只有这一个因子不同，所以它只作用在经网关那一臂，直连臂碰不到它。
+GATEWAY_EXTRA="${GATEWAY_EXTRA:-}"
 SETTLE="${SETTLE:-5}"                      # 工具退场后给网关收连接的时间（S2-05 起这是排水，不是杀进程）
 STEADY_MIN_MS="${STEADY_MIN_MS:-60000}"    # SLO 写死「稳态采样 60 s」：达标看**实际跑出来的窗口**
 REPORT_EVERY_SECONDS="${REPORT_EVERY_SECONDS:-5}"
@@ -175,8 +181,13 @@ D_P50=$R_P50; D_P99=$R_P99; D_P999=$R_P999; D_P9999=$R_P9999; D_HW=$R_HALF_OK
 D_SAMPLES=$R_SAMPLES; D_MEAN=$R_MEAN; D_OBS=$R_OBS_CORES
 
 echo "-- 组 B：经网关转发（同一个上游、同一台机器、同样的连接数与请求数）"
-"$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" --upstream "127.0.0.1:$UP_PORT" \
-  --workers "$WORKERS" > "$OUT/gateway.log" 2>&1 &
+GW_ARGV=("$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" \
+           --upstream "127.0.0.1:$UP_PORT" --workers "$WORKERS")
+if [[ -n "$GATEWAY_EXTRA" ]]; then
+  read -r -a GW_EXTRA_ARGS <<< "$GATEWAY_EXTRA"
+  GW_ARGV+=("${GW_EXTRA_ARGS[@]}")
+fi
+"${GW_ARGV[@]}" > "$OUT/gateway.log" 2>&1 &
 G_PID=$!
 wait_for_line "$G_PID" "$OUT/gateway.log" '\[serve\] 监听' 30 || fatal "网关起不来（$OUT/gateway.log）"
 # 路径签名当场核对：A/B 的两臂如果其实都是单 Reactor，报告里那两个 workers= 就是假话。
@@ -235,7 +246,7 @@ INC_P99_MS=$(awk -v a="${D_P99:-}" -v b="${P_P99:-}" 'BEGIN{ if (a=="" || b=="" 
 REPORT="$OUT/s1-p999.summary.txt"
 {
   echo "# SLO #1 · p999 增量（s1-p999.sh）canonic=$CANONIC —— $(date -Is)"
-  echo "参数: body=${BODY_BYTES}B conns=${CONNECTIONS} requests_direct=${REQUESTS_DIRECT} requests_proxy=${REQUESTS_PROXY} ramp_ms=${RAMP_MS} workers=${WORKERS}(自报 ${GW_WORKERS}) steady_min_ms=${STEADY_MIN_MS}"
+  echo "参数: body=${BODY_BYTES}B conns=${CONNECTIONS} requests_direct=${REQUESTS_DIRECT} requests_proxy=${REQUESTS_PROXY} ramp_ms=${RAMP_MS} workers=${WORKERS}(自报 ${GW_WORKERS}) steady_min_ms=${STEADY_MIN_MS} gateway_extra=${GATEWAY_EXTRA:-（空）}"
   echo "工具: l7gate_c100k 闭环形态（HDR 分位带误差棒）；malloc=$("$BIN/l7gate" --self-check | sed -n 's/.*malloc=\([^ ]*\).*/\1/p')；绑核：未做（同 s1-p99.sh）"
   echo "构建: 只在 release 上跑；sanitizer 下的延迟是检查开销的延迟，不是网关的延迟"
   echo

@@ -304,8 +304,10 @@ TEST(S1_06_Framing, MappingTableOwnsEveryErrorCode) {
 TEST(S1_06_Framing, GatewayRepliesAreCompleteAndSelfConsistent) {
   // 每条自产响应都必须**自己就是合法的 CL 响应**：CL 声明的字节数 == body 实际
   // 字节数，状态行和终止串齐。数错 CL 的"错误响应"本身就是需要被 502 的畸形。
-  for (std::uint16_t status : {std::uint16_t{400}, std::uint16_t{411}, std::uint16_t{413},
-                               std::uint16_t{501}, std::uint16_t{502}}) {
+  // S3-01 加进来的是 404（路由无匹配）。它必须和其余每条一样**自己就是合法的 CL 响应**，
+  // 否则"用一条畸形去表态"这件事会由我自己在 S3 第一次落地。
+  for (std::uint16_t status : {std::uint16_t{400}, std::uint16_t{404}, std::uint16_t{411},
+                               std::uint16_t{413}, std::uint16_t{501}, std::uint16_t{502}}) {
     const std::string_view reply = gateway_error_reply(status);
     ASSERT_FALSE(reply.empty());
     const auto info = analyze_response_head(reply);

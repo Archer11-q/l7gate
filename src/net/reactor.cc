@@ -14,6 +14,7 @@
 
 #include "http/response_framing.h"
 #include "net/socket.h"
+#include "route/router.h"  // kNoUpstreamTarget：链调用点判"filter 没表态"用的那个哨兵
 
 namespace l7gate::net {
 
@@ -117,6 +118,10 @@ Reactor::Reactor(Config config)
     throw std::system_error(errno, std::system_category(), "eventfd");
   }
   wake_fd_ = UniqueFd{fd};
+  // 池的桶数组在构造时按目标表长度定长（S3-01）。运行期不 resize：目标表变长是 S5
+  // 热重载的话题，那时按 ADR-10 换成"整张表换一根指针"，而不是往一个正在被循环读的
+  // 容器里 push（那和"运行期改链"是同一条 race）。
+  upstream_pool_.resize(config_.upstream_targets.size());
 }
 
 Reactor::Reactor(Config config, ReactorStats& shared_stats)
@@ -129,6 +134,7 @@ Reactor::Reactor(Config config, ReactorStats& shared_stats)
     throw std::system_error(errno, std::system_category(), "eventfd");
   }
   wake_fd_ = UniqueFd{fd};
+  upstream_pool_.resize(config_.upstream_targets.size());  // 同上：定长在构造时
 }
 
 Reactor::~Reactor() {
@@ -623,18 +629,42 @@ void Reactor::retry_peer_after_room(const std::shared_ptr<Connection>& conn) {
 }
 
 std::shared_ptr<Connection> Reactor::ensure_upstream(
-    const std::shared_ptr<Connection>& downstream) {
+    const std::shared_ptr<Connection>& downstream, std::uint16_t upstream_target) {
+  // 索引目标表之前先认这条下标。`upstream_target` 是 filter 写回来的值（见链调用点），
+  // 而这里的失败形态不是"回错一个后端"而是越界读，所以检查必须在索引它的那一处。
+  if (upstream_target >= config_.upstream_targets.size()) {
+    return nullptr;  // 装配漏检：当作"这一轮拿不到上游"，请求留在下游缓冲里，
+                     // 不猜一个目标把请求发出去（猜 = 把配置错误读成后端脾气）。
+  }
   const int existing = downstream->peer_fd();
   if (existing != kInvalidFd) {
     auto it = connections_.find(existing);
-    if (it != connections_.end()) return it->second;
+    if (it != connections_.end()) {
+      std::shared_ptr<Connection> paired = it->second;
+      if (paired->upstream_target() == upstream_target) return paired;
+      // **目标变了。** 只有在干净边界上才换：在飞归零 + 出向空 + `upstream_reusable()`。
+      // 这三个条件就是 ADR-15 那条"能不能归还进池"的判据本身（我刻意不另写一套——
+      // "能进池却换不了目标"那种状态没人能解释）。换不动就返回**旧的那条**，由
+      // forward_request 认出桶不对、把这条请求压回下游缓冲：换了就会把 ADR-16 的
+      // 响应 FIFO 打乱（上一条的响应还在 A 路上，下一条却发给 B）。
+      if (paired->in_flight_requests() == 0 && paired->outbound_pending() == 0 &&
+          upstream_reusable(*paired)) {
+        // 先解链，再按**它自己那条目标**归还——顺序和 close_connection 里那条级联归还
+        // 同一个形状：recycle 要求调用方已经解配，否则它会带着一个仍然指向下游的
+        // peer_fd 进池，下一条借它的下游就成了幽灵配对。
+        paired->set_peer_fd(kInvalidFd);
+        downstream->set_peer_fd(kInvalidFd);
+        recycle_upstream(paired);
+      } else {
+        return paired;  // 压住，不是失败
+      }
+    }
+    // 查不到就是那个 fd 已经关了（注册表反查认人，与批内事件同一条纪律）：
+    // 配对关系随它一起消失，落到下面借/新建那条路。
   }
-  if (config_.upstream_port == 0) {
-    return nullptr;  // 没配上游：S1-04 的 serve 模式一定配了，这里只是不把空端口当合法值
-  }
-  // S2-02（ADR-15）：先从本 worker 的池里借一条热上游。借出**不新增连接**（它本来就在
-  // connections_ 里），所以不受 fd 预算约束；池空才落到下面新建那条受预算约束的路径。
-  if (auto pooled = take_pooled_upstream()) {
+  // S2-02（ADR-15）：先从**这个目标自己的桶**里借一条热上游。借出**不新增连接**（它本来
+  // 就在 connections_ 里），所以不受 fd 预算约束；桶空才落到下面新建那条受预算约束的路径。
+  if (auto pooled = take_pooled_upstream(upstream_target)) {
     pooled->set_peer_fd(downstream->fd());
     downstream->set_peer_fd(pooled->fd());
     // 借出时它已注册、只挂着 EPOLLIN（空闲监控态）。请求字节随后由 forward_request
@@ -646,7 +676,8 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
     return nullptr;
   }
 
-  ConnectOutcome outcome = start_connect(config_.upstream_address, config_.upstream_port);
+  const Config::Target& target = config_.upstream_targets[upstream_target];
+  ConnectOutcome outcome = start_connect(target.address, target.port);
   if (outcome.status == ConnectStatus::kFailed) {
     stats_.upstream_connect_failed.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
@@ -655,6 +686,9 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   auto upstream = std::make_shared<Connection>(std::move(outcome.fd), Role::kUpstream,
                                                config_.connection, stats_);
   stats_.upstream_opened.fetch_add(1, std::memory_order_relaxed);
+  // 目标标签必须在这里就写：它决定这条上游将来归还进**哪一个**桶。写在 stats 之后、
+  // 注册之前，是为了让任何一条"借出去又还回来"的路径都不可能碰到一条没标签的上游。
+  upstream->set_upstream_target(upstream_target);
   upstream->set_state(outcome.status == ConnectStatus::kConnected ? State::kOpen
                                                                   : State::kConnecting);
   int error = 0;
@@ -677,23 +711,56 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   return upstream;
 }
 
-// --- 上游连接池（S2-02，ADR-15）------------------------------------------
+// --- 上游连接池（S2-02，ADR-15；S3-01 按目标分桶，见 ADR-15 追加节）--------------
 //
-// 池是每 worker 一份、只被本循环线程碰的空闲热上游表，所以全程无锁（ADR-14 的
-// 单线程拥有原样成立，这也是 ADR-15 选 per-worker 而不是 shared 的决定性理由）。
+// 池是每 worker 一份、只被本循环线程碰的**按目标分桶**的空闲热上游表，所以全程无锁
+// （ADR-14 的单线程拥有原样成立，这也是 ADR-15 选 per-worker 而不是 shared 的决定性理由）。
 // 三条边界必须分清，混一条就是 bug：
-//   借出（take_pooled_upstream）——从空闲表移除、配对给某条下游；
-//   归还（recycle_upstream）——下游关闭时，干净的上游解配、复位、放回空闲表；
-//   淘汰（evict_pooled + close）——空闲上游被对端 EOF、或池满、或不干净时关闭。
-// 归还只发生在「下游关闭」这个干净边界上，不按单个请求（理由见 ADR-15「为什么」：
-// 按请求借还会和 pipelining 的响应 FIFO 冲突，那是 S2-04 的配对模型）。
+//   借出（take_pooled_upstream）——从**指定那个目标的桶**移除、配对给某条下游；
+//   归还（recycle_upstream）——下游关闭时（或干净边界换目标时），干净的上游解配、复位、
+//      放回**它自己那条目标**对应的桶；
+//   淘汰（evict_pooled + close）——空闲上游被对端 EOF、或那个桶满了、或不干净时关闭。
+// 归还只发生在「下游关闭」或「目标切换」这两个干净边界上，不按单个请求（理由见 ADR-15
+// 「为什么」：按请求借还会和 pipelining 的响应 FIFO 冲突，那是 S2-04 的配对模型）。
 
-std::shared_ptr<Connection> Reactor::take_pooled_upstream() {
-  while (!upstream_pool_.empty()) {
-    std::shared_ptr<Connection> upstream = upstream_pool_.back();
-    upstream_pool_.pop_back();
-    // 防御性核验：池里的上游应当一直 kOpen 且仍在本 worker 的注册表里。不满足就是
+std::vector<std::shared_ptr<Connection>>* Reactor::pool_bucket(std::uint16_t target) noexcept {
+  if (target >= upstream_pool_.size()) return nullptr;
+  return &upstream_pool_[target];
+}
+
+const std::vector<std::shared_ptr<Connection>>* Reactor::pool_bucket(
+    std::uint16_t target) const noexcept {
+  if (target >= upstream_pool_.size()) return nullptr;
+  return &upstream_pool_[target];
+}
+
+std::size_t Reactor::pool_idle_count() const noexcept {
+  // 各桶之和（ADR-15 追加节改的口径）。单目标配置下与 S2 的 `upstream_pool_.size()`
+  // 逐数相同——这是"历史读数不作废"那句话的实现形式，不是我说说的。
+  std::size_t total = 0;
+  for (const std::vector<std::shared_ptr<Connection>>& bucket : upstream_pool_) {
+    total += bucket.size();
+  }
+  return total;
+}
+
+Reactor::Config::Target Reactor::target_at(std::size_t t) const noexcept {
+  if (t >= config_.upstream_targets.size()) return Config::Target{};
+  return config_.upstream_targets[t];
+}
+
+std::shared_ptr<Connection> Reactor::take_pooled_upstream(std::uint16_t target) {
+  std::vector<std::shared_ptr<Connection>>* bucket = pool_bucket(target);
+  if (bucket == nullptr) return nullptr;  // 没有这个目标的桶：不猜，当作借不到
+  while (!bucket->empty()) {
+    std::shared_ptr<Connection> upstream = bucket->back();
+    bucket->pop_back();
+    // 防御性核验：桶里的上游应当一直 kOpen 且仍在本 worker 的注册表里。不满足就是
     // 陈旧条目（理论上不该发生，但"从池里拿出来的东西"必须验，和批内反查同一条纪律）。
+    // 这里**不**再验一次 `upstream_target() == target`：桶的下标就是目标，而归还与淘汰
+    // 两处都只按 `upstream_target()` 选桶，所以"从 3 号桶里拿出一条 5 号目标的上游"
+    // 不是被漏掉的检查、是结构上不成立的事。真要查它，查的是那个不变量的来源（写入点），
+    // 而写入点已经被 ensure_upstream 的那次边界检查管住了。
     if (upstream->fd() == kInvalidFd || upstream->state() != State::kOpen) continue;
     auto it = connections_.find(upstream->fd());
     if (it == connections_.end() || it->second.get() != upstream.get()) continue;
@@ -708,6 +775,8 @@ bool Reactor::upstream_reusable(const Connection& upstream) const noexcept {
   // 非一次性配对（close_after_response 的语义就是不复用）、出向空（没有在飞请求字节）、
   // **没有在飞请求**（S2-04：请求都转出去了但响应还没全回来的上游不能回收，否则响应会
   // 配错人）、响应跟踪停在 kHead（上一条响应已完整完结并复位，没有半条响应挂在游标上）。
+  // S3-01 起这个判据还兼管第二个问题：**能不能换目标**（ADR-18 第五节）。两个问题用
+  // 同一个判据是刻意的——分成两套迟早出现"能进池却换不了目标"那种没人能解释的状态。
   return upstream.role() == Role::kUpstream && upstream.state() == State::kOpen &&
          !upstream.tunneling() && !upstream.close_after_response() &&
          upstream.outbound_pending() == 0 && upstream.in_flight_requests() == 0 &&
@@ -715,9 +784,18 @@ bool Reactor::upstream_reusable(const Connection& upstream) const noexcept {
 }
 
 void Reactor::recycle_upstream(const std::shared_ptr<Connection>& upstream) {
-  // 调用方（close_connection 的下游分支）已经把这条上游解配（peer_fd 置 kInvalidFd）。
-  if (upstream_pool_.size() >= config_.pool_max_idle) {
-    // 池满：给每连接内存一个硬上界（SLO #2），多出来的直接关，不留。
+  // 调用方（close_connection 的下游分支 / ensure_upstream 的目标切换）已经把这条上游
+  // 解配（peer_fd 置 kInvalidFd）。
+  std::vector<std::shared_ptr<Connection>>* bucket = pool_bucket(upstream->upstream_target());
+  if (bucket == nullptr) {
+    // 目标桶不存在 = 这条上游带着一个表里没有的下标，只能关掉。计数走 evictions_full
+    // 不合适（那不是"满"），走 close 就好：它是"没能留下"这一族的兜底路径。
+    close_connection(upstream);
+    return;
+  }
+  if (bucket->size() >= config_.pool_max_idle) {
+    // 那个桶满了：给每连接内存一个硬上界（SLO #2），多出来的直接关，不留。
+    // **口径注意**：这条上界现在是"每 worker 每目标"的，所以上界总量是 E × pool_max_idle。
     stats_.pool_evictions_full.fetch_add(1, std::memory_order_relaxed);
     close_connection(upstream);
     return;
@@ -726,14 +804,18 @@ void Reactor::recycle_upstream(const std::shared_ptr<Connection>& upstream) {
   // 重新只挂 EPOLLIN：空闲上游要能被对端的 EOF 叫醒（好淘汰它），但出向已空，
   // 绝不能留着 EPOLLOUT 对着"随时可写"的 fd 自旋（那会吃掉 SLO #2 的空闲 CPU）。
   apply_events(upstream);
-  upstream_pool_.push_back(upstream);
+  bucket->push_back(upstream);
   stats_.pool_returns.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool Reactor::evict_pooled(const std::shared_ptr<Connection>& upstream) {
-  for (auto it = upstream_pool_.begin(); it != upstream_pool_.end(); ++it) {
+  // 只去它自己那条目标的桶找——跨桶扫一遍会掩盖"标签写错"这个 bug，
+  // 而标签写错的真实后果正是"请求发给错后端"，那件事必须留得住痕迹。
+  std::vector<std::shared_ptr<Connection>>* bucket = pool_bucket(upstream->upstream_target());
+  if (bucket == nullptr) return false;
+  for (auto it = bucket->begin(); it != bucket->end(); ++it) {
     if (*it == upstream) {
-      upstream_pool_.erase(it);
+      bucket->erase(it);
       return true;
     }
   }
@@ -741,13 +823,15 @@ bool Reactor::evict_pooled(const std::shared_ptr<Connection>& upstream) {
 }
 
 void Reactor::drain_upstream_pool() {
-  // 循环退出时排空：停掉的 worker 不该留着热连接（否则 constructed==destructed 要等
-  // ~Reactor 才成立，而生命周期断言读的是 stop 之后、析构之前那一刻）。
+  // 循环退出时排空**所有桶**：停掉的 worker 不该留着热连接（否则 constructed==destructed
+  // 要等 ~Reactor 才成立，而生命周期断言读的是 stop 之后、析构之前那一刻）。
   // 逐条 close_connection 会把它们从 connections_ 摘掉并推进 retiring_，最后统一兑现析构。
-  std::vector<std::shared_ptr<Connection>> idle;
-  idle.swap(upstream_pool_);
-  for (const std::shared_ptr<Connection>& upstream : idle) {
-    if (upstream->fd() != kInvalidFd) close_connection(upstream);
+  for (std::vector<std::shared_ptr<Connection>>& bucket : upstream_pool_) {
+    std::vector<std::shared_ptr<Connection>> idle;
+    idle.swap(bucket);
+    for (const std::shared_ptr<Connection>& upstream : idle) {
+      if (upstream->fd() != kInvalidFd) close_connection(upstream);
+    }
   }
   retire_closed();
 }
@@ -1021,7 +1105,10 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
       // 而一个字节都还没进上游的出向缓冲（拦下来就真的没回源，不是"回了源再假装没回"）。
       // RequestInfo 里的 view 是借来的，链跑完就作废——所以这里把它做成栈上临时对象，
       // 且在 finish_request 之前：filter 想留下任何字段，只能自己复制出去。
-      const filter::RequestInfo info{
+      // S3-01：这个对象不再是 const——它是链唯一的写通道（upstream_target / reject_status），
+      // 下面两行就是那两个字段各自的第一个读者。**字段和读者同批进来**这条纪律（1.16 的债）
+      // 在这里兑现：删掉任何一个读者，另一个就得写不进去。
+      filter::RequestInfo info{
           .method = pending->method,
           .target = pending->target,
           .headers = pending->headers,
@@ -1029,16 +1116,35 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
           .downstream_fd = downstream->fd(),
       };
       if (request_filters_.run(info) == filter::Decision::kStop) {
-        // 停下不等于表态。今天没有任何业务 filter 会返回 kStop，所以这条出口的实际含义
-        // 只有"不转发、字节留在原地、连接不关"；谁替客户端回那条 429/503，是第一个会停
-        // 请求的 filter（S4 限流）的责任，那时这条出口才有自己的名字。
+        if (info.reject_status != 0) {
+          // **有表态的停止**。S3-01 的第一个走路人是"路由无匹配 → 404"（ADR-18 第二节）。
+          // 走 S1-06 已有的那条自产响应路径（解链 → 回 → 下游 kFlushThenClose），
+          // 所以这里返回 kFailed：连接已被本函数关掉，与解析错误那两条同一个形状。
+          fail_pair_with_reply(downstream, info.reject_status);
+          return ForwardOutcome::kFailed;
+        }
+        // 没有表态的停止 = S1-08 的原样行为。今天链上没有任何 filter 走这一格（路由要么
+        // 命中要么 404），但它必须留着：S4 的限流第一批实现就是"停下但暂不表态"的形状。
         // 复用 kBlocked 而不是新加第四个枚举值：那个值的语义是"暂时转不出去，以后会再来试"，
-        // 而被链停下的请求**永远**不会轮到它 —— 两者现在行为一致（字节不动、连接活着），
+        // 而被链停下的请求**永远**不会轮到它——两者现在行为一致（字节不动、连接活着），
         // 等 S4 给它配了响应再说，那时区别才有内容。
         return ForwardOutcome::kBlocked;
       }
-      if (!forward_request(downstream, pending->consumed, upgrade, close_after)) {
-        return ForwardOutcome::kBlocked;  // 上游没连上或出向满了，字节一条都没消费
+      // 目标下标的读者一：filter 没表态就用本 worker 的默认目标（S2-06a 的 i mod E 就落在
+      // 这一行——没装路由 filter 时这条路径与 S2 逐字节同形，那是八份 canonic 档不作废的凭据）。
+      std::uint16_t upstream_target = info.upstream_target;
+      if (upstream_target == route::kNoUpstreamTarget) upstream_target = config_.default_target;
+      if (upstream_target >= config_.upstream_targets.size()) {
+        // 路由规则指向一个不存在的端点 = 我的装配漏检。这里**不能**返回 kBlocked：
+        // 那等于把这条请求永久压在缓冲里等一个不会出现的桶，而"安静地不动"正是本项目
+        // 最忌讳的失效形态（原型见 S2-06 那 71,769 条 handshake-timeout）。回 502 而不是
+        // 404：404 说的是"你要的东西没有路由"，这条说的是"有路由、那个路由的目的地没配"。
+        fail_pair_with_reply(downstream, 502);
+        return ForwardOutcome::kFailed;
+      }
+      if (!forward_request(downstream, pending->consumed, upgrade, close_after,
+                           upstream_target)) {
+        return ForwardOutcome::kBlocked;  // 上游没连上、出向满了，或目标要换但手上还有在飞
       }
       continue;
     }
@@ -1090,10 +1196,20 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
 }
 
 bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
-                              std::size_t request_bytes, bool upgrade, bool close_after) {
-  std::shared_ptr<Connection> upstream = ensure_upstream(downstream);
+                              std::size_t request_bytes, bool upgrade, bool close_after,
+                              std::uint16_t upstream_target) {
+  std::shared_ptr<Connection> upstream = ensure_upstream(downstream, upstream_target);
   if (upstream == nullptr) {
-    return false;  // 正在 connect 或超出 fd 预算；请求还留在下游缓冲里，没丢
+    return false;  // 正在 connect、超出 fd 预算，或目标下标越界；请求还留在下游缓冲里，没丢
+  }
+  if (upstream->upstream_target() != upstream_target) {
+    // S3-01（ADR-18 第五节）：**目标要换，但手上还有在飞的请求（或这条配对不干净）**。
+    // ensure_upstream 把这个情况表达成"给我的还是旧目标那条"，而不是新造一个返回值——
+    // 新造一个就违反了"S1-08 之后 ForwardOutcome 只有三个值、Decision 只有两个值"那条。
+    // 这里返回 false 的语义和"上游出向满了"完全一致：**一个字节都没排、状态没动、
+    // 这条请求留在原地下一次再试**。真正让它不会永远睡死的，是 pump_response 在
+    // 在飞归零那一刻补的那一次重驱动（少它这条就是挂死，不是慢）。
+    return false;
   }
   if (request_bytes > downstream->inbound().readable_bytes()) {
     return false;  // 调用方给的长度不可信，不动状态
@@ -1135,6 +1251,22 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
 void Reactor::pump_response(const std::shared_ptr<Connection>& upstream) {
   pump_response_body(upstream);
   apply_events(upstream);
+  // S3-01（ADR-18 第五节）：**在飞归零那一刻，把配对下游压着的那条请求重新推一次**。
+  // 这条是"目标要换但手上还有在飞"那个分支欠下的还款：请求被压在下游缓冲里之后，
+  // 边沿触发不会为"上游的响应刚好回完了"这件事再报一次下游事件，而客户端在等响应、
+  // 不会为了唤醒我再写一个字节——**没有这一次重驱动，那条请求就永久睡死**（不是慢，是挂）。
+  // 判据只用 `request() != nullptr`（= 已解析出一个完整请求、还没 finish_request），
+  // 所以没被压住过的连接在这里只是一次指针读；`forward_pending_requests` 只在真的
+  // 压着东西时才干活。
+  // 放在外壳而不是 `kComplete` 分支里，理由和 `pump_response_body` 有七个 return 点
+  // 同一条：分支里补一句等于写第七份"迟早漏一处"的抄本，而收在这里做一次就覆盖全部出口。
+  if (upstream->in_flight_requests() != 0) return;
+  const int peer_fd = upstream->peer_fd();
+  if (peer_fd == kInvalidFd) return;  // 已经没有配对的下游（级联关闭/回收进池）
+  auto it = connections_.find(peer_fd);
+  if (it == connections_.end()) return;  // fd 编号已被复用：认人，不认编号
+  if (it->second->request() == nullptr) return;
+  (void)forward_pending_requests(it->second);
 }
 
 void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {

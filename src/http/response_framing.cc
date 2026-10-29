@@ -431,6 +431,15 @@ std::string_view gateway_error_reply(std::uint16_t status) noexcept {
              "Connection: close\r\n"
              "\r\n"
              "Content Too Large\n";
+    case 404:
+      // S3-01（ADR-18 第二节）：路由无匹配的表态。加进这张表而不是另起一张，是为了让
+      // "网关自产响应"只有一个来源——两处拼状态行就会有两份 CL/字节的账（这张表的
+      // 每条都由用例逐字节核对）。
+      return "HTTP/1.1 404 Not Found\r\n"
+             "Content-Length: 10\r\n"
+             "Connection: close\r\n"
+             "\r\n"
+             "Not Found\n";
     case 501:
       return "HTTP/1.1 501 Not Implemented\r\n"
              "Content-Length: 16\r\n"

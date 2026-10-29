@@ -32,8 +32,10 @@
 
 #include <gtest/gtest.h>
 
+#include "filter/route_filter.h"  // S3-01：端到端那组用例装的就是它
 #include "net/reactor.h"
 #include "net/reactor_group.h"
+#include "route/router.h"
 #include "test_upstream.h"
 
 namespace l7gate::net {
@@ -401,7 +403,18 @@ class Harness {
     if (options.with_upstream) {
       if (!upstream_.start(why)) return false;
       upstream_.set_response_body_bytes(kBodyBytes);
-      config.upstream_port = upstream_.port();
+      // S3-01：`Reactor::Config` 拿的是一张**目标表**（S2 那两个字段没了）。
+      // 这个夹具只有一台测试上游，所以表里就一个目标、默认目标就是它——与 S2 的
+      // 单端点形状完全等价，S1/S2 那 130 多条用例因此不需要各自重写一遍装配。
+      // **调用方自己塞了表的时候不动它**：那是多端点用例（S2_06a / S3_01）在配自己的
+      // 后端集，这里覆盖上去会把它们的表抹平。
+      if (config.upstream_targets.empty()) {
+        Reactor::Config::Target target;
+        target.address = "127.0.0.1";
+        target.port = static_cast<std::uint16_t>(upstream_.port());
+        config.upstream_targets.push_back(std::move(target));
+        config.default_target = 0;
+      }
     }
     // 端口一律给 0 让内核选：测试之间并行跑、失败重跑都不该因为端口占用而随机失败。
     config.listen_port = 0;
@@ -643,7 +656,14 @@ TEST(S1_04_Reactor, TenThousandSequentialRequestsLeaveNothingAlive) {
   // 再 stop_loop 排空池——排空之后才有 live==0 / constructed==destructed。
   ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 5000))
       << "下游关闭后上游没有归还进池（ADR-15 的回收没发生）";
-  EXPECT_EQ(stats.load(stats.live_connections), 1u) << "回收后池里应当正好留着那 1 条热上游";
+  // 这里必须**等**，不能"看到 pool_returns 就立刻读 live"。`live_connections` 是对象
+  // 计数的实时仪表，而下游对象进 `retiring_` 之后要到**事件批次末**的 `retire_closed()`
+  // 才真正析构（六步关闭的第 5 步）——所以 `pool_returns==1` 成立的这一刻，"下游对象
+  // 还没析构"是一个合法中间态，读它会得到 2。串行跑几乎每次都能侥幸读到 1，
+  // `ctest -j 8` 下必红（S3-01 那次并行复跑第一次把它撞出来，原样记进 ARCHITECTURE §5）。
+  // 期望值一个字没改（池里正好 1 条热上游），改的是取样方式：非稳态量只能等它进稳态。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 1u; }, 2000))
+      << "回收后池里应当正好留着那 1 条热上游（等到 retiring_ 兑现之后仍然是别的数，才是真问题）";
   EXPECT_EQ(stats.load(stats.pool_borrows), 0u) << "单条下游全程独占它的上游，从没借过池";
 
   harness.stop_loop();  // 排空池 + join；之后才允许读非原子的 epoll 计数
@@ -1845,7 +1865,7 @@ class ReactorMarkerFilter : public filter::RequestFilter {
 
   std::string_view name() const noexcept override { return name_; }
 
-  filter::Decision on_request(const filter::RequestInfo& info) override {
+  filter::Decision on_request(filter::RequestInfo& info) override {
     // 计数只在"递给它的确实是一条真请求的可见面"时加：方法、目标、至少一个头、
     // 一个合法的 fd。少了这层核对，"主路径把 ParsedRequest 递给链"那一步可以是个
     // 空壳（全空的 RequestInfo 照样跑完链）而没人发现。
@@ -3317,6 +3337,482 @@ TEST(S2_06a_MultiEndpoint, EndpointsBeyondWorkerCountAreNeverUsed) {
   first.stop_and_join();
   second.stop_and_join();
   third.stop_and_join();
+}
+
+// ===========================================================================
+// S3-01：路由作为链上的一环 + per-worker 池按目标分桶（ADR-18 / ADR-15 追加节）
+// ===========================================================================
+//
+// 这一组测的是四件事，每件都对应验收句里的一句（`TASKS.md` 的 S3-01 行）：
+//   一、**路由 filter 改过的目标真的被 `ensure_upstream` 读到**——端到端一条请求落到指定
+//        后端，而且 `upstream_opened` 只增加那一个目标的连接。可见性靠**两个 TestUpstream
+//        各自自报** accepted/requests（沿用 B-007 那句"每个后端收多少条从这里取，不拿
+//        总数 ÷ 后端数算"的立场），网关侧不新增任何观测计数。
+//   二、**桶是分开的**：归还进的是自己那条目标的桶，借出的也只从那个桶借。
+//   三、**目标切换只发生在干净边界**，切换时欠的那一次重驱动是真的发生了
+//        （第五节那条"会挂死的环"——摘掉它就红，见下面的阳性验证说明）。
+//   四、**无匹配 / 越界下标都要表态**，不许退化成"请求安静地压在缓冲里"。
+//
+// 后端靠**响应体长度**区分（64 B vs 128 B，`start_sized_upstream`），客户端拿到多长的体
+// 就是被派到了哪个后端——这件事不需要任何新的网关计数，和 S2_06a 那三条同一个做法。
+namespace {
+
+// 目标表：两个 TestUpstream、两个端口，下标 0/1 就是路由规则里写的那个下标。
+// 注意这里**不走** harness 自己的那台 upstream_（with_upstream=false），
+// 因为一台上游配不出两个目标；单目标用例继续用 with_upstream=true 的那条老路。
+struct TwoTargets {
+  TestUpstream first;
+  TestUpstream second;
+
+  bool start(std::string* why) {
+    if (!start_sized_upstream(&first, 64, why)) return false;
+    return start_sized_upstream(&second, 128, why);
+  }
+  void stop() {
+    first.stop_and_join();
+    second.stop_and_join();
+  }
+  void fill(Harness::Options* options) const {
+    options->with_upstream = false;
+    options->config.upstream_targets.clear();
+    options->config.upstream_targets.push_back(
+        Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(first.port())});
+    options->config.upstream_targets.push_back(
+        Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(second.port())});
+    options->config.default_target = 0;
+  }
+};
+
+std::string get_request(std::string_view path) {
+  return "GET " + std::string(path) + " HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+}
+
+// 一条"命中 /a 去端点 0、命中 /b 去端点 1"的最小表。每个用例自己持有它，
+// 而且必须**声明在 Harness 之前**——filter 拿的是引用，表比 reactor 先死就是悬垂。
+void add_ab_routes(l7gate::route::RouteTable* table) {
+  ASSERT_TRUE(table->add_prefix("/a", 0));
+  ASSERT_TRUE(table->add_prefix("/b", 1));
+}
+
+// 一个故意写下越界下标的 filter：它不是"坏输入测试"的装饰，它是 reactor 里那条
+// 边界检查（`upstream_target >= config_.upstream_targets.size()`）**唯一的读者**。
+// 没有这条用例，那条检查就是一段没人走过的分支——而它保护的是一次 vector 越界索引。
+class BadTargetFilter : public filter::RequestFilter {
+ public:
+  std::string_view name() const noexcept override { return "bad-target"; }
+  filter::Decision on_request(filter::RequestInfo& info) override {
+    info.upstream_target = 99;  // 目标表只有 2 个条目
+    return filter::Decision::kContinue;
+  }
+};
+
+}  // namespace
+
+// 一、最基本的端到端：/b 那条请求只碰端点 1，端点 0 一条连接都不该被开。
+// 这条红了意味着两种错之一：路由没被读（全部落到默认目标 0），或者"读到了但回源
+// 仍然用配置里那一个地址"——后者正是 1.16 记的那笔债的形态（字段写了、没人读）。
+TEST(S3_01_Routing, RequestLandsOnTheRoutedTargetOnly) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  add_ab_routes(&table);
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  // add_filter 只是把 filter 存进 pending 队列，真正挂链发生在 start() 里 spawn 循环线程
+  // **之前**（1.16 那条"运行期不许改链"的纪律，测试不能自己先违反它要证的那条）。
+  // 所以顺序只能是先 add 再 start——反过来的话 filter 根本不在链上，请求会安静地落到
+  // 默认目标 0，而这条用例的失败形态就是"body 64 而不是 128"。
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/b/x")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(body.size(), 128u) << "路由写的是端点 1，客户端却拿到别的后端的体";
+
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u)
+      << "只增加那一个目标的连接：新建数必须是 1，且那条连接属于端点 1";
+  EXPECT_EQ(targets.first.connections_accepted(), 0u) << "端点 0 一条都不该被连";
+  EXPECT_EQ(targets.second.connections_accepted(), 1u);
+  EXPECT_EQ(targets.first.requests_served(), 0u);
+  EXPECT_EQ(targets.second.requests_served(), 1u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 二、无匹配 → 404，而且**一条上游都不开**。
+// 后半句才是这条用例的主语：1.16 写的是"拦下来必须真的没回源，不是回了源再假装没回"。
+// 如果哪天链调用点被挪到 forward_request 之后，前端仍然看到 404、用例的前半句照样绿，
+// 但 upstream_opened 会变成 1——所以那一格必须断。
+TEST(S3_01_Routing, NoMatchRepliesFourOhFourAndNeverOpensAnUpstream) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  ASSERT_TRUE(table.add_prefix("/a", 0));  // 只有 /a，/zz 谁都不挨着
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/zz")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 404 Not Found");
+  EXPECT_EQ(body, "Not Found\n");
+
+  EXPECT_EQ(stats.load(stats.upstream_opened), 0u) << "拦下来就真的没回源：一条上游都不许开";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u) << "自产响应要有账";
+  EXPECT_EQ(targets.first.connections_accepted(), 0u);
+  EXPECT_EQ(targets.second.connections_accepted(), 0u);
+
+  // 404 那条响应自带 `Connection: close`（这张表里每一条都带），所以配对收尾、
+  // 客户端随后看到 EOF。等不到 EOF 就是"回了响应但连接挂着"，那是另一类失效。
+  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  harness.stop_loop();
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 三、越界下标必须**表态**而不是把请求永久压住。
+// 这条是 reactor 里那条索引前边界检查的读者（也是 `pool_bucket()` 返回 nullptr 那一格
+// 能被走到的唯一途径）。形状：filter 写了 99、目标表只有 2 个条目 → 502 + 不开上游。
+// 为什么不是 404：404 说"你要的东西没有路由"，这一格说的是"有路由、目的地没配"——
+// 那是网关自己的毛病，把它读成客户端的错会让运维去查一条根本没坏的路径。
+TEST(S3_01_Routing, OutOfRangeTargetRejectsFiveOhTwoInsteadOfStalling) {
+  std::string why;
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<BadTargetFilter>());
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/a")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "越界的目标下标不该让请求安静地压在缓冲里等一个不会出现的桶（那就是挂死）";
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+  EXPECT_EQ(stats.load(stats.upstream_opened), 0u);
+  EXPECT_EQ(targets.first.connections_accepted(), 0u);
+  EXPECT_EQ(targets.second.connections_accepted(), 0u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 四、**桶是分开的**：/a 的热上游还回 0 号桶，/b 的下游绝不许把它借走。
+// 这条是"分桶"这个改动本身的证据。把池退回成一个不带键的 vector（S2 的形状），
+// 第 3 步就会从池里捞出端点 0 那条热连接、请求被送到错误的后端——客户端会拿到 64 B
+// 而不是 128 B 的体，而 `upstream_opened` 会停在 1。两种错法都逃不掉。
+TEST(S3_01_Routing, PoolBucketsKeepTargetsApart) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  add_ab_routes(&table);
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 1) 第一条 /a 下游：新建端点 0 的连接，关闭 → 归还进 0 号桶。
+  {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(client.write_all(get_request("/a/1")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(body.size(), 64u);
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 3000))
+        << "下游关闭后上游没有归还进池";
+  }
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u);
+
+  // 2) 第二条 /a 下游：应当从 0 号桶**借到**那条热上游，不新建。
+  {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(client.write_all(get_request("/a/2")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+    EXPECT_EQ(body.size(), 64u);
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_borrows) == 1u; }, 3000))
+        << "同目标的第二条下游没有复用 0 号桶里的热上游";
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 2u; }, 3000));
+  }
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "0 号桶里有热的，不该再开新的";
+
+  // 3) /b 的下游：0 号桶里那条热连接**不归它用**，必须为端点 1 新建一条。
+  {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(client.write_all(get_request("/b/1")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+    EXPECT_EQ(body.size(), 128u)
+        << "借到了别的目标的池化上游：桶没分开，或者归还时走错了桶";
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 3u; }, 3000));
+  }
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "两个目标各开一条，池不跨目标摊薄";
+  EXPECT_EQ(stats.load(stats.pool_borrows), 1u) << "/b 那条没有从 0 号桶借到东西（也不该借到）";
+  EXPECT_EQ(targets.first.connections_accepted(), 1u);
+  EXPECT_EQ(targets.second.connections_accepted(), 1u);
+
+  // 4) **这一步才是"桶真的分开了"的那一格**。上面三步还漏着一个形状：如果归还时不看
+  //    连接自己那条目标、一律进同一个桶（我第一次跑阳性验证时就是这么打的补丁），
+  //    前三步照样全绿——因为没有任何后续请求会去碰那个被放错位置的条目。
+  //    现在两条目标的池里各有一条热的，再来一条 `/a` 的下游：0 号桶里应当只有连到
+  //    端点 0 的那条，借到它就是一次复用（`upstream_opened` 不涨、体长 64）。
+  //    **实测到的红不是"拿到 128"而是挂到读超时**（2026-10-29 那次阳性验证）：放错桶的
+  //    那条被 `take_pooled_upstream(0)` 捞出来后，`forward_request` 认出它的标签不是 0,
+  //    于是按"目标要换但手上这条是配对"的口径把请求压住——压住本身是对的（那是 pipeline
+  //    那一格的机制），错的是它永远等不到干净边界。失败形态从"发错后端"变成"不动",
+  //    两样都不能接受，但注释必须按观察到的那个写。
+  {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(client.write_all(get_request("/a/3")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第三条 /a：" << why;
+    EXPECT_EQ(body.size(), 64u)
+        << "从 0 号桶借到了连向端点 1 的热上游：归还时没按连接自己的目标选桶";
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_borrows) == 2u; }, 3000))
+        << "0 号桶里有热的却没借到，说明桶的键不对";
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+    ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 4u; }, 3000));
+  }
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "复用命中就不该再开新的";
+  EXPECT_EQ(targets.first.requests_served(), 3u);
+  EXPECT_EQ(targets.second.requests_served(), 1u);
+
+  harness.stop_loop();
+  // 排空池要排**所有桶**。只排一个桶的写法在这里会露出来：池里还剩一条热上游，
+  // live_connections 不归零、constructed != destructed，而 `pool_idle_count()`
+  // 也不是 0（它是各桶之和，S3-01 改的那个口径就在这个数上）。
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u) << "停环之后仍有桶没排空";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 五、`pool_max_idle` 的上界现在是**每 worker 每目标**的（ADR-15 追加节改的那一格）。
+// 池上限 1、两个目标各归还一条：旧的"每 worker 一个池"会把第二条判成满了并关掉
+// （pool_evictions_full==1），新口径下两条都留在各自桶里（evictions_full==0、returns==2）。
+// 这条用例的存在理由：这条上界直接进 SLO #2 的内存账（E×pool_max_idle），
+// 口径变了而读数不变，那笔账就是错的。
+TEST(S3_01_Routing, PoolMaxIdleIsPerBucketNotPerWorker) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  add_ab_routes(&table);
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  options.config.pool_max_idle = 1;  // 每 worker 每目标 1 条
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  for (std::string_view path : {std::string_view("/a"), std::string_view("/b")}) {
+    Client client;
+    ASSERT_TRUE(client.connect_to(harness.port(), &why)) << path;
+    ASSERT_TRUE(client.write_all(get_request(path)));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << path;
+    client.shutdown_write();
+    ASSERT_TRUE(client.wait_for_eof(&why)) << path;
+  }
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 2u; }, 3000))
+      << "两条分别属于两个目标的空闲上游没能同时留在池里";
+  EXPECT_EQ(stats.load(stats.pool_evictions_full), 0u)
+      << "上界被当成『每 worker 总量』算了：第二条会被判成池满关掉，那 SLO #2 的账就少记一格";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 六、同一条 keep-alive 下游**换目标**：/a 答完之后再发 /b。
+// 换的时机是干净边界（在飞 0 + 出向空 + upstream_reusable），换法是把旧上游按它自己
+// 那条目标归还进 0 号桶（不是关掉它），再为端点 1 新建一条。
+TEST(S3_01_Routing, TargetSwitchRecyclesIntoItsOwnBucket) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  add_ab_routes(&table);
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.write_all(get_request("/a/first")));
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第一条：" << why;
+  ASSERT_EQ(body.size(), 64u);
+  ASSERT_EQ(stats.load(stats.upstream_opened), 1u);
+
+  // 同一条下游上的第二条请求，路由指向另一个目标。此刻手上没有在飞请求 → 允许换。
+  ASSERT_TRUE(client.write_all(get_request("/b/second")));
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << "换目标那一条：" << why;
+  EXPECT_EQ(body.size(), 128u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "新目标是新建的，不是从别的桶借的";
+  EXPECT_EQ(stats.load(stats.pool_returns), 1u)
+      << "换下来的旧上游应当按它自己那条目标归还进 0 号桶，而不是被关掉";
+  EXPECT_EQ(stats.load(stats.pool_evictions_full), 0u) << "0 号桶才用掉 1 格，不该判成满";
+  EXPECT_EQ(targets.first.requests_served(), 1u);
+  EXPECT_EQ(targets.second.requests_served(), 1u);
+
+  client.shutdown_write();
+  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 2u; }, 3000))
+      << "下游关闭后第二条上游也该进桶";
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u) << "所有桶都该在停环时排空";
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 七、**这条是 ADR-18 第五节那笔代价的收据**。
+// 形状：一条下游在**同一次可读里**pipeline 两条请求，第一条去端点 0、第二条去端点 1，
+// 而端点 0 故意晚 200 ms 才回。于是第二条请求第一次被考虑时，第一条还在飞（in_flight=1）
+// → 按口径必须**压住**它。压住之后唯一的出路是响应完结那一刻由 `pump_response` 补的
+// 那次重驱动：**把那次重驱动摘掉，这条用例不会变快也不会变慢，它是挂住**
+// （第二次 read_response 撞 2 s 读超时）。这就是"能红才叫绿"。
+// 顺带把 ADR-16 那条 FIFO 也钉住：响应顺序必须等于请求顺序（先 64 B 后 128 B）。
+TEST(S3_01_Routing, PipelinedTargetSwitchIsHeldThenRedriven) {
+  std::string why;
+  l7gate::route::RouteTable table;
+  add_ab_routes(&table);
+
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+  targets.first.set_delay_before_response_ms(200);  // 端点 0 慢，把第二条请求压在闸内
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/a/slow") + get_request("/b/held")))
+      << "两条请求一次写完：一个段、一次 EPOLLIN";
+
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第一条（慢上游）：" << why;
+  EXPECT_EQ(body.size(), 64u);
+  ASSERT_TRUE(client.read_response(&status, &body, &why))
+      << "第二条被压住之后没有等来重驱动：这就是 ADR-18 第五节那条会挂死的环";
+  EXPECT_EQ(body.size(), 128u) << "响应顺序或目标错位：pipeline 的 FIFO 被打乱了";
+
+  EXPECT_EQ(stats.load(stats.requests_parsed), 2u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 2u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "两个目标各新建一条";
+  EXPECT_EQ(stats.load(stats.pool_returns), 1u) << "换下来的 0 号上游进了 0 号桶";
+  EXPECT_EQ(targets.first.requests_served(), 1u);
+  EXPECT_EQ(targets.second.requests_served(), 1u);
+
+  client.shutdown_write();
+  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  harness.stop_loop();
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 八、**没有路由 filter 时，worker 用的就是它的默认目标**——这一格是 S2-06a 那三条
+// 用例不作废的根据（它们在多 Reactor 下断 `i mod E`，这条在单 Reactor 下断同一个形状：
+// 表里第 0 个条目），也是压测"空链那一臂"的含义：链是空的，不是"装了 filter 但没命中"。
+TEST(S3_01_Routing, NoFilterUsesDefaultTargetExactlyLikeS2) {
+  std::string why;
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);  // default_target = 0
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ASSERT_EQ(harness.reactor()->request_filter_count(), 0u) << "这一臂的链必须是空的";
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/b/not-routed-anyway")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(body.size(), 64u) << "空链时该走默认目标（端点 0），路由不参与";
+  EXPECT_EQ(targets.first.connections_accepted(), 1u);
+  EXPECT_EQ(targets.second.connections_accepted(), 0u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
 }
 
 }  // namespace l7gate::net

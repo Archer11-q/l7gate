@@ -13,6 +13,7 @@
 #include "net/fd.h"
 #include "net/reactor.h"
 #include "net/stats.h"
+#include "route/router.h"  // Config::route_table 的指向类型（本文件直接用它，就直接 include）
 
 namespace l7gate::net {
 
@@ -52,20 +53,29 @@ class ReactorGroup {
     // 0 表示由内核选端口；测试全靠它避免端口撞车。
     std::uint16_t listen_port = 0;
 
-    // S2-06a（ADR-17 已裁候选 A）：回源端点列表。**第 i 条 worker 只用第 i mod E 个端点**
-    // （E = 列表长度），所以一条 worker 从头到尾只面对一个 (目的地址, 目的端口) 元组。
-    // 这条形状是选它而不是选"共享池 + 按请求选目标"的实际原因：ADR-15 的 per-worker 池
-    // 因此**仍然是单目标池**（`upstream_pool_` 不带目标键），不加锁、不扩大 ADR-14 的
-    // 跨线程接触面。它**不是**路由也不是负载均衡：那两者要按请求决定目标，归 S3。
-    // 容量账：这一跳能开出的连接数 = min(worker 数, E) × 单元组容量（本机实测 28,232），
-    // 所以 `--workers 1` 的单 Reactor 路径永远只用第 0 个端点（`main.cc` 里就是这么取的）。
-    struct UpstreamEndpoint {
-      std::string address = "127.0.0.1";
-      std::uint16_t port = 0;
-    };
-    // 空列表 = 没配上游（与 `Reactor::Config` 里 `upstream_port == 0` 同一口径，
-    // `ensure_upstream` 那条短路一致）。
+    // --- 回源端点列表（S2-06a 引入，S3-01/ADR-18 改了它的角色）--------------------
+    // S2-06a 时它是"静态指派表"：第 i 条 worker 一辈子只用第 `i mod E` 个端点，
+    // 所以 `Reactor::Config` 侧只需要一个端点、池不需要目标键。
+    // **S3-01 之后它是目标表**：整张表交给每一个 worker，`i mod E` 降级成"这个 worker 的
+    // 默认目标"（没装路由 filter 时用的就是它，所以那一条路径与 S2 逐字节同形）。路由一装，
+    // 一个 worker 就会按请求碰多个目的元组 → 池按目标分桶（ADR-15 追加节）。
+    // 容量账因此也改了口径：**没路由时**仍是 `min(worker 数, E) × 单元组容量（实测 28,232）`；
+    // **有路由时**每个 (worker, 目标) 元组各自有 28,232 的余量，`--workers 1` 那一档
+    // 从"永远只用第 0 个端点"变成"路由指到哪个端点就连哪个"。
+    // 这里**不**再另立一个端点类型：`Reactor::Config::Target` 就是"一个目的元组"的唯一定义，
+    // 抄两份会有两份字段顺序一致的假象，改一处漏一处（那类坑的原型见 max_header_count）。
+    using UpstreamEndpoint = Reactor::Config::Target;
+    // 空列表 = 没配上游（与 `Reactor::Config` 里 `upstream_targets` 为空同一口径，
+    // `ensure_upstream` 那条边界检查一致）。
     std::vector<UpstreamEndpoint> upstream_endpoints;
+
+    // S3-01（ADR-18）：路由表。**nullptr = 不装路由 filter**，于是每一个 worker 都只走
+    // `i mod E` 那个默认目标——这一条就是"没路由时行为等于 S2"的形式定义，也是压测里
+    // 空链那一臂的来源。非空时本组在 `start_listen()` 里给每个 worker 挂一个
+    // `filter::RouteFilter`（链不许运行期改，所以那里是唯一合法的装配点）。
+    // 裸指针 + 只读引用不是偷懒而是这条数据的本相：表由装配方（`main.cc` / 测试）拥有，
+    // **必须比本组活得久**；复制一张进来会造出第二个可以各自漂移的真相。
+    const l7gate::route::RouteTable* route_table = nullptr;
 
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，

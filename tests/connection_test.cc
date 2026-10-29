@@ -832,4 +832,30 @@ TEST(S2_07_MemoryComposition, IdleConnectionCellAtN128IsBelowItsOwnResolution) {
   small.clear();
 }
 
+// S3-01（ADR-18 后果段）：路由给上游连接加的那个"目标桶"标签**不许多付 8 字节**。
+// 这条断言的分量全在 B-011 那张构成表上：它把 `Connection`×2 = 1,056 B 逐条钉进了
+// 每对 17,861 B，与生产 100k 对的 RSS 商 17,889 B/对 差 0.16%。标签要是把对象抬到 536，
+// 100k 对就多 1.6 MiB，那张表连同 #2 的可引用数字要整张重写——所以这里要红的不是
+// "对象变大了"这句抱怨，而是那条已经进档的账。
+// 用 static_assert 而不是只写 EXPECT：变大在**编译期**就该挡住，不给"这条用例没被跑到"
+// 留任何余地（1.10 那条"跳过＝不判，不是通过"的纪律，同一个方向）。
+TEST(S3_01_ConnectionLayout, TargetLabelFitsInTheExistingPadding) {
+  static_assert(sizeof(Connection) == 528,
+                "S3-01 的目标标签必须落在 armed_events_/read_stopped_at_line_ 之后的空位里");
+  EXPECT_EQ(sizeof(Connection), 528u);
+
+  PipePair pipe;
+  ASSERT_TRUE(pipe.ok());
+  ReactorStats stats;
+  Connection conn(pipe.take_read_end(), Connection::Role::kUpstream, default_config(), stats);
+
+  // 默认 0：单目标配置下"只有一个桶"，而 S2 时代根本没有这个字段——默认必须是 0 才
+  // 不让既有用例（构造路径没写它的那些）看到未初始化值。
+  EXPECT_EQ(conn.upstream_target(), 0u);
+  conn.set_upstream_target(7);
+  EXPECT_EQ(conn.upstream_target(), 7u);
+  conn.set_upstream_target(0xffff);  // 哨兵也能存下：它是 uint16_t 的满值空间
+  EXPECT_EQ(conn.upstream_target(), 0xffffu);
+}
+
 }  // namespace

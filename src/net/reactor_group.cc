@@ -8,6 +8,7 @@
 #include <system_error>
 #include <utility>
 
+#include "filter/route_filter.h"  // config_.route_table 非空时给每个 worker 挂的那一环
 #include "net/socket.h"
 
 namespace l7gate::net {
@@ -84,20 +85,30 @@ bool ReactorGroup::start_listen(int* error) noexcept {
   if (n < 1) n = 1;
   for (int i = 0; i < n; ++i) {
     Reactor::Config wc;
-    // S2-06a（ADR-17 候选 A）：静态指派——worker i 拿第 i mod E 个端点，**一整轮进程生命
-    // 期都不换**。所以 `Reactor::Config` 侧看到的仍然是一个端点：`ensure_upstream` 不知道
-    // 列表存在，池不需要目标键，跨线程面也没变大（这三条就是"静态映射"买到的东西）。
+    // S3-01（ADR-18）：整张目标表交给每一个 worker，而 `i mod E` 降级成**这个 worker 的
+    // 默认目标**。所以：
+    //   没装路由 filter 时——路由不表态 → 用默认目标 → worker i 仍然一辈子只连第 i mod E 个
+    //     端点，S2-06a 的静态指派逐字节保留（容量公式 `min(N,E)×28,232`、B-007 的 100k、
+    //     八份 canonic 档因此都不作废，`s1-p99.sh` 靠横幅签名判路径那两条也没被动到）；
+    //   装了路由 filter 时——按请求选目标，池因此按目标分桶（ADR-15 追加节）。
+    // 跨线程接触面仍然只有裸 fd：目标表是**构造期拷进去的只读数据**，运行期只在 owner
+    // 线程读它，没有新增任何共享可变状态（TSan 是这条的裁判，不是我）。
+    wc.upstream_targets = config_.upstream_endpoints;
     if (!config_.upstream_endpoints.empty()) {
-      const auto& endpoint =
-          config_.upstream_endpoints[static_cast<std::size_t>(i) % config_.upstream_endpoints.size()];
-      wc.upstream_address = endpoint.address;
-      wc.upstream_port = endpoint.port;
+      wc.default_target = static_cast<std::uint16_t>(
+          static_cast<std::size_t>(i) % config_.upstream_endpoints.size());
     }
     wc.max_connections = config_.max_connections_per_worker;
     wc.connection = config_.connection;
     wc.wait_timeout_ms = config_.wait_timeout_ms;
     wc.stop_after_requests = 0;
     auto worker = std::make_unique<Reactor>(wc, *stats_);
+    // 路由 filter 只能在 run() 之前挂（链在循环线程里被逐条读、无锁，S1-08 那条时序纪律）。
+    // start_listen 恰好就在 run() 之前，而 worker 的 run() 由本组的 run() spawn——
+    // 所以这里是唯一合法的装配点，不是"顺手在哪都能加"。
+    if (config_.route_table != nullptr) {
+      worker->add_request_filter(std::make_unique<filter::RouteFilter>(*config_.route_table));
+    }
     if (!worker->start_worker(error)) {
       // 已经建好的 worker 由本对象析构清理（它们的 start_worker 若成功则 wake_fd
       // 已注册，~Reactor 会注销）。listener_/accept_epoll_ 同样由析构清理。

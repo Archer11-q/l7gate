@@ -10,6 +10,7 @@ add_executable(l7gate_tests
   framing_test.cc
   reactor_test.cc
   request_parser_test.cc
+  route_test.cc
   upgrade_test.cc
 )
 target_link_libraries(l7gate_tests PRIVATE

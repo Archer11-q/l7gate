@@ -43,8 +43,21 @@ class Reactor {
     std::string listen_address = "127.0.0.1";
     // 0 表示由内核选端口；测试全靠它避免端口撞车，所以这个 0 是功能不是便利。
     std::uint16_t listen_port = 0;
-    std::string upstream_address = "127.0.0.1";
-    std::uint16_t upstream_port = 0;
+
+    // --- 目标上游表（S3-01，ADR-18）---------------------------------------------
+    // 取代 S2 那两个字段（`upstream_address` / `upstream_port`）。**数组下标就是
+    // `filter::RequestInfo::upstream_target` 的值域**，所以路由的返回空间和回源的目的
+    // 地是同一个索引体系，不需要第二份映射（那又是一份会漂移的抄本）。
+    struct Target {
+      std::string address = "127.0.0.1";
+      std::uint16_t port = 0;
+    };
+    // 空表 = 没配上游（与 S2 时代 `upstream_port == 0` 同一口径，`ensure_upstream`
+    // 那条短路一致）。**没有 filter 表态时一律用 `default_target`**，而 ReactorGroup
+    // 给 worker i 的默认目标就是 S2-06a 那个第 `i mod E` 个端点——这就是"没装路由 filter
+    // 时行为逐字节等于 S2"的落点，容量公式 `min(N,E)×28,232` 与八份 canonic 档因此不作废。
+    std::vector<Target> upstream_targets;
+    std::uint16_t default_target = 0;
 
     int listen_backlog = 1024;
     // fd 预算。超过就直接把新连接关掉而不是排队：一个网关在 fd 耗尽时的正确
@@ -54,9 +67,14 @@ class Reactor {
 
     // S2-02（ADR-15）：本 worker 的上游连接池里最多留多少条**空闲**热上游。
     // 归还时池已满就直接关掉而不是放回——这是每连接内存（SLO #2）的硬上界。
+    // **S3-01（ADR-15 追加节）改了这条上界的分母**：池按目标分桶之后，它是
+    // **每 worker 每目标**的上界，所以上界从 `pool_max_idle` 抬到
+    // `目标数 E × pool_max_idle`（缺省 64、E=4 → 每 worker 最多 256 条空闲上游）。
+    // 这一格要进 SLO #2 的账，不许只写在配置注释里。100k 隧道那一档不受影响
+    // （隧道态 1:1 专用、不入池，B-011 的"池摊销 = 0"仍然成立）。
     // 它和 max_connections 的关系：在飞配对的上游 + 池里空闲的上游 + 下游都算进
-    // connections_，所以 pool_max_idle 要显著小于 max_connections，否则池会把 fd
-    // 预算吃光、导致下游在 ensure_upstream 那里被拒。
+    // connections_，所以 `E × pool_max_idle` 要显著小于 max_connections，
+    // 否则池会把 fd 预算吃光、导致下游在 ensure_upstream 那里被拒。
     std::size_t pool_max_idle = 64;
 
     Connection::Config connection;
@@ -155,9 +173,21 @@ class Reactor {
 
   std::size_t live_connection_count() const noexcept { return connections_.size(); }
 
-  // S2-02（ADR-15）：当前池里的空闲热上游数。**非原子观测**，和 live_connection_count()
-  // 同一类——只能在循环线程停下之后读（stats.h 第 25 行那条纪律）。
-  std::size_t pool_idle_count() const noexcept { return upstream_pool_.size(); }
+  // S2-02（ADR-15）：本 worker 的上游连接池。**S3-01（ADR-15 追加节）改了口径**：
+  // 从"本 worker 的空闲热上游数"变成"**按目标分桶后各桶之和**"。单目标配置下两者数值
+  // 相同（只有一个桶在用），所以历史读数不作废；但任何"池有多满"的比较要说清是哪几个桶。
+  // 仍然与 live_connection_count() 同一类：**非原子观测**，只能在循环线程停下之后读
+  // （stats.h 第 25 行那条纪律）。
+  std::size_t pool_idle_count() const noexcept;
+
+  // 目标表长度。装配方（ReactorGroup / 测试）拿它校验路由规则的下标，
+  // 因为越界的 upstream_target 若一路走到这里索引 `upstream_targets`，
+  // 那不是"回错一个后端"而是越界读——查在索引处才叫查。
+  std::size_t target_count() const noexcept { return config_.upstream_targets.size(); }
+  std::uint16_t default_target() const noexcept { return config_.default_target; }
+
+  // 第 t 个目标的地址与端口（越界返回空地址 + 0 端口，仅日志/断言用）。
+  Config::Target target_at(std::size_t t) const noexcept;
 
   // --- S1-07 的「epoll 侧可断言」------------------------------------------
   // 验收句要的是"能观测到网关不再消费下游可读事件"，那话的主语是**注册表里的兴趣
@@ -221,12 +251,16 @@ class Reactor {
   // 转发策略（S1-04 的部分）：请求头+body 一旦完整，就把它的**原始字节**排进上游
   // 的出向缓冲，然后消费掉下游的这些字节。不改写、不重新分帧——逐字节透传的前提
   // 是"我碰过的字节和我没碰过的字节长得一样"，这条归 S1-06 的验收负责证明。
-  // 返回 false 表示这一条没转出去（上游还没连上 / 上游出向满了），字节留在原地。
+  // 返回 false 表示这一条没转出去（上游还没连上 / 上游出向满了 / **目标要换但手上还有
+  // 在飞的请求**——第三种是 S3-01 新增的，见 `ensure_upstream` 那段"干净边界"）。
   // upgrade / close_after 是 S1-05 的两条连接级意图：从**这条请求自己的**已解析
   // view 判出（调用方必须在 finish_request 之前取用 view，这里是唯一的取用点），
   // 由本函数决定落到哪条连接、何时置 kClosing。判定不碰字节：转发出去的仍是原始请求。
+  // `upstream_target` 是链调用点读回来的那个下标（S3-01，ADR-18）：filter 没表态时
+  // 它已经被换成 `config_.default_target`，所以本函数以下只认"这就是要去的桶"。
   bool forward_request(const std::shared_ptr<Connection>& downstream,
-                       std::size_t request_bytes, bool upgrade, bool close_after);
+                       std::size_t request_bytes, bool upgrade, bool close_after,
+                       std::uint16_t upstream_target);
   // 响应语义泵（S1-06）：上游入向缓冲里的字节按"当前响应的阶段"过一遍框架判定
   // （http/response_framing 的纯函数），然后透传——头整块排（半个头排出去就是把
   // 畸形喂给客户端），body 按框架边界拆散排（截断的权力在框架知识，不在这条泵）。
@@ -276,26 +310,49 @@ class Reactor {
   // 理由同 pump_response_body：本体有七个 return 点，逐个补一句等于第七份抄本。
   ForwardOutcome forward_pending_requests_body(const std::shared_ptr<Connection>& downstream);
 
-  // 确保这条下游连接已经有配对的上游；没有就**先从本 worker 的池里借**一条热上游
-  // （ADR-15），池空才发起异步 connect 新建并配对。借出的上游在这条下游的整个存活期
-  // 与它 1:1 配对（S1 的 keep-alive 复用不变）；下游关闭时上游归还进池而不是级联销毁。
+  // 确保这条下游连接已经有配对的上游，而且它配的是 `upstream_target` 那一个目标。
+  // 没有就**先从该目标的桶里借**一条热上游（ADR-15 + 它的 S3-01 追加节），桶空才发起
+  // 异步 connect 新建并配对。借出的上游在这条下游的整个存活期与它 1:1 配对（S1 的
+  // keep-alive 复用不变）；下游关闭时上游按它自己那个目标归还进桶，而不是级联销毁。
+  //
+  // **目标变了而手上还有在飞的请求时不换**——返回那条旧目标的上游，由 `forward_request`
+  // 认出"这不是我要的桶"、把这条请求压回下游缓冲（ADR-18 第五节：换了就把 ADR-16 的
+  // 响应 FIFO 打乱，那不是我给路由买的单）。被压住的请求由 `pump_response` 的
+  // `kComplete` 分支在在飞归零那一刻重新驱动；**少那一次重驱动就是一条挂死的环**。
   // 返回 nullptr 表示暂时还没有（正在 connect）或已达 fd 预算上限。
-  std::shared_ptr<Connection> ensure_upstream(const std::shared_ptr<Connection>& downstream);
+  std::shared_ptr<Connection> ensure_upstream(const std::shared_ptr<Connection>& downstream,
+                                              std::uint16_t upstream_target);
 
-  // --- 上游连接池（S2-02，ADR-15）：借 / 还 / 淘汰 --------------------------
-  // 池是**每 worker 一份**、只被本循环线程碰，所以全程无锁（ADR-14 的单线程拥有）。
-  // 从池里取一条仍可用的空闲热上游（跳过陈旧的）；池空返回 nullptr。计 pool_borrows。
-  std::shared_ptr<Connection> take_pooled_upstream();
-  // 这条上游现在能不能安全归还进池复用：kOpen、非隧道、非一次性配对、出向空、
+  // --- 上游连接池（S2-02，ADR-15；分桶见 ADR-15 追加节）：借 / 还 / 淘汰 ---------
+  // 池是**每 worker 一份**、只被本循环线程碰的按目标分桶的空闲热上游表，所以全程无锁
+  // （ADR-14 的单线程拥有原样成立，这也是 ADR-15 选 per-worker 而不是 shared 的决定性理由）。
+  // 三条边界必须分清，混一条就是 bug：
+  //   借出（take_pooled_upstream）——从**指定那个桶**移除、配对给某条下游；
+  //   归还（recycle_upstream）——下游关闭时（或目标切换时），干净的上游解配、复位、
+  //      放回它自己那条目标对应的桶；
+  //   淘汰（evict_pooled + close）——空闲上游被对端 EOF、或池满、或不干净时关闭。
+  // 从 `target` 那个桶里取一条仍可用的空闲热上游（跳过陈旧的）；桶空返回 nullptr。计 pool_borrows。
+  std::shared_ptr<Connection> take_pooled_upstream(std::uint16_t target);
+  // 这条上游现在能不能安全复用：kOpen、非隧道、非一次性配对、出向空、没有在飞请求、
   // 响应跟踪停在干净边界（上一条响应已完整完结并复位）。任一不满足就淘汰而不是归还。
+  // **S3-01 起它是两个问题的同一个判据**：能不能进池，和**能不能换目标**（ADR-18 第五节）。
+  // 我刻意不另写第二个条件——"能进池却换不了目标"那种状态没人能解释。
   bool upstream_reusable(const Connection& upstream) const noexcept;
-  // 下游关闭时调用：可复用且池未满 → 解配、复位、重新只挂 EPOLLIN（监控对端 EOF）、
-  // 放回池，计 pool_returns；池满 → 关闭并计 pool_evictions_full。
+  // 下游关闭时（或干净边界上换目标时）调用：可复用且**那个目标的桶**未满 → 解配、复位、
+  // 重新只挂 EPOLLIN（监控对端 EOF）、放回它自己那条目标对应的桶，计 pool_returns；
+  // 桶满 → 关闭并计 pool_evictions_full（`pool_max_idle` 现在是**每 worker 每目标**的上界）。
   void recycle_upstream(const std::shared_ptr<Connection>& upstream);
-  // 把这条上游从池的空闲表里摘掉（若不在池里是 no-op），返回它是否确实在池里。
+  // 把这条上游从它那条目标的空闲桶里摘掉（不在桶里是 no-op），返回它是否确实在桶里。
   bool evict_pooled(const std::shared_ptr<Connection>& upstream);
-  // 循环退出时排空池：停掉的 worker 不该留着热连接。关闭全部空闲上游并清表。
+  // 循环退出时排空所有桶：停掉的 worker 不该留着热连接。关闭全部空闲上游并清表。
   void drain_upstream_pool();
+
+  // 某个目标对应的空闲桶；**越界返回 nullptr**。所有"拿 filter 写回来的下标去索引数组"
+  // 的动作都必须走这一道，因为那件事的失败形态不是"回错一个后端"而是越界读。
+  // 走这一道的第二个理由是口径：目标合法性只在两个地方判——装配方（规则下标 vs 表长度）
+  // 和这里（索引前），而不是散在借、还、淘汰各写一遍。
+  std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) noexcept;
+  const std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) const noexcept;
 
   // --- 优雅停止：排水（S2-05，ARCHITECTURE 1.20）---------------------------
   // 两条都只在**循环线程**上跑，碰的全是循环内状态（注册表 / epoll / 出向缓冲），
@@ -350,10 +407,12 @@ class Reactor {
   std::unordered_map<int, std::shared_ptr<Connection>> connections_;
   std::vector<std::shared_ptr<Connection>> retiring_;
 
-  // 上游连接池（S2-02，ADR-15）：本 worker 的空闲热上游。它们**同时**在 connections_
-  // 里（仍注册在本 worker 的 epoll 上、监控对端 EOF），这里只是"哪些是空闲可借"的子集。
-  // 借出时从本表移除并配对；归还时放回本表并解配。每 worker 一份、只被循环线程碰，无锁。
-  std::vector<std::shared_ptr<Connection>> upstream_pool_;
+  // 上游连接池（S2-02，ADR-15；S3-01 起按目标分桶，见 ADR-15 追加节）：本 worker 的
+  // 空闲热上游，**外层下标 = 目标下标**。它们**同时**还在 connections_ 里（仍注册在本
+  // worker 的 epoll 上、监控对端 EOF），每个桶只是"这条目标的哪些上游是空闲可借"的子集。
+  // 桶数组在构造时按目标表长度定长（运行期不 resize——变长是 S5 热重载的话题，那时按
+  // ADR-10 换成"整张表换一根指针"）。每 worker 一份、只被循环线程碰，无锁。
+  std::vector<std::vector<std::shared_ptr<Connection>>> upstream_pool_;
 
   // 待探测读的连接（S1-07 的恢复路径）。持 shared_ptr 和 retiring_ 同一个理由：
   // 排队期间这条连接可能正好被关掉，出队时必须靠注册表反查认人，不能信手里的裸指针。

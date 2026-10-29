@@ -86,6 +86,14 @@ class TestUpstream {
   std::uint64_t requests_served() const noexcept {
     return requests_served_.load(std::memory_order_relaxed);
   }
+  // S3-01 加的这一格：accept 成功的**连接条数**（不是请求条数）。
+  // 它存在的理由是一条具体的验收句——"一条请求落到指定后端、`upstream_opened` 只增加
+  // 那一个目标的连接"。`upstream_opened` 是网关侧的总量，只能证明"总共开了几条";
+  // "开到了谁那里"必须由被连的那一侧自报。这沿用 B-007 那套 `accepted_by_addr=` 的
+  // 立场：**每个后端各收多少条，从来不由"总数 ÷ 后端数"算出来**。
+  std::uint64_t connections_accepted() const noexcept {
+    return connections_accepted_.load(std::memory_order_relaxed);
+  }
 
   // 三个测试侧旋钮。语义都限定在"对端行为"，不触碰网关内部状态。
   // 响应体的**长度**由 response_body_bytes_ 决定，内容形如 "seq=42....."，
@@ -225,6 +233,7 @@ class TestUpstream {
       if (!accepted.ok()) return;  // EAGAIN 或真错误，两种都收工
       Client client;
       client.fd = std::move(accepted.fd);
+      connections_accepted_.fetch_add(1, std::memory_order_relaxed);
       clients.push_back(std::move(client));
     }
   }
@@ -504,6 +513,7 @@ class TestUpstream {
   std::thread worker_;
   std::atomic<bool> stop_{false};
   std::atomic<std::uint64_t> requests_served_{0};
+  std::atomic<std::uint64_t> connections_accepted_{0};  // S3-01：见上面 getter 的注释
   std::uint16_t port_ = 0;
   std::size_t response_body_bytes_ = 64;
   int delay_ms_ = 0;
