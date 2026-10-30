@@ -4847,5 +4847,220 @@ TEST(S3_05_FaultMatrix, SlowWithinProbeTimeoutStaysAlive) {
   backend1.stop_and_join();
 }
 
+
+// ======================= S4-01：请求级超时（ADR-21）==================================
+//
+// 三格的端到端：头超时（stall 在响应头之前）→ 自产 504 + 被动记账；
+// body 空闲（stall 在 body 中途）→ 头已出去、无自产资格，只能连接终止表态；
+// 连接超时（黑洞地址，预探针判环境）→ connect 限期未完成 → 504。
+// 健康判据的联动也在这批用例里钉：超时 = note_health_failure 的输入（ADR-21 规则 1）。
+
+namespace {
+
+// 读到 EOF 为止、把所有字节攒下来（Client::wait_for_eof 会丢数据，这一格要留证据：
+// "头先到、body 只有一段、然后才是 EOF" 的次序就是 body 空闲表态的形状）。
+bool read_all_until_eof(int fd, std::string* out, std::string* why) {
+  char buf[2048];
+  while (true) {
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n == 0) return true;
+    if (n > 0) {
+      out->append(buf, static_cast<std::size_t>(n));
+      continue;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      *why = "读超时：连接既没关也没新字节（body 空闲超时没触发，或触发了没关干净）";
+      return false;
+    }
+    *why = std::string("read errno=") + std::to_string(errno);
+    return false;
+  }
+}
+
+}  // namespace
+
+TEST(S4_01_Timeouts, HeadTimeoutReplies504AndCountsPassiveFailure) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+  // 两台都在响应头之前冻住（收请求不回）：头超时的触发形态。
+  backend0.set_stall_reads(true);
+  backend1.set_stall_reads(true);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend0.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend1.port())});
+  options.config.default_target = 0;
+  options.config.upstream_head_timeout_ms = 300;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;  // 被动专场：超时是唯一的失败来源
+  policy.max_fails = 2;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 100;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend0.port()),
+               "127.0.0.1:" + std::to_string(backend1.port())},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 零业务流量时超时器无副作用：500ms 里没有任何超时计数（deadline 表为空）。
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 0u);
+  EXPECT_EQ(health.ejected_now(), 0u);
+
+  // 两台各吃两次头超时（max_fails=2 → 第二次触发摘除）：每条都要在 ~300ms + tick 内拿到 504。
+  for (int round = 0; round < 4; ++round) {
+    const auto sent_at = std::chrono::steady_clock::now();
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/head-stall")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(c.read_response(&status, &body, &why))
+        << "超时后客户端没拿到 504：请求挂死（S2-06 的旧形状）";
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - sent_at)
+                          .count();
+    EXPECT_EQ(status, "HTTP/1.1 504 Gateway Timeout") << "round " << round;
+    EXPECT_LE(took, 2000) << "round " << round << "：504 来得太慢";
+    c.close();
+  }
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 4u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 4u);
+  // 健康判据联动（ADR-21 规则 1）：两次头超时 = 两次被动失败 → 两台各被摘一次。
+  ASSERT_TRUE(wait_until([&] {
+    return health.snapshot(0).ejections_total >= 1 && health.snapshot(1).ejections_total >= 1;
+  }, 1000)) << "超时没有计入健康判据：慢过容忍线的后端不会被摘";
+  EXPECT_EQ(health.ejected_now(), 2u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
+}
+
+TEST(S4_01_Timeouts, BodyIdleClosesWithoutFabricatedReply) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 128, &why)) << why;
+  // body=128 的响应头固定是 64 字节（17+21+24+2）。发出头 + 10 字节 body 后冻结：
+  // 流死在半路，头已出去——无自产资格的那一格。
+  backend.set_stall_after_bytes(74);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "127.0.0.1";
+  target.port = static_cast<std::uint16_t>(backend.port());
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+  options.config.upstream_head_timeout_ms = 0;   // 头格关：只验 body 空闲
+  options.config.upstream_body_idle_timeout_ms = 300;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 100;
+  auto health = std::make_shared<l7gate::route::HealthTable>(1, policy);
+  options.config.health = health;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/body-stall")));
+  std::string partial;
+  ASSERT_TRUE(read_all_until_eof(c.fd(), &partial, &why)) << why;
+  EXPECT_EQ(partial.rfind("HTTP/1.1 200 OK", 0), 0u) << "响应头没先到";
+  EXPECT_GT(partial.size(), 64u) << "body 一段都没透传";
+  EXPECT_LT(partial.size(), 192u + 1u) << "收到了完整的 body：流没有冻结";
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upstream_body_idle_timeout) == 1u; }, 2000))
+      << "body 空闲超时没有触发";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "头已出去还伪造第二条响应";
+  EXPECT_EQ(health->snapshot(0).ejections_total, 1u) << "body 空闲没有计入健康判据";
+
+  c.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend.stop_and_join();
+}
+
+// 连接超时的可控形态是"黑洞地址"：TEST-NET-1（192.0.2.0/24，RFC 5737）在 NAT 环境
+// 里通常是被静默丢弃的（connect 挂住直到超时）。**环境预探针**：300ms 内当场失败
+// （ICMP 快速不可达的 NAT）→ Skipped＝环境不产生黑洞，不判（先例：mallinfo2 那两条
+// Skipped 的口径）；挂住 → 才有资格断言。真防火墙/黑门的交叉验证归 S4-07 矩阵。
+TEST(S4_01_Timeouts, ConnectTimeoutOnBlackHoleReplies504) {
+  // 预探针：非阻塞 connect + 300ms poll。
+  int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(1);
+  addr.sin_addr.s_addr = htonl(0xC0000201);  // 192.0.2.1（TEST-NET-1）
+  const int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  if (rc == 0) {
+    ::close(probe);
+    GTEST_SKIP() << "192.0.2.1 立即连上了（NAT 劫持 TEST-NET）：环境不产生黑洞，不判";
+  }
+  if (rc < 0 && errno != EINPROGRESS) {
+    ::close(probe);
+    GTEST_SKIP() << "connect 当场失败 errno=" << errno << "：环境快速拒绝而不是黑洞，不判";
+  }
+  pollfd p{probe, POLLOUT, 0};
+  const int ready = ::poll(&p, 1, 300);
+  ::close(probe);
+  if (ready > 0) {
+    GTEST_SKIP() << "黑洞地址 300ms 内完成了握手或快速失败：环境不产生黑洞，不判";
+  }
+
+  std::string why;
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "192.0.2.1";
+  target.port = 1;
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+  options.config.upstream_connect_timeout_ms = 300;
+  options.config.upstream_head_timeout_ms = 0;
+  options.config.upstream_body_idle_timeout_ms = 0;
+
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  const auto sent_at = std::chrono::steady_clock::now();
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/connect-stall")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << "connect 限期未完成时客户端挂死";
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - sent_at)
+                        .count();
+  EXPECT_EQ(status, "HTTP/1.1 504 Gateway Timeout");
+  EXPECT_GE(took, 250) << "504 来得比 connect 超时还早：判的不是超时";
+  EXPECT_LE(took, 2000);
+  EXPECT_EQ(stats.load(stats.upstream_connect_timeout), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  c.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
 }  // namespace l7gate::net
 

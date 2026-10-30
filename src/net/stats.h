@@ -50,6 +50,12 @@ struct ReactorStats {
   std::atomic<std::uint64_t> downstream_accepted{0};
   std::atomic<std::uint64_t> upstream_opened{0};
   std::atomic<std::uint64_t> upstream_connect_failed{0};
+  // S4-01（ADR-21）三类超时的计数。它们也是健康判据的输入（note_health_failure），
+  // 但与 upstream_connect_failed 分开记：超时是"限期未完成"不是"当场被拒"，
+  // 归因口径不同（B-015 的探活账与 S3-05 矩阵都按这个口径读）。
+  std::atomic<std::uint64_t> upstream_connect_timeout{0};
+  std::atomic<std::uint64_t> upstream_head_timeout{0};
+  std::atomic<std::uint64_t> upstream_body_idle_timeout{0};
   std::atomic<std::uint64_t> connections_closed{0};
 
   // 两类"我主动不接"的计数。它们和 connections_closed 必须分开：混在一起的话

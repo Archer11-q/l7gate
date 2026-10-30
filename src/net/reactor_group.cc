@@ -103,6 +103,11 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     wc.connection = config_.connection;
     wc.wait_timeout_ms = config_.wait_timeout_ms;
     wc.stop_after_requests = 0;
+    // S4-01（ADR-21）：请求级超时三格同样在构造前进 wc（与 lb_state/health 同一条
+    // "构造期副本"的教训）。
+    wc.upstream_connect_timeout_ms = config_.upstream_connect_timeout_ms;
+    wc.upstream_head_timeout_ms = config_.upstream_head_timeout_ms;
+    wc.upstream_body_idle_timeout_ms = config_.upstream_body_idle_timeout_ms;
     // S3-03（ADR-12 落地）：健康表与探活分派同样必须在构造前进 wc（与上面 lb_state
     // 同一条教训：Reactor 存 config 的副本，构造之后写等于没写）。探活分派按
     // `target % N == i` 切——探活流量不随 worker 数放大。

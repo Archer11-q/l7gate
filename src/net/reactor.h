@@ -112,6 +112,14 @@ class Reactor {
 
     Connection::Config connection;
 
+    // S4-01（ADR-21）请求级超时三格。0 = 关闭该格（既有用例与压测全部取 0，
+    // 行为逐字节不变）。单位毫秒；扫描粒度是循环 tick（wait_timeout_ms），所以
+    // 实际触发时刻 ≤ 设定值 + 一个 tick。
+    // 已裁：不设 body 总时长——idle 管住"死了的流"，总时长管不住"活着的流"。
+    std::int64_t upstream_connect_timeout_ms = 0;
+    std::int64_t upstream_head_timeout_ms = 0;
+    std::int64_t upstream_body_idle_timeout_ms = 0;
+
     // > 0 时：解析满这么多个请求就自动 stop()。压测和验收需要"跑固定轮数后
     // 自己结束"，而不是靠外部信号——外部 SIGTERM 的送达时机本身不是可控量。
     std::size_t stop_after_requests = 0;
@@ -438,6 +446,14 @@ class Reactor {
   // 为对账后新出现的目标追加探活槽（延续 build_probe_slots 的分派规则）。
   void grow_probe_slots(std::size_t from_target, std::size_t to_target) noexcept;
 
+  // --- S4-01（ADR-21）请求级超时 ------------------------------------------------
+  // 登记与移除只在 owner 循环线程；deadline 表空时 enforce 是一次判空。
+  void set_upstream_deadline(const Connection& conn, std::int64_t delay_ms) noexcept;
+  void erase_upstream_deadline(int fd) noexcept;
+  // 循环 tick 调用：扫 deadline 表，撞线的按格处置（connect/head → 504 + 记账 + 关闭；
+  // body idle → 只能以连接终止表态）。扫的是 map 不是注册表——表的大小 = 在飞上游数。
+  void enforce_upstream_timeouts(std::int64_t now_ms) noexcept;
+
   // --- 负载均衡的配对账（S3-02，ADR-19 第四条）--------------------------------------
   // 尺子是"当前被配给下游的上游连接条数"，不是"这个后端有多少条连接"——池里空闲的那条
   // 不算负载（它闲着的，这正是 least_conn 想看见的事）。
@@ -526,6 +542,14 @@ class Reactor {
   std::vector<std::size_t> probe_targets_;
   std::vector<std::int64_t> probe_next_due_ms_;
   std::vector<Probe> probes_;
+
+  // --- S4-01（ADR-21）请求级超时的 deadline 表 ---------------------------------
+  // fd → 单调毫秒。**只记上游侧的 fd**；生命周期与配对绑定：connect 发起/请求转发时
+  // 登记，响应头到达（换格）/ 响应完结 / 配对解除（close/recycle）时移除。
+  // 放在 Reactor 侧而不是 Connection 上：`sizeof(Connection)` 的 static_assert（528）
+  // 是 B-011 构成表的地基，为计时器加字段要过 ADR；map 只被 owner 循环线程碰。
+  // **零业务流量时表为空**——"超时器不产生任何副作用"的验收由这条结构保证。
+  std::unordered_map<int, std::int64_t> upstream_deadlines_;
   // 停止请求独立于"循环在不在跑"。两个状态合成一个的原因我踩过一次：
   // 用 running_ 同时表达"我在循环里"和"我还没被要求停"，那么 run() 开头的
   // store(true) 就会把在那之前送达的 stop() 抹掉，循环再也不停。

@@ -452,6 +452,14 @@ std::string_view gateway_error_reply(std::uint16_t status) noexcept {
              "Connection: close\r\n"
              "\r\n"
              "Bad Gateway\n";
+    case 504:
+      // S4-01（ADR-21）：请求级超时的表态格。头前超时（连接/响应头）有自产资格；
+      // body 空闲超时头已出去，走连接终止表态、不到这张表。
+      return "HTTP/1.1 504 Gateway Timeout\r\n"
+             "Content-Length: 15\r\n"
+             "Connection: close\r\n"
+             "\r\n"
+             "Gateway Timeout\n";
     default:
       return {};  // 调用方不许把空 view 当"发送成功"（头文件明写）
   }

@@ -109,6 +109,9 @@ class TestUpstream {
   // 请求路径带 /dies，或全局开关打开时对**所有**请求生效。它是"坏上游"的
   // 可控版本：截断的位置由测试定，断的行为由内核定。
   void set_die_after_response_bytes(std::size_t n) noexcept { die_after_bytes_ = n; }
+  // S4-01：发出前 n 个字节（含响应头）后**搁置**——不关连接、不读、不回，但也不走
+  // hang_up。它是"响应中途死掉的流"的可控版本：body 空闲超时的验收靠它把流冻在半路。
+  void set_stall_after_bytes(std::size_t n) noexcept { stall_after_bytes_ = n; }
   // S3-03：命中指定路径前缀的请求回固定状态码（探活的"固定回 404 的后端样本"与
   // 被动 5xx 的可控版本都靠它）。reason 文案给一个占位——网关的框架判定不读 reason。
   void set_path_status(std::string_view prefix, int status) {
@@ -171,6 +174,9 @@ class TestUpstream {
     // S1-06：这一条由上游**主动断掉**（坏上游的两种形态：不回话 / 回半条）。
     // 断完之后本轮就把 client 摘掉，不让它带着 -1 的 fd 再进一次 poll 表。
     bool hang_up = false;
+    // S4-01：被搁置的客户端（发完前 n 字节后冻结）——外层循环跳过它，
+    // 不读不写不摘，等的是网关侧的 body 空闲超时来收这条流。
+    bool stalled = false;
   };
 
   void loop() {
@@ -199,6 +205,7 @@ class TestUpstream {
         const short revents = pfds[i].revents;
         if (revents == 0) continue;
         Client& client = clients[i - 1];
+        if (client.stalled) continue;  // S4-01：被搁置的流不读不写不摘，冻在半路
         const bool alive = read_into(client, revents);
         if (client.tunneled) {
           // 隧道：不碰语义，pending 里是什么就回显什么（包括"看起来像畸形 HTTP"
@@ -366,6 +373,19 @@ class TestUpstream {
       }
 
       std::string payload = build_response(want_close);
+      if (stall_after_bytes_ < payload.size()) {
+        // S4-01：发出前 n 个字节（头 + 一段 body）后搁置这条客户端——流冻在半路，
+        // 连接保持打开。与 /dies-mid-body 的区别是那一格"断"（EOF 表态）、这一格"僵"
+        // （无字节流动，等的是 body 空闲超时这类主动计时）。
+        const std::size_t head_end = payload.find("\r\n\r\n") + 4;
+        if (stall_after_bytes_ > head_end) {
+          echo_all(client, payload.substr(0, stall_after_bytes_));
+          client.pending.erase(0, block_end + body_len);
+          requests_served_.fetch_add(1, std::memory_order_relaxed);
+          client.stalled = true;
+          return;
+        }
+      }
       if (die_after_bytes_ < payload.size()) {
         // 全局断链模式：只发前 die_after_bytes_ 字节就关（0 时一个字节的响应都不发）。
         // 截断的**位置**由测试定，断的**动作**由内核的 FIN 完成——这条分工让
@@ -535,6 +555,7 @@ class TestUpstream {
   bool close_after_response_ = false;
   std::string fixed_body_;
   std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
+  std::size_t stall_after_bytes_ = std::numeric_limits<std::size_t>::max();
   std::string status_path_prefix_;
   int status_path_code_ = 0;
   std::atomic<bool> stall_reads_{false};

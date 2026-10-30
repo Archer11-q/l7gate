@@ -41,6 +41,8 @@ void usage(std::FILE* out) {
       "               [--config <path>]\n"
       "               [--nodes-db <host:port>] [--nodes-user U] [--nodes-password P]\n"
       "               [--nodes-schema DB] [--nodes-reload-ms MS] [--nodes-timeout-ms MS]\n"
+      "               [--upstream-connect-timeout-ms MS] [--upstream-head-timeout-ms MS]\n"
+      "               [--upstream-body-idle-timeout-ms MS]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -72,6 +74,11 @@ void usage(std::FILE* out) {
       "保留上一份成员继续服务（不拒绝、不 500），恢复后自动换上新表。MySQL 连不上时\n"
       "mysql 组按空成员启动。配置声明了 source=mysql 但没给 --nodes-schema 是配置矛盾，\n"
       "退出码 2。\n"
+      "--upstream-*-timeout-ms（S4-01，ADR-21）请求级超时三格：连接超时（缺省 3000）、\n"
+      "响应头超时（缺省 10000）、body 空闲超时（缺省 30000，0 = 关闭该格；**不设 body\n"
+      "总时长**——idle 管住死了的流，总时长管不住活着的流）。撞线：连接/头超时给配对\n"
+      "下游自产 504 并按健康判据记账（被动失败）；body 空闲头已出去、无自产资格，只能\n"
+      "以连接终止表态。--drain-timeout-ms 必须 ≥ 响应头超时，违反退出码 2。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：摘掉监听（新连接从此拿 RST）→ 不再接受新请求 →\n"
       "在飞请求逐条响应完 + 刷完出向 → 空闲连接立即关 → 到点兜底强关 → 退出循环、join worker。\n"
       "带 upgrade 的隧道**只能硬关**：ADR-09 不解析帧就发不出 WS close 握手，刷完已缓冲的\n"
@@ -235,6 +242,11 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   put("accept_errors", static_cast<long long>(stats.load(stats.accept_errors)));
   put("upstream_opened", static_cast<long long>(stats.load(stats.upstream_opened)));
   put("upstream_connect_failed", static_cast<long long>(stats.load(stats.upstream_connect_failed)));
+  // S4-01（ADR-21）：三类超时的终局读数。
+  put("upstream_connect_timeout", static_cast<long long>(stats.load(stats.upstream_connect_timeout)));
+  put("upstream_head_timeout", static_cast<long long>(stats.load(stats.upstream_head_timeout)));
+  put("upstream_body_idle_timeout",
+      static_cast<long long>(stats.load(stats.upstream_body_idle_timeout)));
   put("requests_parsed", static_cast<long long>(stats.load(stats.requests_parsed)));
   put("requests_rejected", static_cast<long long>(stats.load(stats.requests_rejected)));
   put("connections_constructed", static_cast<long long>(stats.load(stats.connections_constructed)));
@@ -355,6 +367,10 @@ int serve(int argc, char** argv) {
   bool have_nodes_schema = false;
   l7gate::config::NodesDbParams nodes_params;
   long long nodes_reload_ms = 5000;
+  // S4-01（ADR-21）：请求级超时三格。0 = 关闭该格。
+  long long upstream_connect_timeout_ms = 3000;
+  long long upstream_head_timeout_ms = 10000;
+  long long upstream_body_idle_timeout_ms = 30000;
 
   for (int i = 2; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -414,6 +430,30 @@ int serve(int argc, char** argv) {
         return 2;
       }
       nodes_params.timeout_ms = n;
+      ++i;
+    } else if (flag == "--upstream-connect-timeout-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 600000) {
+        std::fprintf(stderr, "参数错误: --upstream-connect-timeout-ms 要的是 0..600000，收到 %s\n", value);
+        return 2;
+      }
+      upstream_connect_timeout_ms = n;
+      ++i;
+    } else if (flag == "--upstream-head-timeout-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 600000) {
+        std::fprintf(stderr, "参数错误: --upstream-head-timeout-ms 要的是 0..600000，收到 %s\n", value);
+        return 2;
+      }
+      upstream_head_timeout_ms = n;
+      ++i;
+    } else if (flag == "--upstream-body-idle-timeout-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 600000) {
+        std::fprintf(stderr, "参数错误: --upstream-body-idle-timeout-ms 要的是 0..600000，收到 %s\n", value);
+        return 2;
+      }
+      upstream_body_idle_timeout_ms = n;
       ++i;
     } else if (flag == "--serve-requests" && value != nullptr) {
       long long n = 0;
@@ -475,6 +515,11 @@ int serve(int argc, char** argv) {
     }
   }
   config.stop_after_requests = stop_after_requests;
+  // S4-01（ADR-21）：请求级超时三格进单 Reactor 的 config（多 Reactor 路径在 gconfig 处
+  // 同样进一份）。
+  config.upstream_connect_timeout_ms = upstream_connect_timeout_ms;
+  config.upstream_head_timeout_ms = upstream_head_timeout_ms;
+  config.upstream_body_idle_timeout_ms = upstream_body_idle_timeout_ms;
   // 兜底窗口先落到全局原子，**再**装 handler：反过来的话存在一个窗口——信号在装好
   // handler 之后、这一行之前到达，handler 读到的就是默认值而不是命令行给的值。
   // 这里给的是同一个 5000 所以后果一样，但顺序错了就是"迟早会错"的那种写法。
@@ -497,6 +542,16 @@ int serve(int argc, char** argv) {
   }
   if (config_path.empty() && !have_upstream) {
     std::fprintf(stderr, "参数错误: --serve 需要 --upstream 或 --config 之一\n");
+    return 2;
+  }
+  // S4-01（ADR-21）：排水与超时的对齐在启动时校验——头都等不到的排水窗口没有意义
+  // （S2-05 埋的那条约定在此兑现）。body 空闲不参与：它是对活流的耐心，不是对排水的预算。
+  if (drain_timeout_ms > 0 && upstream_head_timeout_ms > 0 &&
+      drain_timeout_ms < upstream_head_timeout_ms) {
+    std::fprintf(stderr,
+                 "参数错误: --drain-timeout-ms (%lld) 必须 ≥ --upstream-head-timeout-ms (%lld)："
+                 "头都等不到的排水窗口没有意义\n",
+                 drain_timeout_ms, upstream_head_timeout_ms);
     return 2;
   }
   if (!config_path.empty()) {
@@ -656,6 +711,9 @@ int serve(int argc, char** argv) {
     gconfig.max_connections_per_worker = config.max_connections;
     gconfig.connection = config.connection;
     gconfig.stop_after_requests = stop_after_requests;
+    gconfig.upstream_connect_timeout_ms = upstream_connect_timeout_ms;
+    gconfig.upstream_head_timeout_ms = upstream_head_timeout_ms;
+    gconfig.upstream_body_idle_timeout_ms = upstream_body_idle_timeout_ms;
     gconfig.wait_timeout_ms = config.wait_timeout_ms;
 
     l7gate::net::ReactorGroup group(gconfig);
@@ -681,7 +739,9 @@ int serve(int argc, char** argv) {
                 gconfig.max_connections_per_worker, upstream_list.c_str(), upstream_endpoints.size(),
                 stop_after_requests, gconfig.wait_timeout_ms,
                 gconfig.connection.inbound.high_water_mark, drain_timeout_ms);
-    if (has_routes || has_groups) {
+    std::printf("[serve] upstream_timeouts=on connect_ms=%lld head_ms=%lld body_idle_ms=%lld\n",
+                upstream_connect_timeout_ms, upstream_head_timeout_ms,
+                upstream_body_idle_timeout_ms);    if (has_routes || has_groups) {
       // **单独一行，不动上面那条横幅**：`scripts/bench/s1-p99.sh` 是靠横幅里的键名
       // （多 Reactor 有 `workers=`、单 Reactor 有 `max_connections=`）当场判"这一臂到底是
       // 哪条路径"的，改那些键等于让历史脚本对不上路。策略的信息量新起一行给。
@@ -772,6 +832,9 @@ int serve(int argc, char** argv) {
               config.max_connections, shown_target.address.c_str(), shown_target.port,
               stop_after_requests, config.wait_timeout_ms,
               config.connection.inbound.high_water_mark, drain_timeout_ms);
+  std::printf("[serve] upstream_timeouts=on connect_ms=%lld head_ms=%lld body_idle_ms=%lld\n",
+              upstream_connect_timeout_ms, upstream_head_timeout_ms,
+              upstream_body_idle_timeout_ms);
   if (has_routes || has_groups) {
     // 同多 Reactor 那一臂：新起一行，不碰上面那条签名行。
     std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu default_target=%u\n",

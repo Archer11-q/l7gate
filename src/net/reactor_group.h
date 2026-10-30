@@ -107,6 +107,11 @@ class ReactorGroup {
 
     // accept 循环与每个 worker 循环的 epoll_wait 超时。
     int wait_timeout_ms = 200;
+
+    // S4-01（ADR-21）：请求级超时三格，逐 worker 下发（0 = 关闭该格）。
+    std::int64_t upstream_connect_timeout_ms = 0;
+    std::int64_t upstream_head_timeout_ms = 0;
+    std::int64_t upstream_body_idle_timeout_ms = 0;
   };
 
   explicit ReactorGroup(Config config);

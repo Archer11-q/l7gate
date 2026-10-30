@@ -325,6 +325,9 @@ std::uint64_t Reactor::run() {
     // 无发布器时是空转前的一次判空，成本为零。
     sync_nodes_snapshot();
 
+    // S4-01（ADR-21）请求级超时的扫描点：deadline 表为空时是一次判空。
+    enforce_upstream_timeouts(monotonic_ms());
+
     if (config_.stop_after_requests > 0 &&
         stats_.requests_parsed.load(std::memory_order_relaxed) >= config_.stop_after_requests) {
       // 这条 break **不排水**：它的语义是"解析满 N 条就停循环"，帮助文本一直明写着
@@ -761,6 +764,11 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   note_upstream_paired(upstream_target);
   upstream->set_state(outcome.status == ConnectStatus::kConnected ? State::kOpen
                                                                   : State::kConnecting);
+  // S4-01（ADR-21）：连接超时的登记点。回环上立刻完成的 connect（kConnected）不设——
+  // 它没有"限期未完成"可言，响应头超时在 forward_request 里接管。
+  if (upstream->state() == State::kConnecting && config_.upstream_connect_timeout_ms > 0) {
+    set_upstream_deadline(*upstream, config_.upstream_connect_timeout_ms);
+  }
   int error = 0;
   (void)set_tcp_nodelay(upstream->fd(), &error);
 
@@ -837,6 +845,60 @@ void Reactor::grow_probe_slots(std::size_t from_target, std::size_t to_target) n
     probe_targets_.push_back(t);
     probe_next_due_ms_.push_back(0);  // 0 = 立即到期：下一拍就探新成员
     probes_.emplace_back();           // 槽位只追加：user_data 编码的是下标，搬家不失效
+  }
+}
+
+// --- S4-01（ADR-21）请求级超时 ---------------------------------------------------
+
+void Reactor::set_upstream_deadline(const Connection& conn, std::int64_t delay_ms) noexcept {
+  if (delay_ms <= 0) return;
+  upstream_deadlines_[conn.fd()] = monotonic_ms() + delay_ms;
+}
+
+void Reactor::erase_upstream_deadline(int fd) noexcept { upstream_deadlines_.erase(fd); }
+
+void Reactor::enforce_upstream_timeouts(std::int64_t now_ms) noexcept {
+  if (upstream_deadlines_.empty()) return;  // 零业务流量：一次判空，无副作用
+  // 先收集再处置：处置会 close（级联触发别的 deadline 擦除），边遍历边删是自找的雷。
+  std::vector<int> expired;
+  for (const auto& [fd, deadline] : upstream_deadlines_) {
+    if (deadline <= now_ms) expired.push_back(fd);
+  }
+  for (const int fd : expired) {
+    upstream_deadlines_.erase(fd);  // 处置路径自己会走 close_connection（那里也擦一次，幂等）
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) continue;  // fd 已被同批事件关闭：认人，不认编号
+    const std::shared_ptr<Connection> conn = it->second;
+
+    std::shared_ptr<Connection> downstream;
+    if (conn->peer_fd() != kInvalidFd) {
+      auto dit = connections_.find(conn->peer_fd());
+      if (dit != connections_.end()) downstream = dit->second;
+    }
+
+    if (conn->state() == State::kConnecting) {
+      // 连接超时：握手限期未完成。头前超时有自产资格（S1-06 的表态资格规则）。
+      stats_.upstream_connect_timeout.fetch_add(1, std::memory_order_relaxed);
+      note_health_failure(conn->upstream_target());
+      fail_pair_with_reply(downstream, 504);
+      continue;  // fail_pair 已按丢弃关闭上游、按 flush 关闭下游
+    }
+    const bool head_pending =
+        conn->response_tracking().phase == Connection::ResponsePhase::kHead;
+    if (head_pending && conn->in_flight_requests() > 0) {
+      if (config_.upstream_head_timeout_ms <= 0) continue;  // 混配（只开 connect 格）：头格不记账
+      // 响应头超时：请求字节早已排进上游，最终头（1xx 不算）限期未见。
+      stats_.upstream_head_timeout.fetch_add(1, std::memory_order_relaxed);
+      note_health_failure(conn->upstream_target());
+      fail_pair_with_reply(downstream, 504);
+      continue;
+    }
+    // body 空闲超时：头已排给下游——**无自产资格**（给同一条请求发第二条响应就是
+    // 伪造，S1-06 的口径），只能以连接终止表态（客户端看到断流，框架知识自己判截断）。
+    if (config_.upstream_body_idle_timeout_ms <= 0) continue;  // 混配：body 格不记账
+    stats_.upstream_body_idle_timeout.fetch_add(1, std::memory_order_relaxed);
+    note_health_failure(conn->upstream_target());
+    close_connection(conn);
   }
 }
 
@@ -1076,6 +1138,8 @@ bool Reactor::upstream_reusable(const Connection& upstream) const noexcept {
 void Reactor::recycle_upstream(const std::shared_ptr<Connection>& upstream) {
   // 调用方（close_connection 的下游分支 / ensure_upstream 的目标切换）已经把这条上游
   // 解配（peer_fd 置 kInvalidFd）。
+  // S4-01：进池 = 没有在飞请求，超时管辖到此为止（借出时按需重新登记）。
+  erase_upstream_deadline(upstream->fd());
   std::vector<std::shared_ptr<Connection>>* bucket = pool_bucket(upstream->upstream_target());
   if (bucket == nullptr) {
     // 目标桶不存在 = 这条上游带着一个表里没有的下标，只能关掉。计数走 evictions_full
@@ -1514,6 +1578,12 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
   // S2-04（ADR-16）：字节成功排队 = 这条请求已转发、开始占用上游一个在飞位。
   // 与 pump_response 的 note_response_completed 配平；close 兑现时机靠它判"归零没"。
   upstream->note_request_forwarded();
+  // S4-01（ADR-21）：响应头超时的登记点（连接已完成的那条路径；还在 kConnecting 的
+  // 由 connect 超时管，握手完成时在 on_upstream_event 里换格）。pipeline 里后续请求
+  // 的转发会刷新它——头超时的口径是"最近一次转发之后多久没见最终头"。
+  if (upstream->state() == State::kOpen && config_.upstream_head_timeout_ms > 0) {
+    set_upstream_deadline(*upstream, config_.upstream_head_timeout_ms);
+  }
 
   // 意图落在连接上，必须赶在 finish_request 作废 view 之前（此刻 pending 还有效，
   // 而上面一次字节都没动过状态——这个顺序是刻意的，转发失败时意图也不会残留）。
@@ -1539,8 +1609,30 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
 // S1-07 之前这里"下次可读事件再说"是成立的（反正一直订阅着 EPOLLIN），
 // 现在不成立——摘掉之后没有事件会来，恢复只能在这里判。
 void Reactor::pump_response(const std::shared_ptr<Connection>& upstream) {
+  // S4-01（ADR-21）：body 空闲超时的刷新依据——本轮 pump 消费掉的入向字节数。
+  // 只在"确实有字节流过"时刷新 idle：head 格是绝对计时（1xx 不重置），body 格看流速。
+  const std::size_t inbound_before = upstream->inbound().readable_bytes();
   pump_response_body(upstream);
   apply_events(upstream);
+  if (config_.upstream_body_idle_timeout_ms > 0 && !upstream->tunneling()) {
+    const auto phase = upstream->response_tracking().phase;
+    if (phase == Connection::ResponsePhase::kComplete ||
+        upstream->in_flight_requests() == 0) {
+      erase_upstream_deadline(upstream->fd());  // 响应完结/配对解除：没有"等头/等 body"可言
+    } else if (phase == Connection::ResponsePhase::kBody) {
+      if (upstream->inbound().readable_bytes() < inbound_before) {
+        set_upstream_deadline(*upstream, config_.upstream_body_idle_timeout_ms);
+      }
+    }
+  } else if (config_.upstream_body_idle_timeout_ms == 0 && !upstream->tunneling()) {
+    // body 空闲关闭时，头格的使命在最终头到达那一刻就结束了——不擦的话，头格的
+    // 绝对期限会在 body 阶段误触发"body 空闲超时"（分类按 phase 走，账会记错格）。
+    const auto phase = upstream->response_tracking().phase;
+    if (phase != Connection::ResponsePhase::kHead ||
+        upstream->in_flight_requests() == 0) {
+      erase_upstream_deadline(upstream->fd());
+    }
+  }
   // S3-01（ADR-18 第五节）：**在飞归零那一刻，把配对下游压着的那条请求重新推一次**。
   // 这条是"目标要换但手上还有在飞"那个分支欠下的还款：请求被压在下游缓冲里之后，
   // 边沿触发不会为"上游的响应刚好回完了"这件事再报一次下游事件，而客户端在等响应、
@@ -1865,6 +1957,11 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
       return;
     }
     conn->set_state(State::kOpen);
+    // S4-01（ADR-21）：连接完成后，若请求字节已在排队（在飞 > 0），响应头超时从这里
+    // 起算（覆盖掉连接超时的登记——从这一刻起"限期"量的是等响应头，不是等握手）。
+    if (conn->in_flight_requests() > 0 && config_.upstream_head_timeout_ms > 0) {
+      set_upstream_deadline(*conn, config_.upstream_head_timeout_ms);
+    }
     // 原来这里写的是"没货待发就 modify 成 kReadEvents"。换成 apply_events 之后
     // 同一件事多担保了一层：出向还有货就继续挂 EPOLLOUT，一条都不漏。
     apply_events(conn);
@@ -2025,6 +2122,9 @@ void Reactor::arm_write(const std::shared_ptr<Connection>& conn) noexcept {
 void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy why) noexcept {
   const int fd = conn->fd();
   if (fd == kInvalidFd) return;  // 幂等：重复关闭不重复计数
+  // S4-01：deadline 表跟着 fd 一起走——关闭路径覆盖所有形态（含级联），这里是
+  // 唯一需要的擦除点（kClosing 早退分支里那一次是"刷出向期间不归超时管"的提前擦）。
+  erase_upstream_deadline(fd);
   // 在改动 conn 之前记下它的角色：下面第 4 步之后 conn 已 kClosed，而"这条被关的是
   // 下游还是上游"决定了它的对端该被回收（下游关 → 上游进池）还是级联关闭（上游死 →
   // 下游跟着关，S1-06）。role_ 本身不随关闭改变，但提前存一份读起来更清楚。
@@ -2034,6 +2134,9 @@ void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy
     // 第 0 步：货还没发完。这里关掉 fd 就等于把已经接受的字节丢在原地，
     // 而调用我的场景（上游回完就断、客户端提前断开）恰恰是有响应在排队的场景。
     conn->set_state(State::kClosing);
+    // S4-01：进入 kClosing 就退出超时的管辖——刷出向是尽力而为的收尾，
+    // 不是"等响应"（deadline 表的语义只覆盖在飞/在连）。
+    erase_upstream_deadline(fd);
     arm_write(conn);
     return;
   }
