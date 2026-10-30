@@ -256,3 +256,44 @@ accept 的隧道。这一问抓出三条，都属于"工具自己的账"，所�
 空链 vs 路由链同机交替各 2 轮，每请求 p50/p99/p999 的跨臂差**不超过 A 臂自己的组内极差**，
 每请求 `epoll_ctl` 四份落在 4.0000–4.0005 → 判"**无可分辨成本**"；那个名义上 0.4% 的 QPS 优势按
 顺序效应记（B 臂在每一对里都是第二个跑的），**不读成路由让网关变快了**。
+
+## 9. S3-02 的阳性验证与三条工具侧发现（2026-10-30，负载均衡与配置文件这一层）
+
+**先说立场**：§8 那条"第一次没红"的教训是这一节的尺子。S3-02 的每条断言都单独打红过一次，
+改回即全绿，`grep -rn 'TEMP-POSITIVE' src/ tests/` 现在是 0 条——**没红过的断言我不写进文档**。
+
+| 我把代码改成什么 | 哪条用例该红 | 实测 |
+|---|---|---|
+| 环查找改成"取环上第一个点"（`return ring.front().second`） | `S3_02_MigrationRate.AddingOneBackendMovesAtMostOneInNewTotal` + 端到端粘住那条 | **两条红**，但**只有 N=3 那档抓住了它**（48.10% → 100.00%）；**N=7 那档读到 0.00%，反而"满足" ≤ 12.5%**。理由是：所有 key 都不再参与选择时，两张环给出的映射处处相同、差集是空集 → **一条只看上界的判据挡不住"哈希根本没生效"**。这条实测把 ADR-19 的判据读法改成"上界 + 散布"一对，记在 ADR-19 追加第二条 |
+| 轮询游标钉成常量 0 | `S3_02_RoundRobinCursor.CyclesPerGroupAndEachGroupHasItsOwn`、`S3_02_LoadBalanceFilter.RoundRobinWritesMemberTargetsInOrder`、`S3_02_LoadBalance.RoundRobinCyclesAcrossBackendsOnOneKeepAliveConnection` | **三条同时红**（纯函数、filter、按后端计数各一层）。12 条 ÷ 3 台应当各 4 条，常量游标下变成 12/0/0 |
+| `least_conn` 的比较符从 `<` 翻成 `>=` | `S3_02_LoadBalance.LeastConnectionsSendsNewWorkToTheIdleBackend`、`S3_02_LoadBalance.LeastConnectionsReleasesCapacityWhenTheDownstreamGoesAway` | **两条红**：前者把新请求派给正忙的后端、撞 2 s 读超时；后者拿到 64 B（错的那一台）。方向断言不依赖绝对值，所以换机器不会跟着变红 |
+| 解析器把"未知字段"从拒绝改成忽略 | `S3_02_ConfigAssembly.RejectsUnknownFieldInAGroup` | **只有这一条红**（其余 29 条照绿）。附带一条好读的性质：`banlace` 那种**键名**拼错被两条独立拒绝同时抓住（不认识的键 + 缺 `balance`），所以那一格不依赖这道门 |
+| 解析器把"重复键"从拒绝改成接受 | `S3_02_ConfigJson.RejectsDuplicateKeyInOneObject` | **只有这一条红** |
+| 解析器把"空 `targets`"从拒绝改成允许 | `S3_02_ConfigAssembly.RejectsEmptyTargets` | **只有这一条红** |
+
+**发现一：交接段"已验证"那一格只覆盖到 debug，两个 clang preset 当时是编译失败的。**
+`src/config/json.h` 用 `std::vector<std::pair<std::string, JsonValue>>` 做递归——`JsonValue`
+在自己完整之前就要实例化 `pair`，而 libstdc++ 的 `pair` 要求两边都完整。**GCC 15 放得过、
+clang 21 放不过**，所以 `asan-ubsan` 与 `tsan` 两个 preset 从我接手到修好之前是 `build exit=2`。
+改法是类内声明 `struct Member;`、类外定义（`std::vector<Member>` 走的是 C++17 P0646 给 vector
+开的那条"元素类型可以暂不完整"的路），两个编译器从此给同一个答案。
+**为什么这件事记在故障注入文档里**：它是一次构建侧的静默失效——同一份代码在一个 preset 上绿、
+在另外两个上根本没编，而当时的记录写的是"已验证"。
+
+**发现二：`verify-all-presets.sh` 在构建失败时不响，它会拿旧二进制继续跑 ctest 并报通过。**
+上面那两个 preset 报的是 `164/164`（S3-01 时代的旧产物），而真实用例数当时已经是 189。
+脚本的形状是 `cmake --build ... > log` → 打一行 `build exit=$?` → **无条件**接着 `ctest --preset`。
+`build exit=2` 那一行确实打出来了，但它不参与任何判定，红就这样被吞掉。
+**这一格我没改脚本**（改它等于改门禁工具本身，而且它今天还在给我有用的三行输出），先把纪律记下来：
+**看到三行 `tests passed` 不等于三个 preset 都构建成功——门禁的计数要看，门禁的退出码也要看**。
+这是纪律六（警告要在三个 preset 分别看）的同号版本。
+
+**发现三（旧账，B-013 的定标就是被它逼出来的）：B-012 那四轮的落盘自带 7 条 ✗。**
+`build/bench/s3-01-cost-a1.driver.log` 里有 `requests_done=20594212 ≠ planned=650000000`、
+`等式不闭合`，以及脚本自己那句 `本轮有 ✗，上面的数字不要用`。根因不是网关、也不是脚本坏：
+`REQUESTS_DIRECT=6500000` 是**每条连接**的配额，100 条连接就是 650M 条请求，而
+`l7gate_c100k` 有自己的总预算（约 120 s），在吃完配额之前就停了 —— 于是
+`requests_done == requests_planned` 这道门**在这组参数下永远合不上**。B-012 的读数来自一个
+119,998 ms 的真稳态窗口，但那一轮被工具自己判成"没资格进文档"。
+**处置**：B-013 的配额按"窗口内真吃得完"定标（直连 100k/conn、经网关 18k/conn、稳态门 ≥50 s），
+六轮全部 `rc=0`、✗ 计数 0；**B-012 要不要按同一定标复测是项目所有人的裁决**，我不回头改已记的数。

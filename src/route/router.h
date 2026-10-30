@@ -35,14 +35,26 @@ inline constexpr std::uint16_t kNoUpstreamTarget = 0xffff;
 inline constexpr std::uint16_t kMaxUpstreamTarget =
     static_cast<std::uint16_t>(kNoUpstreamTarget - 1);
 
+// 上游组的下标空间，与 `upstream_target` 同一套哨兵写法。**两个哨兵值不同**是故意的：
+// "没人决定过组"和"决定了组但组里没选出后端"要修的代码不是同一处，值一样就分不开。
+// 声明放在这里而不是 `balance.h`，因为路由表和均衡层共用这两个下标空间，
+// 而依赖方向是 balance → router（组存的成员就是 target 下标）。
+inline constexpr std::uint16_t kNoUpstreamGroup = 0xfffe;
+inline constexpr std::uint16_t kMaxUpstreamGroup =
+    static_cast<std::uint16_t>(kNoUpstreamGroup - 1);
+
 enum class Kind : std::uint8_t {
   kPrefix,  // 前缀命中，表内取**最长**的那个
   kRegex,   // 全串锚定命中（等价 std::regex_match，不是 search），表内取**配置顺序**的第一条
 };
 
 // 命名口径，写死在这里：`request_target` 永远是**请求行里那个 URI**（`/a/b?c=1`），
-// `upstream_target` 永远是**目标上游的下标**。这两个词在中文里都叫"目标"，混着用
-// 迟早写出 `if (target == target)` 那种谁也看不懂的行。
+// `upstream_group` 永远是**上游组的下标**，`upstream_target` 永远是**单个后端端点的下标**。
+// 三个词在中文里都可能被叫成"目标"，混着用迟早写出 `if (target == target)` 那种行。
+//
+// S3-02（ADR-19）把路由的返回从 target 改成 group：一条路由指向**一组**后端，
+// 组里选哪一个由 `LoadBalanceFilter` 决定。这不是为了好看——把两者合成一步会让
+// "路由"这个纯函数层染上有状态的选择，1.23 那条"规则语义用例不建 socket"就作废了。
 
 // 规则表。顺序 = 添加顺序，而且链和解析器同一个口径：**不加 priority 字段**，
 // 需要优先级的时候那就是装配顺序。
@@ -60,17 +72,17 @@ class RouteTable {
   RouteTable& operator=(const RouteTable&) = delete;
 
   // 加一条前缀规则。空前缀是合法的 catch-all（命中任何 request_target）。
-  // upstream_target 只要求落在下标空间内；**它是否真的对应一个已配置的上游端点，由装配方
-  // 校验**（main.cc / ReactorGroup），因为这张表不该知道端点表长什么样——否则"路由"就同时
-  // 知道目的地和目的地的目的地，S3-02 的节点表进来时会有两份真相。
-  bool add_prefix(std::string_view prefix, std::uint16_t upstream_target) noexcept;
+  // upstream_group 只要求落在组下标空间内；**这个组里到底有没有成员、成员对不对得上端点表，
+  // 由装配方校验**（`config/gateway_config`），因为这张表不该知道端点表长什么样——否则
+  // "路由"就同时知道目的地和目的地的目的地，两份真相迟早各说各话。
+  bool add_prefix(std::string_view prefix, std::uint16_t upstream_group) noexcept;
 
   // 加一条正则规则。模式编译不过（语法非法）就返回 false 且**不留半条规则**：
   // 这是装配期错误，调用方必须像 `--upstream` 那样整体失败退出，
   // 不能让它退化成"这条规则没生效、请求安静地落到别的后端"。
-  bool add_regex(std::string_view pattern, std::uint16_t upstream_target);
+  bool add_regex(std::string_view pattern, std::uint16_t upstream_group);
 
-  // 命中 → upstream_target 下标；没有任何规则命中 → nullopt（调用方据此表态，见 ADR-18
+  // 命中 → upstream_group 下标；没有任何规则命中 → nullopt（调用方据此表态，见 ADR-18
   // 第二节：无匹配是请求侧的确定性结果，回 404，不是网关故障）。
   //
   // **noexcept 是有前提的**：add_regex 已经在编译期挡掉了非法模式，所以匹配阶段
@@ -88,7 +100,7 @@ class RouteTable {
   struct KindView {
     Kind kind = Kind::kPrefix;
     std::string_view pattern;
-    std::uint16_t upstream_target = kNoUpstreamTarget;
+    std::uint16_t upstream_group = kNoUpstreamGroup;
     bool valid = false;  // 越界时为 false
   };
   KindView rule_at(std::size_t index) const noexcept;
@@ -97,7 +109,7 @@ class RouteTable {
   struct Rule {
     Kind kind = Kind::kPrefix;
     std::string pattern;                                // 原始模式串（日志/用例回读用）
-    std::uint16_t upstream_target = kNoUpstreamTarget;
+    std::uint16_t upstream_group = kNoUpstreamGroup;
     std::shared_ptr<const void> compiled_regex;         // Kind::kRegex 才有；<regex> 关在 .cc 里
   };
 

@@ -50,9 +50,13 @@ struct RequestInfo {
   std::size_t request_bytes = 0;  // 整条请求的原始字节数（含 body 区）
   int downstream_fd = -1;         // 这条请求来自哪条下游连接（S1 的身份就是 fd）
 
-  // --- S3-01（ADR-18）：两个写回字段，读者都在 reactor -------------------------------
-  // 目标上游的下标。`route::kNoUpstreamTarget` 读作"这个 filter 没决定"，reactor 于是用
-  // 它自己的默认目标。**这条就是"没装路由 filter 时行为逐字节等于 S2"的实现位置**：
+  // --- S3-01（ADR-18）+ S3-02（ADR-19）：写回字段。读者是 reactor 与链上的下一环 -------
+  // 上游**组**的下标。S3-02 把路由的返回从"端点"改成"一组后端"：路由说"这条请求属于哪一组"，
+  // `LoadBalanceFilter` 说"这一组里这次给哪一个"。所以它的读者不是 reactor，而是紧跟其后的
+  // 那一环——**"路由必须在均衡之前"这条顺序的唯一实现处就是这个字段的读写位置**。
+  std::uint16_t upstream_group = route::kNoUpstreamGroup;
+  // 目标上游的下标。`route::kNoUpstreamTarget` 读作"没人决定过"，reactor 于是用它自己的
+  // 默认目标。**这条就是"没装路由/均衡 filter 时行为逐字节等于 S2"的实现位置**：
   // 缺了它，空链那一臂就变成"每条请求都必须有 filter 表态"。
   std::uint16_t upstream_target = route::kNoUpstreamTarget;
   // 拒这条请求时回什么状态码。0 = 不表态，保持 S1-08 的行为（字节留在原地、连接不关、

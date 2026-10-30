@@ -76,6 +76,11 @@ class ReactorGroup {
     // 裸指针 + 只读引用不是偷懒而是这条数据的本相：表由装配方（`main.cc` / 测试）拥有，
     // **必须比本组活得久**；复制一张进来会造出第二个可以各自漂移的真相。
     const l7gate::route::RouteTable* route_table = nullptr;
+    // S3-02（ADR-19）：上游组表。**nullptr 或空表 = 不装均衡 filter**，链上就只有路由那一环
+    // （或者两环都不装）。与 route_table 同理，装配方持有它、必须比本组活得久。
+    // 每一个 worker 拿**同一张表**但**各有一份 LbState**——这是 ADR-19「per-worker 均衡」的实现处：
+    // 表是只读数据，状态才是私有的，所以共享表不违反 ADR-14。
+    const l7gate::route::GroupTable* groups = nullptr;
 
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，

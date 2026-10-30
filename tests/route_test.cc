@@ -1,9 +1,12 @@
-// S3-01（ADR-18）：路由决策的用例。分两层写在一个文件里，因为这两层都不需要 socket：
-//   一、`route::RouteTable::match` —— 纯函数本体，规则语义全部在这里断；
-//   二、`filter::RouteFilter` —— 它怎么把命中结果交回链（写哪两个字段、什么时候 kStop）。
+// S3-01（ADR-18）+ S3-02（ADR-19）：路由决策的用例。分两层写在一个文件里，因为这两层都不需要 socket：
+//   一、`route::RouteTable::match` —— 纯函数本体，规则语义全部在这里断；S3-02 起它返回的是
+//       **上游组的下标**（一条路由指向一组后端），不再是单个端点；
+//   二、`filter::RouteFilter` —— 它怎么把命中结果交回链（写哪个字段、什么时候 kStop）。
 // "路由改过的目标真的被 `ensure_upstream` 读到"那半条验收**不在这里**，在 reactor_test.cc
 // 的 `S3_01_Routing`：需要真连接与事件循环的断言不放进纯函数文件（1.16 那条分工，
 // S1-06/07/08 一直是这么切的）。
+// 组 → 组里哪一个后端，是 `LoadBalanceFilter` 的事，不在这里断（ADR-19 第三条：路由是纯函数、
+// 均衡天生有状态，所以分成两环、也分成两处断言）。
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -26,12 +29,13 @@ using l7gate::filter::Decision;
 using l7gate::filter::FilterChain;
 using l7gate::filter::RequestInfo;
 using l7gate::filter::RouteFilter;
+using l7gate::route::kNoUpstreamGroup;
 using l7gate::route::kNoUpstreamTarget;
 using l7gate::route::Kind;
 using l7gate::route::RouteTable;
 
-// 一台"命中即返回其下标"的表，逐条加规则。返回值一律走 optional，所以"没命中"
-// 与"命中了下标 0"是可区分的——这条性质本身也要断（见 NoRulesMatchNothing）。
+// 一台"命中即返回其组下标"的表，逐条加规则。返回值一律走 optional，所以"没命中"
+// 与"命中了组 0"是可区分的——这条性质本身也要断（见 NoMatchIsNotIndexZeroAndIsRepeatable）。
 std::optional<std::uint16_t> hit(const RouteTable& table, std::string_view target) {
   return table.match(target);
 }
@@ -42,7 +46,7 @@ std::optional<std::uint16_t> hit(const RouteTable& table, std::string_view targe
 
 // 这条是 ADR-18 里"字典序命中会当场红"那句的可执行形式。
 // 样本集是照着那个失败形状挑的：三条规则按字典序排是 `/ap` < `/api` < `/api/v2`，
-// 所以"排序后取第一条命中"的实现会把 `/api/v2/users` 送到 `/ap` 的后端（2）。
+// 所以"排序后取第一条命中"的实现会把 `/api/v2/users` 送到 `/ap` 的那个组（2）。
 // 最长匹配给的是 1。**添加顺序也故意不是长度顺序**，否则"根本没排序、只是恰好
 // 长的在前面"也能过。
 TEST(S3_01_RoutePrefix, LongestMatchWinsNotLexicographicOrder) {
@@ -53,7 +57,7 @@ TEST(S3_01_RoutePrefix, LongestMatchWinsNotLexicographicOrder) {
   ASSERT_EQ(table.size(), 3u);
 
   EXPECT_EQ(hit(table, "/api/v2/users"), 1u)
-      << "不是最长优先：字典序 + 第一条命中的实现会把这条送到 /ap（下标 2）";
+      << "不是最长优先：字典序 + 第一条命中的实现会把这条送到 /ap 的组（下标 2）";
   EXPECT_EQ(hit(table, "/api/orders"), 0u);
   EXPECT_EQ(hit(table, "/apple"), 2u);
 }
@@ -71,7 +75,7 @@ TEST(S3_01_RoutePrefix, LongerRuleAddedLaterStillWins) {
 
 // 空前缀 = catch-all。这一格是**实现最容易写错的一条**：只比"谁更长"的话，
 // 长度 0 永远赢不了自己初值 0，于是表里明明有一条兜底规则、请求却得到"无匹配"→404。
-// reactor.cc 里那个 `!found ||` 就是为了这一条存在的。
+// router.cc 里那个 `!found ||` 就是为了这一条存在的。
 TEST(S3_01_RoutePrefix, EmptyPrefixIsCatchAll) {
   RouteTable table;
   ASSERT_TRUE(table.add_prefix("", 7));
@@ -161,21 +165,23 @@ TEST(S3_01_RouteAssembly, InvalidRegexLeavesNoRule) {
 
   ASSERT_TRUE(table.add_regex("/ok", 3));
   EXPECT_EQ(table.size(), 1u);
-  EXPECT_EQ(table.rule_at(0).upstream_target, 3u);
+  EXPECT_EQ(table.rule_at(0).upstream_group, 3u);
   EXPECT_EQ(table.rule_at(0).kind, Kind::kRegex);
 }
 
-// 哨兵不是合法下标。main.cc 的 `--route /a=65535` 因此在这一步就被挡掉，
-// 而不是变成一个"看起来配了、实际指向哨兵"的规则。
-TEST(S3_01_RouteAssembly, SentinelTargetIsRejected) {
+// 组的哨兵不是合法下标。`routes[].upstream` 指向的组名在装配期解析成下标
+// （`config/gateway_config`），而"这个名字根本不存在"要在这里就被挡掉，
+// 而不是变成一条"看起来配了、实际指向哨兵"的规则——那会让请求安静地走成 404，
+// 而 404 说的是"客户端要的东西没有路由"，不是"我把组名写错了"。
+TEST(S3_01_RouteAssembly, SentinelGroupIsRejected) {
   RouteTable table;
-  EXPECT_FALSE(table.add_prefix("/a", kNoUpstreamTarget));
-  EXPECT_FALSE(table.add_regex("/a", kNoUpstreamTarget));
+  EXPECT_FALSE(table.add_prefix("/a", kNoUpstreamGroup));
+  EXPECT_FALSE(table.add_regex("/a", kNoUpstreamGroup));
   EXPECT_EQ(table.size(), 0u);
 }
 
-// rule_at 是 main.cc 那条启动前校验（规则下标 vs 端点数）唯一的读法。
-// 它必须把 kind/pattern/target 三项都如实还原——校验的是 target，而报错时要能说清
+// rule_at 是装配期那条启动前校验（规则指向的组 vs 组表）唯一的读法。
+// 它必须把 kind/pattern/group 三项都如实还原——校验的是组，而报错时要能说清
 // 是哪一条规则，所以 pattern 也得在。
 TEST(S3_01_RouteAssembly, RuleAtRoundTripsForTheValidator) {
   RouteTable table;
@@ -186,18 +192,18 @@ TEST(S3_01_RouteAssembly, RuleAtRoundTripsForTheValidator) {
   ASSERT_TRUE(first.valid);
   EXPECT_EQ(first.kind, Kind::kPrefix);
   EXPECT_EQ(first.pattern, "/api/v2");
-  EXPECT_EQ(first.upstream_target, 1u);
+  EXPECT_EQ(first.upstream_group, 1u);
 
   const auto second = table.rule_at(1);
   ASSERT_TRUE(second.valid);
   EXPECT_EQ(second.kind, Kind::kRegex);
   EXPECT_EQ(second.pattern, R"(/health[0-9]*)");
-  EXPECT_EQ(second.upstream_target, 4u);
+  EXPECT_EQ(second.upstream_group, 4u);
 
   EXPECT_FALSE(table.rule_at(2).valid) << "越界不越读";
 }
 
-// 纯函数那条前提在这里兑现两次：空表要能明确区分"没命中"和"命中了下标 0"，
+// 纯函数那条前提在这里兑现两次：空表要能明确区分"没命中"和"命中了组 0"，
 // 而同一个输入重复喂必须给同一个输出（S1-03 给解析器立的是同一条规矩）。
 TEST(S3_01_RoutePurity, NoMatchIsNotIndexZeroAndIsRepeatable) {
   RouteTable empty;
@@ -233,10 +239,11 @@ RequestInfo info_for(std::string_view target) {
 
 }  // namespace
 
-// 命中 → 写下标、放行；**不写 reject_status**。反过来说：一个放行的 filter 若顺手
-// 写了状态码，主路径也不会理它（主路径只在 kStop 那一支读它）——但这条断言存在的
-// 意义是"路由命中时的写入面只有一个字段"，别多写。
-TEST(S3_01_RouteFilter, HitWritesTargetAndContinues) {
+// 命中 → 只写组下标、放行；**不写目标、也不写 reject_status**。S3-02 把这一环的写出面收到
+// 一个字段上（ADR-19 第三条：路由说"哪一组"，均衡说"组里哪一个"）。这条断言存在的意义就是
+// "路由这一环写完组之后不顺手替均衡做决定"：它一旦同时写了目标，下一环要么根本不会被读到
+// 它写的组，要么与它各写一次同一个字段——同一件事两个答案，而其中一个是没人核对的那个。
+TEST(S3_01_RouteFilter, HitWritesGroupOnlyAndContinues) {
   RouteTable table;
   ASSERT_TRUE(table.add_prefix("/api", 2));
   RouteFilter filter(table);
@@ -245,20 +252,21 @@ TEST(S3_01_RouteFilter, HitWritesTargetAndContinues) {
 
   RequestInfo info = info_for("/api/v1/orders");
   ASSERT_EQ(chain.run(info), Decision::kContinue);
-  EXPECT_EQ(info.upstream_target, 2u);
+  EXPECT_EQ(info.upstream_group, 2u);
+  EXPECT_EQ(info.upstream_target, kNoUpstreamTarget) << "选后端不是这一环的事";
   EXPECT_EQ(info.reject_status, 0u);
 
   // 直接用 filter 也必须是同一个答案（链在这里只是转发决定，不该改变语义）。
   RequestInfo single = info_for("/api");
   ASSERT_EQ(filter.on_request(single), Decision::kContinue);
-  EXPECT_EQ(single.upstream_target, 2u);
+  EXPECT_EQ(single.upstream_group, 2u);
 }
 
-// 无匹配 → 404 + kStop，**且不写 upstream_target**。
+// 无匹配 → 404 + kStop，**组和目标都不写**。
 // 后半句不是多余的：主路径在 kStop 那一支读的是 reject_status，但如果 filter 同时也写了
-// 一个下标，那"这条请求被拦下了"和"这条请求有个去处"就会同时成立——S3-02 的负载均衡
-// 一旦把两者分开读，这就是一个把请求发给后端的静默泄漏。
-TEST(S3_01_RouteFilter, NoMatchRejectsFourOhFourWithoutTarget) {
+// 下标，那"这条请求被拦下了"和"这条请求有个去处"就会同时成立——链下一环的负载均衡一旦
+// 读到那个组，这就是一次把已拦下的请求发给后端的静默泄漏。
+TEST(S3_01_RouteFilter, NoMatchRejectsFourOhFourWithoutGroupOrTarget) {
   RouteTable table;
   ASSERT_TRUE(table.add_prefix("/api", 2));
   ASSERT_TRUE(table.add_regex("/health", 3));
@@ -267,8 +275,8 @@ TEST(S3_01_RouteFilter, NoMatchRejectsFourOhFourWithoutTarget) {
   RequestInfo info = info_for("/somewhere/else");
   ASSERT_EQ(filter.on_request(info), Decision::kStop);
   EXPECT_EQ(info.reject_status, 404u);
-  EXPECT_EQ(info.upstream_target, kNoUpstreamTarget)
-      << "拦下的那条请求不许留下目标下标";
+  EXPECT_EQ(info.upstream_group, kNoUpstreamGroup) << "拦下的那条请求不许留下组下标";
+  EXPECT_EQ(info.upstream_target, kNoUpstreamTarget) << "拦下的那条请求不许留下目标下标";
 }
 
 // 404 这个数不是"filter 想回什么就回什么"：它必须是 `gateway_error_reply()` 表里有货的
@@ -284,6 +292,9 @@ TEST(S3_01_RouteFilter, RejectStatusMustBeASelfProducedReplyWeActuallyHave) {
       << "写了表里没有的状态码 = 客户端什么也收不到，而网关计数说它发了";
 }
 
-// 隧道路径不经过链（ADR-09 / 1.16）。这一格在 reactor_test.cc 的
-// `S3_01_Routing.TunneledConnectionNeverAsksTheRouteFilter` 里断，因为它需要真握手；
-// 这里不放假版本：一个不调用 socket 的用例断不出"链一次都没被调用"。
+// 隧道路径不经过链（ADR-09 / 1.16）。**这一格今天没有专门的用例**：reactor_test.cc 里
+// 与它最近的是 `S1_05_Reactor.UpgradeRequestSwitchesToRawTunnelAfterThe101`，它断的是
+// "101 之后连接进隧道态、后续字节不再被解析成请求"——链拿不到请求，所以链也就不会被问，
+// 但那是**推出来的**，不是我断过的"链一次都没被调用"。我不在这里放假版本：一个不调用
+// socket 的用例断不出那件事；真要正面钉它，得给链加一个"被问过几次"的观测面，而 ADR-18
+// 已经明写不给路由单独新增产品侧计数。边界本身记在 1.16 与 1.23 的边界段。

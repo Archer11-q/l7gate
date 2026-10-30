@@ -13,6 +13,7 @@
 #include "net/epoll.h"
 #include "net/fd.h"
 #include "net/stats.h"
+#include "route/balance.h"
 
 namespace l7gate::net {
 
@@ -58,6 +59,12 @@ class Reactor {
     // 时行为逐字节等于 S2"的落点，容量公式 `min(N,E)×28,232` 与八份 canonic 档因此不作废。
     std::vector<Target> upstream_targets;
     std::uint16_t default_target = 0;
+
+    // S3-02（ADR-19）：**本 worker 的均衡状态**（轮询游标 + 每后端配对数）。
+    // nullptr = 这个 reactor 不跑负载均衡（今天所有既有用例与压测都是这一格）。
+    // `shared_ptr` 不表示跨线程共享：持有者是 reactor 的记账路径与 `LoadBalanceFilter`，
+    // 两者都在同一个 worker 的循环线程里跑（ADR-14 的红线；理由见 ADR-19「为什么」第一条）。
+    std::shared_ptr<l7gate::route::LbState> lb_state;
 
     int listen_backlog = 1024;
     // fd 预算。超过就直接把新连接关掉而不是排队：一个网关在 fd 耗尽时的正确
@@ -353,6 +360,16 @@ class Reactor {
   // 和这里（索引前），而不是散在借、还、淘汰各写一遍。
   std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) noexcept;
   const std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) const noexcept;
+
+  // --- 负载均衡的配对账（S3-02，ADR-19 第四条）--------------------------------------
+  // 尺子是"当前被配给下游的上游连接条数"，不是"这个后端有多少条连接"——池里空闲的那条
+  // 不算负载（它闲着的，这正是 least_conn 想看见的事）。
+  // **只有两个 dissolution 入口会调 unpair**（`close_connection` 的两条互斥分支、
+  // `ensure_upstream` 的目标切换），加一个 pair 入口（`ensure_upstream` 借出/新建）。
+  // 记账点少是刻意的：这类计数一旦有三个写入点，就有一个"少减一次"的分支在等着。
+  // `config_.lb_state` 为空时这两个函数直接返回——所有既有单 Reactor 路径与压测都不为账付费。
+  void note_upstream_paired(std::uint16_t target) noexcept;
+  void note_upstream_unpaired(std::uint16_t target) noexcept;
 
   // --- 优雅停止：排水（S2-05，ARCHITECTURE 1.20）---------------------------
   // 两条都只在**循环线程**上跑，碰的全是循环内状态（注册表 / epoll / 出向缓冲），

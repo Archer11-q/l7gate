@@ -17,6 +17,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -32,9 +33,12 @@
 
 #include <gtest/gtest.h>
 
+#include "filter/lb_filter.h"    // S3-02：链上的第二环（组 → 目标）
 #include "filter/route_filter.h"  // S3-01：端到端那组用例装的就是它
+#include "lb_fixture.h"           // S3-02：测试侧的组装配（含建环）
 #include "net/reactor.h"
 #include "net/reactor_group.h"
+#include "route/balance.h"
 #include "route/router.h"
 #include "test_upstream.h"
 
@@ -3387,11 +3391,46 @@ std::string get_request(std::string_view path) {
   return "GET " + std::string(path) + " HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
 }
 
-// 一条"命中 /a 去端点 0、命中 /b 去端点 1"的最小表。每个用例自己持有它，
-// 而且必须**声明在 Harness 之前**——filter 拿的是引用，表比 reactor 先死就是悬垂。
-void add_ab_routes(l7gate::route::RouteTable* table) {
-  ASSERT_TRUE(table->add_prefix("/a", 0));
-  ASSERT_TRUE(table->add_prefix("/b", 1));
+// 均衡这一环的装配具：组表 + 每 worker 一份的状态（ADR-19「per-worker 均衡」在测试里的形状）。
+// 组表必须比 reactor 活得久——`LoadBalanceFilter` 拿的是引用，和 RouteFilter 同一条命期纪律，
+// 所以用例里它和路由表都声明在 Harness **之前**。
+//
+// `arm()` 与 `install()` 分成两步不是啰嗦：状态里的配对账按目标数开长度、轮询游标按组数开
+// 长度，而调用这两步之前组数还不知道。**装链必须在 start() 之前**（1.16 那条"运行期不许改链"），
+// `config.lb_state` 也必须在 start() 之前进 options——Reactor 存的是 config 的一份副本，
+// 构造之后再写等于没写，后果不是崩而是 `least_conn` 的账只加不减、永远选第一个成员，
+// 看起来完全在正常工作（这条我自己踩过，写在 S3-02 的交接段里）。
+struct LbRig {
+  l7gate::route::GroupTable groups;
+  std::shared_ptr<l7gate::route::LbState> state;
+
+  // 建一个**只有一个成员**的轮询组，返回它的组下标（装配顺序就是下标顺序）。
+  // 一成员组 + 轮询在数值上等于"命中哪条规则就去那个端点"，所以 S3-01 那 8 条期望的
+  // 数字一个都不用改——变的只是这个下标现在要经过均衡这一环才拿到。
+  std::uint16_t add_single_member_group(std::string_view name, std::uint16_t target) {
+    std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+    EXPECT_TRUE(groups.add_group(name, l7gate::route::Balance::kRoundRobin, &group));
+    EXPECT_TRUE(groups.add_member(group, target));
+    return group;
+  }
+
+  void arm(std::size_t target_count) {
+    state = std::make_shared<l7gate::route::LbState>(target_count, groups.size());
+  }
+
+  // 装到链上（第二环）+ 把同一份状态交给 reactor 记账。**调用点必须在 add_filter(RouteFilter)
+  // 之后、start() 之前**——顺序 = 添加顺序，而均衡读的那个组下标正是路由这一环写下的。
+  void install(Harness::Options* options, Harness* harness) {
+    options->config.lb_state = state;
+    harness->add_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(groups, state));
+  }
+};
+
+// 一条"命中 /a 去组 0（端点 0）、命中 /b 去组 1（端点 1）"的最小表 + 两个一成员组。
+// 每个用例自己持有它们，而且必须**声明在 Harness 之前**。
+void add_ab_routes(l7gate::route::RouteTable* table, LbRig* rig) {
+  ASSERT_TRUE(table->add_prefix("/a", rig->add_single_member_group("a", 0)));
+  ASSERT_TRUE(table->add_prefix("/b", rig->add_single_member_group("b", 1)));
 }
 
 // 一个故意写下越界下标的 filter：它不是"坏输入测试"的装饰，它是 reactor 里那条
@@ -3414,7 +3453,8 @@ class BadTargetFilter : public filter::RequestFilter {
 TEST(S3_01_Routing, RequestLandsOnTheRoutedTargetOnly) {
   std::string why;
   l7gate::route::RouteTable table;
-  add_ab_routes(&table);
+  LbRig rig;
+  add_ab_routes(&table, &rig);
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3427,6 +3467,8 @@ TEST(S3_01_Routing, RequestLandsOnTheRoutedTargetOnly) {
   // 所以顺序只能是先 add 再 start——反过来的话 filter 根本不在链上，请求会安静地落到
   // 默认目标 0，而这条用例的失败形态就是"body 64 而不是 128"。
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);  // 第二环：组 → 目标（没有它，路由写下的组没人翻成下标）
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3437,7 +3479,7 @@ TEST(S3_01_Routing, RequestLandsOnTheRoutedTargetOnly) {
   std::string body;
   ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
   EXPECT_EQ(status, "HTTP/1.1 200 OK");
-  EXPECT_EQ(body.size(), 128u) << "路由写的是端点 1，客户端却拿到别的后端的体";
+  EXPECT_EQ(body.size(), 128u) << "路由给的是组 1、组 1 里只有端点 1，客户端却拿到别的后端的体";
 
   EXPECT_EQ(stats.load(stats.upstream_opened), 1u)
       << "只增加那一个目标的连接：新建数必须是 1，且那条连接属于端点 1";
@@ -3459,7 +3501,8 @@ TEST(S3_01_Routing, RequestLandsOnTheRoutedTargetOnly) {
 TEST(S3_01_Routing, NoMatchRepliesFourOhFourAndNeverOpensAnUpstream) {
   std::string why;
   l7gate::route::RouteTable table;
-  ASSERT_TRUE(table.add_prefix("/a", 0));  // 只有 /a，/zz 谁都不挨着
+  LbRig rig;
+  ASSERT_TRUE(table.add_prefix("/a", rig.add_single_member_group("a", 0)));  // 只有 /a，/zz 谁都不挨着
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3468,6 +3511,8 @@ TEST(S3_01_Routing, NoMatchRepliesFourOhFourAndNeverOpensAnUpstream) {
   Harness::Options options = default_options();
   targets.fill(&options);
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3536,7 +3581,8 @@ TEST(S3_01_Routing, OutOfRangeTargetRejectsFiveOhTwoInsteadOfStalling) {
 TEST(S3_01_Routing, PoolBucketsKeepTargetsApart) {
   std::string why;
   l7gate::route::RouteTable table;
-  add_ab_routes(&table);
+  LbRig rig;
+  add_ab_routes(&table, &rig);
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3545,6 +3591,8 @@ TEST(S3_01_Routing, PoolBucketsKeepTargetsApart) {
   Harness::Options options = default_options();
   targets.fill(&options);
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3648,7 +3696,8 @@ TEST(S3_01_Routing, PoolBucketsKeepTargetsApart) {
 TEST(S3_01_Routing, PoolMaxIdleIsPerBucketNotPerWorker) {
   std::string why;
   l7gate::route::RouteTable table;
-  add_ab_routes(&table);
+  LbRig rig;
+  add_ab_routes(&table, &rig);
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3658,6 +3707,8 @@ TEST(S3_01_Routing, PoolMaxIdleIsPerBucketNotPerWorker) {
   targets.fill(&options);
   options.config.pool_max_idle = 1;  // 每 worker 每目标 1 条
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3688,7 +3739,8 @@ TEST(S3_01_Routing, PoolMaxIdleIsPerBucketNotPerWorker) {
 TEST(S3_01_Routing, TargetSwitchRecyclesIntoItsOwnBucket) {
   std::string why;
   l7gate::route::RouteTable table;
-  add_ab_routes(&table);
+  LbRig rig;
+  add_ab_routes(&table, &rig);
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3697,6 +3749,8 @@ TEST(S3_01_Routing, TargetSwitchRecyclesIntoItsOwnBucket) {
   Harness::Options options = default_options();
   targets.fill(&options);
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3742,7 +3796,8 @@ TEST(S3_01_Routing, TargetSwitchRecyclesIntoItsOwnBucket) {
 TEST(S3_01_Routing, PipelinedTargetSwitchIsHeldThenRedriven) {
   std::string why;
   l7gate::route::RouteTable table;
-  add_ab_routes(&table);
+  LbRig rig;
+  add_ab_routes(&table, &rig);
 
   TwoTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
@@ -3752,6 +3807,8 @@ TEST(S3_01_Routing, PipelinedTargetSwitchIsHeldThenRedriven) {
   Harness::Options options = default_options();
   targets.fill(&options);
   harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(2);
+  rig.install(&options, &harness);
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
@@ -3811,6 +3868,380 @@ TEST(S3_01_Routing, NoFilterUsesDefaultTargetExactlyLikeS2) {
 
   client.close();
   harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+}
+
+}  // namespace l7gate::net
+
+// ===========================================================================
+// S3-02：负载均衡三策略的端到端形状（ADR-19 验收句的那三条 + 交接段第 ⑦ 条坑的收据）
+// ===========================================================================
+//
+// 可见性沿用 S3-01 的立场：**每个后端各收多少条由被连的那一侧自报**（`TestUpstream::
+// connections_accepted()` / `requests_served()`），不给网关加"每目标请求数"这组分位——
+// 它的第一个真读者是 S3-03 的误摘率分母，那时才按 ADR 引入（ADR-19「我放弃什么」最后一条）。
+// 后端仍然靠**响应体长度**区分（64/128/192）：客户端拿到多长的体，就是被派到了哪个后端。
+//
+// 三条策略各断一件事，形状互不替换：
+//   一、轮询断**分布**（12 ÷ 3 = 各 4 条，而且是在同一条 keep-alive 上——这条同时是
+//        ADR-19 后果段那句"均衡让换目标从边角变成主路径"的第一次真实负载）；
+//   二、最少连接断**方向**，不断绝对值（绝对值被这台机器的时序牵着走）；
+//   三、一致哈希断**同一个 key 换一条连接也落在同一个后端**，这是它对客户端的承诺。
+namespace l7gate::net {
+namespace {
+
+// 三个后端 = 一个组三个成员的最小可用形状。两个成员断不出轮询周期，也断不出
+// "三个里挑最闲的那个"这种方向性判断。
+struct ThreeTargets {
+  TestUpstream first;
+  TestUpstream second;
+  TestUpstream third;
+
+  bool start(std::string* why) {
+    if (!start_sized_upstream(&first, 64, why)) return false;
+    if (!start_sized_upstream(&second, 128, why)) return false;
+    return start_sized_upstream(&third, 192, why);
+  }
+  void stop() {
+    first.stop_and_join();
+    second.stop_and_join();
+    third.stop_and_join();
+  }
+  void fill(Harness::Options* options) const {
+    options->with_upstream = false;
+    options->config.upstream_targets.clear();
+    options->config.upstream_targets.push_back(
+        Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(first.port())});
+    options->config.upstream_targets.push_back(
+        Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(second.port())});
+    options->config.upstream_targets.push_back(
+        Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(third.port())});
+    options->config.default_target = 0;
+  }
+  // 环上的点键**从这三台后端现场取**，不另写一份常量：环的位置和"reactor 真的会连的那个
+  // socket"必须是同一份地址，否则"这台后端在环上的位置"和"这台后端是谁"就是两份真相。
+  std::vector<std::string> endpoint_keys() const {
+    return {"127.0.0.1:" + std::to_string(first.port()), "127.0.0.1:" + std::to_string(second.port()),
+            "127.0.0.1:" + std::to_string(third.port())};
+  }
+  std::size_t size(std::uint16_t index) const {
+    switch (index) {
+      case 0: return 64;
+      case 1: return 128;
+      default: return 192;
+    }
+  }
+};
+
+// 一条"什么都命中"的路由 + 一个三成员的组：这一组用例的主语是**组里选哪一个**，
+// 不是哪条路由，所以路由层给一条 catch-all 就够（空前缀那条语义用例在 route_test.cc）。
+void install_group(l7gate::route::GroupTable* groups, const ThreeTargets& targets,
+                   l7gate::route::Balance balance, std::uint16_t* group, std::string* why,
+                   const l7gate::route::HashKey& hash_key = {}) {
+  const bool ok = l7gate::testing::add_balanced_group(groups, "all", balance, {0, 1, 2},
+                                                     targets.endpoint_keys(), group, why,
+                                                     l7gate::route::kDefaultVnodes, hash_key);
+  EXPECT_TRUE(ok) << *why;
+}
+
+std::uint16_t catch_all_to_route_table(l7gate::route::RouteTable* table, std::uint16_t group) {
+  EXPECT_TRUE(table->add_prefix("", group));
+  return group;
+}
+
+}  // namespace
+
+// 一、**轮询按后端计数**：12 条请求、3 个后端，各收 4 条（⌊12/3⌋…⌈12/3⌉），而且这 12 条
+// 全在**同一条 keep-alive 下游**上。选这个形状有两个理由：一是 ADR-19「我放弃什么」第一条
+// 明写的——per-worker 的游标在"多条短连接跨 worker"时是 16 个计数器的叠加，那条不是本用例
+// 能证的；二是同一条连接上连续换目标，正是 ADR-18 第五节那条重驱动从边角变成主路径的负载。
+// `upstream_opened` 应当停在 3：第二轮起每一台都是**从自己的桶里借**，不是重开。
+TEST(S3_02_LoadBalance, RoundRobinCyclesAcrossBackendsOnOneKeepAliveConnection) {
+  std::string why;
+  ThreeTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  l7gate::route::RouteTable table;
+  LbRig rig;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+  install_group(&rig.groups, targets, l7gate::route::Balance::kRoundRobin, &group, &why);
+  ASSERT_NE(group, l7gate::route::kNoUpstreamGroup) << "组装配失败：" << why;
+  catch_all_to_route_table(&table, group);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(3);
+  rig.install(&options, &harness);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  const std::vector<std::size_t> expected_cycle{64, 128, 192};
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/api/req" + std::to_string(i)))) << i << ": " << why;
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条";
+    EXPECT_EQ(body.size(), expected_cycle[static_cast<std::size_t>(i) % 3])
+        << "第 " << i << " 条没落在轮询该给的那个后端上";
+  }
+  EXPECT_EQ(targets.first.requests_served(), 4u);
+  EXPECT_EQ(targets.second.requests_served(), 4u);
+  EXPECT_EQ(targets.third.requests_served(), 4u);
+  EXPECT_EQ(targets.first.connections_accepted(), 1u) << "第二轮起应当从桶里借，不是重开一条";
+  EXPECT_EQ(targets.second.connections_accepted(), 1u);
+  EXPECT_EQ(targets.third.connections_accepted(), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 3u) << "12 条请求开了 3 条以上的上游：桶没被用上";
+  EXPECT_EQ(stats.load(stats.responses_completed), 12u);
+
+  // 12 条请求在同一条下游上换了 11 次目标，加上下游自己关闭时归还的那一条，池归还总数
+  // 应当是 12。**先等循环把 FIN 处理完再停环**（口径⑤：`pool_returns` 是非稳态量，
+  // 要 `wait_until` 等它进稳态，不能"看到条件成立就立刻读"，更不能停环之前抢读）。
+  client.shutdown_write();
+  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 12u; }, 3000))
+      << "11 次换目标 + 收尾归还一次，池归还总数应当是 12";
+
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u) << "停环后要排空所有三个桶";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 二、**最少连接断方向**：人为把两个后端压成"各挂一条在飞"，第三个后端仍然闲着，
+// 于是新请求必须落到第三个上。这里用 `set_stall_reads` 造"已转发、响应没回"那一格
+// （S2-05 同一个手法），所以 0 号和 1 号后端各被占住一条配对连接、且永远不会有响应。
+// **比较符翻转（`<` 改成 `>`）就是这条红**（ADR-19 阳性验证第三条）。
+TEST(S3_02_LoadBalance, LeastConnectionsSendsNewWorkToTheIdleBackend) {
+  std::string why;
+  ThreeTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+  targets.first.set_stall_reads(true);   // 0 号：收了请求不回
+  targets.second.set_stall_reads(true);  // 1 号：收了请求不回
+
+  l7gate::route::RouteTable table;
+  LbRig rig;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+  install_group(&rig.groups, targets, l7gate::route::Balance::kLeastConnections, &group, &why);
+  ASSERT_NE(group, l7gate::route::kNoUpstreamGroup) << "组装配失败：" << why;
+  catch_all_to_route_table(&table, group);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(3);
+  rig.install(&options, &harness);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 前两条下游各占一个后端；等到"确实连上了"再发下一条，否则三条会在全零的账上平手取第一个。
+  Client held_first;
+  ASSERT_TRUE(held_first.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(held_first.write_all(get_request("/hold/1")));
+  ASSERT_TRUE(wait_until([&] { return targets.first.connections_accepted() == 1u; }, 3000))
+      << "第一条没有配对到 0 号后端";
+
+  Client held_second;
+  ASSERT_TRUE(held_second.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(held_second.write_all(get_request("/hold/2")));
+  ASSERT_TRUE(wait_until([&] { return targets.second.connections_accepted() == 1u; }, 3000))
+      << "第二条没有配对到 1 号后端：最少连接在两个都空时应当取成员顺序的下一个";
+
+  // 此刻 0 号和 1 号各挂着一条在飞、2 号一条都没有。新请求必须去 2 号。
+  Client fresh;
+  ASSERT_TRUE(fresh.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(fresh.write_all(get_request("/now")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(fresh.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(body.size(), 192u) << "把活派给了正忙的后端：最少连接的比较方向是反的";
+  EXPECT_EQ(targets.third.requests_served(), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 3u) << "三个后端各一条，没有多开";
+
+  // 收尾：放开 stall，让两条压着的下游把响应收完，否则"停环之后 live==0"就靠硬关而不是排空。
+  targets.first.set_stall_reads(false);
+  targets.second.set_stall_reads(false);
+  std::string released_body;
+  ASSERT_TRUE(held_first.read_response(&status, &released_body, &why)) << "0 号放开后该补响应";
+  ASSERT_TRUE(held_second.read_response(&status, &released_body, &why)) << "1 号放开后该补响应";
+  fresh.close();
+  held_first.close();
+  held_second.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 三、**交接段第 ⑦ 条坑的收据**：那条坑的表现不是崩，是"账只加不减、永远选第一个成员"，
+// 看起来完全在正常工作。这里把它变成可断言的形状：三个后端各配一条**活着但空闲**的下游，
+// 然后只关掉中间那一条——它的上游归还进 1 号桶、账回落到 0。下一条请求必须去 1 号。
+// 如果 `note_unpaired` 没被调（或者调错了目标），三个读数一样 → 平手取第一个 → 拿到 64 B。
+// 这条用例还顺手证明"归还进桶的那条热上游真的被下一个人借走"：1 号后端的
+// `connections_accepted` 应当停在 1，而 `requests_served` 涨到 2。
+TEST(S3_02_LoadBalance, LeastConnectionsReleasesCapacityWhenTheDownstreamGoesAway) {
+  std::string why;
+  ThreeTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  l7gate::route::RouteTable table;
+  LbRig rig;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+  install_group(&rig.groups, targets, l7gate::route::Balance::kLeastConnections, &group, &why);
+  ASSERT_NE(group, l7gate::route::kNoUpstreamGroup) << "组装配失败：" << why;
+  catch_all_to_route_table(&table, group);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(3);
+  rig.install(&options, &harness);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  std::string status;
+  std::string body;
+  // 三条各自活着的下游，依次配到 0、1、2（每次都是"当前最闲"，所以三台各一条）。
+  Client keep_first;
+  Client keep_second;
+  Client keep_third;
+  ASSERT_TRUE(keep_first.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(keep_first.write_all(get_request("/a")));
+  ASSERT_TRUE(keep_first.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(body.size(), 64u) << "第一条在全零的账上应当取成员顺序的第一个";
+  ASSERT_TRUE(keep_second.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(keep_second.write_all(get_request("/b")));
+  ASSERT_TRUE(keep_second.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(body.size(), 128u) << "0 号已经挂了一条，第二条不该再派给它";
+  ASSERT_TRUE(keep_third.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(keep_third.write_all(get_request("/c")));
+  ASSERT_TRUE(keep_third.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(body.size(), 192u) << "两条都挂着，第三条该去唯一空闲的那个";
+
+  // 只关掉中间那条。它的上游按 ADR-15 归还进 1 号桶，账回落。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 0u; }, 200))
+      << "三条都还空闲在配对，此刻不该有归还";
+  keep_second.shutdown_write();
+  ASSERT_TRUE(keep_second.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 1u; }, 3000))
+      << "关掉的那条下游没有把它的上游归还进桶：账就再也回不来了";
+
+  Client next;
+  ASSERT_TRUE(next.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(next.write_all(get_request("/d")));
+  ASSERT_TRUE(next.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(body.size(), 128u)
+      << "释放掉的那条容量没被重新算进去：这就是'账只加不减、永远选第一个成员'那一格";
+  EXPECT_EQ(targets.second.connections_accepted(), 1u) << "1 号桶里有热上游，不该再开新的";
+  EXPECT_EQ(targets.second.requests_served(), 2u);
+  EXPECT_EQ(stats.load(stats.pool_borrows), 1u) << "借那一步没发生：说明它是重开的而不是复用的";
+
+  // 收尾必须**等循环侧真的处理完 FIN**再停环：三条下游各归还一条上游（连同前面 keep_second
+  // 那一条，池归还总计 4 次），`constructed == destructed` 才有意义。硬 `close()` 之后立刻
+  // `stop_loop()` 会让这条断言读到一个还没被循环看到的连接数——那是收尾顺序错，不是泄漏。
+  next.shutdown_write();
+  keep_first.shutdown_write();
+  keep_third.shutdown_write();
+  ASSERT_TRUE(next.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(keep_first.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(keep_third.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 4u; }, 3000))
+      << "四条下游没有各自把上游归还进桶";
+
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u) << "停环后排空所有桶";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  targets.stop();
+}
+
+// 四、**一致性哈希端到端**：同一个 key 换一条连接也落在同一个后端。环本身的性质
+// （同一 key 恒定、N→N+1 迁移率）在 balance_test.cc 的纯函数那半边断，这一条断的是
+// "这一环真的接在链上、key 真的从请求里取"——把 `select_from_ring` 接错参数（比如误用
+// 游标）只有这条会红。顺带钉住 ADR-19 警告过的那次倾斜：**一批 key 不许全落在同一个后端上**
+// （为什么是 24 个而不是 6 个，见下面那段注释——端点键带着临时端口，样本太小就变成掷硬币）。
+TEST(S3_02_LoadBalance, ConsistentHashPinsTheSameKeyAcrossConnections) {
+  std::string why;
+  ThreeTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+
+  l7gate::route::RouteTable table;
+  LbRig rig;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+  install_group(&rig.groups, targets, l7gate::route::Balance::kConsistentHash, &group, &why);
+  ASSERT_NE(group, l7gate::route::kNoUpstreamGroup) << "组装配失败：" << why;
+  catch_all_to_route_table(&table, group);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  rig.arm(3);
+  rig.install(&options, &harness);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  const std::vector<std::string> paths{"/orders/1", "/orders/2", "/orders/3", "/orders/4",
+                                       "/orders/5", "/orders/6", "/orders/7", "/orders/8",
+                                       "/users/1",  "/users/2",  "/users/3",  "/users/4",
+                                       "/users/5",  "/users/6",  "/users/7",  "/users/8",
+                                       "/api/1",    "/api/2",    "/api/3",    "/api/4",
+                                       "/api/5",    "/api/6",    "/health",   "/healthz"};
+  std::vector<std::size_t> first_round;
+  for (int round = 0; round < 2; ++round) {
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+      Client client;  // **每条都换一条新连接**：粘住的是 key，不是连接
+      ASSERT_TRUE(client.connect_to(harness.port(), &why)) << paths[i];
+      ASSERT_TRUE(client.write_all(get_request(paths[i]))) << paths[i];
+      std::string status;
+      std::string body;
+      ASSERT_TRUE(client.read_response(&status, &body, &why)) << paths[i];
+      if (round == 0) {
+        first_round.push_back(body.size());
+      } else {
+        EXPECT_EQ(body.size(), first_round[i])
+            << paths[i] << " 第二轮换了后端：粘住的不是 key（`select_from_ring` 接错了参数）";
+      }
+      client.close();
+    }
+  }
+  std::size_t distinct = 0;
+  for (const std::size_t size : {std::size_t{64}, std::size_t{128}, std::size_t{192}}) {
+    if (std::find(first_round.begin(), first_round.end(), size) != first_round.end()) ++distinct;
+  }
+  // **为什么是 24 个 key**：端点键里有内核分配的临时端口，所以环的位置每轮都不一样，
+  // 6 个 key 的"别全钉一台"会变成一枚硬币（全部落到同一台的概率按均匀弧算是 (1/3)^6 ≈ 0.1%，
+  // 而弧长并不均匀）。24 个 key 把这个概率压到可以当成断言用。**分布本身只打印不裁决**：
+  // 弧长天然不等，这里的倾斜不是缺陷的证据；统计意义上的判据是 balance_test.cc 那条
+  // 10,000 个 key 的迁移率（那边端点键是写死的，所以读数可复现）。
+  std::printf("[S3-02 hash] %zu 个 key 的落点：64B=%zu 128B=%zu 192B=%zu，用到 %zu 台后端\n",
+              first_round.size(),
+              static_cast<std::size_t>(std::count(first_round.begin(), first_round.end(), 64)),
+              static_cast<std::size_t>(std::count(first_round.begin(), first_round.end(), 128)),
+              static_cast<std::size_t>(std::count(first_round.begin(), first_round.end(), 192)),
+              distinct);
+  EXPECT_GE(distinct, 2u) << "24 个 key 全落在同一个后端上：这就是 ADR-19 说的那次哈希倾斜";
+  // 开过几条上游 = 用了几台后端。第二轮一条都不该新开（key 没变、桶里有热的）。
+  EXPECT_EQ(stats.load(stats.upstream_opened), distinct) << "同一个 key 的第二轮重开了上游连接";
+
+  // 48 次请求（两轮 × 24 个 key），每次都在一条独立的下游上，收尾各归还一条上游。
+  // 等这个非稳态量进稳态再停环（口径⑤）。**不能等 `live_connections == 0`**：池里那几条
+  // 热上游本身就计入 live，它们在停环排空池之前归不到 0——那是 1.18 的语义不是漏收尾。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == paths.size() * 2; }, 3000))
+      << "48 次请求没有各自把上游归还进桶";
+
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u) << "停环后仍有桶没排空";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
   harness.shutdown_all();
   targets.stop();
 }

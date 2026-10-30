@@ -17,20 +17,20 @@ constexpr std::regex_constants::syntax_option_type kSyntax =
 
 }  // namespace
 
-bool RouteTable::add_prefix(std::string_view prefix, std::uint16_t upstream_target) noexcept {
-  if (upstream_target == kNoUpstreamTarget) return false;  // 哨兵不是可用的后端下标
+bool RouteTable::add_prefix(std::string_view prefix, std::uint16_t upstream_group) noexcept {
+  if (upstream_group == kNoUpstreamGroup) return false;  // 哨兵不是可用的组下标
   rules_.push_back(Rule{
       .kind = Kind::kPrefix,
       .pattern = std::string(prefix),
-      .upstream_target = upstream_target,
+      .upstream_group = upstream_group,
       .compiled_regex = nullptr,  // 前缀规则不编译模式；显式写出来，-Wmissing-field-initializers
                                   // 才有地方闭嘴，而它闭嘴的意义是"这条真的是没填而不是漏填"
   });
   return true;
 }
 
-bool RouteTable::add_regex(std::string_view pattern, std::uint16_t upstream_target) {
-  if (upstream_target == kNoUpstreamTarget) return false;
+bool RouteTable::add_regex(std::string_view pattern, std::uint16_t upstream_group) {
+  if (upstream_group == kNoUpstreamGroup) return false;
   std::shared_ptr<const std::regex> compiled;
   try {
     compiled = std::make_shared<std::regex>(std::string(pattern), kSyntax);
@@ -40,7 +40,7 @@ bool RouteTable::add_regex(std::string_view pattern, std::uint16_t upstream_targ
   rules_.push_back(Rule{
       .kind = Kind::kRegex,
       .pattern = std::string(pattern),
-      .upstream_target = upstream_target,
+      .upstream_group = upstream_group,
       .compiled_regex = std::move(compiled),
   });
   return true;
@@ -60,7 +60,7 @@ std::optional<std::uint16_t> RouteTable::match(std::string_view request_target) 
     // 而 search 的"模式出现在任何位置都算命中"会让 `/ap` 命中 `/api/x`。
     // RouteTest.RegexIsAnchoredNotSubstring 钉的就是这条差别。
     if (std::regex_match(request_target.begin(), request_target.end(), *re)) {
-      return rule.upstream_target;
+      return rule.upstream_group;
     }
   }
 
@@ -70,7 +70,7 @@ std::optional<std::uint16_t> RouteTable::match(std::string_view request_target) 
   // 用例 LongestPrefixWinsOverLexicographicOrder 用一对"字典序会答错"的样本钉住它。
   bool found = false;
   std::size_t best_len = 0;
-  std::uint16_t best_target = kNoUpstreamTarget;
+  std::uint16_t best_group = kNoUpstreamGroup;
   for (const Rule& rule : rules_) {
     if (rule.kind != Kind::kPrefix) continue;
     // view 指向 rule.pattern 的内部缓冲。表在 run() 之前装配完、运行期不再改（和
@@ -83,10 +83,10 @@ std::optional<std::uint16_t> RouteTable::match(std::string_view request_target) 
     if (!found || prefix.size() > best_len) {
       found = true;
       best_len = prefix.size();
-      best_target = rule.upstream_target;
+      best_group = rule.upstream_group;
     }
   }
-  if (found) return best_target;
+  if (found) return best_group;
   return std::nullopt;  // 没有任何规则命中：调用方按 ADR-18 第二节回 404
 }
 
@@ -96,7 +96,7 @@ RouteTable::KindView RouteTable::rule_at(std::size_t index) const noexcept {
   return KindView{
       .kind = rule.kind,
       .pattern = std::string_view(rule.pattern),
-      .upstream_target = rule.upstream_target,
+      .upstream_group = rule.upstream_group,
       .valid = true,
   };
 }

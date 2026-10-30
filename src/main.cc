@@ -18,7 +18,9 @@
 #include <string_view>
 #include <vector>
 
+#include "config/gateway_config.h"
 #include "core/build_info.h"
+#include "filter/lb_filter.h"
 #include "filter/route_filter.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
@@ -33,7 +35,7 @@ void usage(std::FILE* out) {
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>[,<ipv4:port>...]\n"
       "               [--serve-requests N] [--max-connections N]\n"
       "               [--high-water-mark BYTES] [--workers N] [--drain-timeout-ms MS]\n"
-      "               [--route <前缀>=<端点下标>]... [--route-regex <锚定正则>=<端点下标>]...\n"
+      "               [--config <path>]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -51,12 +53,14 @@ void usage(std::FILE* out) {
       "--drain-timeout-ms 是优雅停止的**兜底**窗口（0..600000，默认 5000）：到点就把还没\n"
       "收尾的连接强关，代价是那条连接的出向字节被丢弃、客户端看到截断。它是兜底不是承诺\n"
       "（一条卡死的客户端不该能无限拖住一次下线），且按 ARCHITECTURE 1.20 必须 ≥ S4 的请求超时。\n"
-      "--route / --route-regex（S3-01，ADR-18）把请求按前缀或锚定正则分到 --upstream 列表里的\n"
-      "第 N 个端点：前缀取**最长命中**优先，正则取**配置顺序第一条全串命中**且优先于前缀，\n"
-      "匹配的是原始请求行里的 origin-form（含 query、不解码、不做路径规范化）。没有任何规则\n"
-      "命中回 404 并关连接。一条规则都不给 = 不装路由 filter = 每个 worker 只用它的默认目标\n"
-      "（第 i mod E 个端点），那一条路径与 S2-06a 逐字节同形。\n"
-      "**这一对开关是临时的**：路由与节点表的配置文件格式归 S3-02，那时它被文件取代、不留兼容。\n"
+      "--config <path>（S3-02，ADR-19）读一份 JSON 子集配置：upstreams（组名、balance、成员后端）与\n"
+      "routes（prefix/regex → 组名）。**只有策略进文件**：监听地址、监听端口、--workers 这些进程形态\n"
+      "仍然只走命令行，两边之间没有「谁覆盖谁」这回事。给了 --config 就不必给 --upstream，两个都给会被\n"
+      "拒绝——两个来源同时存在时，「哪一份是真相」这件事本身就是一份会漂移的配置。\n"
+      "解析或校验不过一律退出码 2 并指出是哪一项，不退回默认值继续跑。\n"
+      "路由：前缀取最长命中、正则全串锚定且优先于前缀，匹配原始 origin-form（含 query、不解码、不规范化）；\n"
+      "无匹配回 404 并关连接。balance 只认 round_robin / least_conn / consistent_hash。\n"
+      "不给 --config 时一个 filter 都不装，链是空的，行为与 S2-06a 逐字节同形。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：摘掉监听（新连接从此拿 RST）→ 不再接受新请求 →\n"
       "在飞请求逐条响应完 + 刷完出向 → 空闲连接立即关 → 到点兜底强关 → 退出循环、join worker。\n"
       "带 upgrade 的隧道**只能硬关**：ADR-09 不解析帧就发不出 WS close 握手，刷完已缓冲的\n"
@@ -183,45 +187,6 @@ bool parse_number(const char* text, long long* out) {
   return true;
 }
 
-// S3-01（ADR-18）：`--route /api=0` / `--route-regex ^/health$=1` 的单条解析。
-// 分隔符取**最后一个** '='：前缀本身可以含 '='（`/search?q=` 是真的），正则更需要它；
-// 从右边切一次是这两种形态都成立的唯一切法。
-// 这里**不**校验下标是否落在端点表里——端点表要到收完参数才知道长度，而命令行是边收边校。
-// 收完之后那一次 `validate_route_targets` 才是那条检查，也是唯一一份（两处各判一遍
-// 就是"同一个限制有两个抄本"，原型见 `max_header_count` 那次）。
-bool parse_route_spec(std::string_view spec, bool regex_kind,
-                      l7gate::route::RouteTable* table) {
-  const std::size_t sep = spec.rfind('=');
-  if (sep == std::string_view::npos) return false;
-  const std::string index_text(spec.substr(sep + 1));
-  long long index = -1;
-  if (!parse_number(index_text.c_str(), &index)) return false;
-  if (index < 0 || index > static_cast<long long>(l7gate::route::kMaxUpstreamTarget)) {
-    return false;
-  }
-  const auto target = static_cast<std::uint16_t>(index);
-  // 正则那一支还会因**模式语法非法**返回 false（RouteTable::add_regex 在编译期挡）。
-  // 两种失败在命令行上都必须整体退出：一条没生效的规则和一条编译不过的规则，
-  // 从外面看都是"网关按一张我以为不是这样的表在跑"。
-  return regex_kind ? table->add_regex(spec.substr(0, sep), target)
-                    : table->add_prefix(spec.substr(0, sep), target);
-}
-
-// 规则指向一个不存在的端点 = 配置写错，必须**整体失败退出**。理由和 --upstream 那条
-// 一字不差：配置写错不该退化成一种安静形态，而它退化之后的观测形态恰好和"网关坏了"
-// 长得一样（请求被压住或得到 502，从外面看不出是我自己把一张坏表启动了）。
-bool validate_route_targets(const l7gate::route::RouteTable& table, std::size_t endpoint_count,
-                            std::uint16_t* bad_target) {
-  for (std::size_t i = 0; i < table.size(); ++i) {
-    const l7gate::route::RouteTable::KindView rule = table.rule_at(i);
-    if (rule.upstream_target >= endpoint_count) {
-      *bad_target = rule.upstream_target;
-      return false;
-    }
-  }
-  return true;
-}
-
 // 只在循环退出之后调用：ReactorStats 全原子，但这份快照要的是"这一次运行的最终账"，
 // 在循环还在跑的时候打印会得到一个中间态，那种数字最容易被当成结论抄进文档。
 // S2-01 起它接收**显式的聚合量**而不是 Reactor&：单 Reactor 传自己的、ReactorGroup
@@ -333,9 +298,11 @@ int serve(int argc, char** argv) {
   bool have_listen = false;
   bool have_upstream = false;
   std::vector<UpstreamEndpoint> upstream_endpoints;
-  // S3-01（ADR-18）：路由表。空表 = 不装路由 filter = 每一个 worker 只用它的默认目标，
-  // 那一条路径与 S2-06a 逐字节同形（八份 canonic 档不作废的凭据就在这一句上）。
-  l7gate::route::RouteTable route_table;
+  // S3-02（ADR-19）：策略配置。没给 `--config` 时它整个是空的——**一个 filter 都不装**，
+  // 链是空的，每个 worker 走自己的默认目标，那一条路径与 S2-06a 逐字节同形
+  // （八份 canonic 档 + B-007 + B-012 不作废的凭据就在这句上）。
+  l7gate::config::GatewayConfig gateway_config;
+  std::string config_path;
 
   for (int i = 2; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -354,17 +321,15 @@ int serve(int argc, char** argv) {
       }
       have_upstream = true;
       ++i;
-    } else if ((flag == "--route" || flag == "--route-regex") && value != nullptr) {
-      // S3-01 的最小装配面。它是**临时**的：路由与节点表的配置文件格式归 S3-02（ADR-19
-      // 之前先定格式），那时这一对开关会被文件里的 routes 段取代、不留兼容层。
-      // 它必须存在的最小理由很硬：S3-01 验收第四条要在**真实进程**上跑"空链 vs 路由链"的
-      // 每请求成本对照，而一个无法打开路由的 binary 只能测出空链那一臂。
-      const bool regex_kind = flag == "--route-regex";
-      if (!parse_route_spec(value, regex_kind, &route_table)) {
-        std::fprintf(stderr, "参数错误: %s 要的是 <%s>=<端点下标>，收到 %s\n",
-                     std::string(flag).c_str(), regex_kind ? "锚定正则" : "前缀", value);
+    } else if (flag == "--config" && value != nullptr) {
+      // S3-02（ADR-19）。它取代的是 S3-01 那对临时开关 `--route` / `--route-regex`，
+      // **不留兼容层**：同一件事有两种配法时，成本对照与故障注入会各测一种，
+      // 而这两种测的是不同的代码路径。传了就是无法识别的选项、退出码 2。
+      if (!config_path.empty()) {
+        std::fprintf(stderr, "参数错误: --config 只能给一次，第二个是 %s\n", value);
         return 2;
       }
+      config_path = value;
       ++i;
     } else if (flag == "--serve-requests" && value != nullptr) {
       long long n = 0;
@@ -435,26 +400,42 @@ int serve(int argc, char** argv) {
   // （超时策略归 S4），而现在这个 wait_timeout_ms 控制的是 epoll_wait 的醒来间隔，
   // 也就是"停循环最坏等多久"。把一个内部参数包装成"--idle-timeout-ms"给用户，
   // 等于用命令行给还没实现的能力发一张存在的证明。
-  if (!have_listen || !have_upstream) {
-    std::fprintf(stderr, "参数错误: --serve 需要同时给 --listen 和 --upstream\n");
+  if (!have_listen) {
+    std::fprintf(stderr, "参数错误: --serve 需要 --listen\n");
     return 2;
   }
-  // 单 Reactor 路径（workers < 2）只有一条循环。S2-06a 时它的说法是"只会用到第 0 个端点，
-  // 容量还是 28,232"；S3-01 之后说法要精确一点：**它的默认目标是第 0 个端点，装了路由 filter
-  // 就会按请求连到路由指的那个**。不给它做"一个 worker 自己轮换多端点"的机制照旧成立——
-  // 轮换就是没有理由的选择，而理由是路由表给的，不是循环自己编的。
-  config.upstream_targets = upstream_endpoints;
-  config.default_target = 0;
-  if (route_table.size() > 0) {
-    std::uint16_t bad_target = 0;
-    if (!validate_route_targets(route_table, upstream_endpoints.size(), &bad_target)) {
-      std::fprintf(stderr,
-                   "参数错误: 路由规则指向端点 %u，而 --upstream 只给了 %zu 个（下标 0..%zu）\n",
-                   bad_target, upstream_endpoints.size(), upstream_endpoints.size() - 1);
+  // 目标表的来源**必须只有一个**：要么命令行的 `--upstream`，要么 `--config` 里的 `upstreams`。
+  // 两个都给就拒绝——不选优先级。一旦允许共存，"哪一份是真相"这件事就成了一段合并规则，
+  // 而合并规则是迟早被人改错的地方（ADR-19 第一节那条切分的另一半）。
+  if (!config_path.empty() && have_upstream) {
+    std::fprintf(stderr, "参数错误: --config 与 --upstream 只能给一个（后端表有两个来源）\n");
+    return 2;
+  }
+  if (config_path.empty() && !have_upstream) {
+    std::fprintf(stderr, "参数错误: --serve 需要 --upstream 或 --config 之一\n");
+    return 2;
+  }
+  if (!config_path.empty()) {
+    std::string why;
+    if (!l7gate::config::load_gateway_config(config_path, &gateway_config, &why)) {
+      // 整体失败，不"退回默认配置继续跑"：一个安静少配了一条路由的网关，从外面看只是
+      // 负载分布不对，而它的真实原因是我自己把一份坏文件启动了。
+      std::fprintf(stderr, "配置错误: %s（来自 %s）\n", why.c_str(), config_path.c_str());
       return 2;
     }
+    for (const l7gate::config::Endpoint& endpoint : gateway_config.endpoints()) {
+      upstream_endpoints.push_back(UpstreamEndpoint{endpoint.address, endpoint.port});
+    }
   }
+  // 单 Reactor 路径（workers < 2）只有一条循环。它的默认目标是第 0 个端点；装了路由/均衡
+  // 就会按请求连到策略指的那个。不给它做"一个 worker 自己轮换多端点"的机制照旧成立——
+  // 轮换就是没有理由的选择，理由是策略给的，不是循环自己编的。
+  config.upstream_targets = upstream_endpoints;
+  config.default_target = 0;
   const std::string upstream_list = join_upstream_list(upstream_endpoints);
+  // 有没有装任何 filter，只看文件里有没有对应的那一段。
+  const bool has_routes = gateway_config.has_routes;
+  const bool has_groups = !gateway_config.groups().empty();
 
   // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
   if (workers >= 2) {
@@ -462,9 +443,10 @@ int serve(int argc, char** argv) {
     gconfig.listen_address = config.listen_address;
     gconfig.listen_port = config.listen_port;
     gconfig.upstream_endpoints = upstream_endpoints;
-    // 空表就是 nullptr：**不装 filter，链保持空**，于是这一臂就是 S2-06a 那一臂
-    // （成本对照的"空链"那一臂也是这么来的，不是靠我另编一个 binary）。
-    gconfig.route_table = route_table.empty() ? nullptr : &route_table;
+    // 没给 --config 时这两个都是 nullptr：**一个 filter 都不装，链保持空**，于是这一臂就是
+    // S2-06a 那一臂（B-012 成本对照的"空链"那一臂也是这么来的，不是靠我另编一个 binary）。
+    gconfig.route_table = has_routes ? &gateway_config.routes() : nullptr;
+    gconfig.groups = has_groups ? &gateway_config.groups() : nullptr;
     gconfig.listen_backlog = config.listen_backlog;
     gconfig.worker_count = workers;
     gconfig.max_connections_per_worker = config.max_connections;
@@ -495,11 +477,13 @@ int serve(int argc, char** argv) {
                 gconfig.max_connections_per_worker, upstream_list.c_str(), upstream_endpoints.size(),
                 stop_after_requests, gconfig.wait_timeout_ms,
                 gconfig.connection.inbound.high_water_mark, drain_timeout_ms);
-    if (!route_table.empty()) {
+    if (has_routes || has_groups) {
       // **单独一行，不动上面那条横幅**：`scripts/bench/s1-p99.sh` 是靠横幅里的键名
       // （多 Reactor 有 `workers=`、单 Reactor 有 `max_connections=`）当场判"这一臂到底是
-      // 哪条路径"的，改那些键等于让历史脚本对不上路。路由的信息量新起一行给。
-      std::printf("[serve] route_rules=%zu no_match_status=404\n", route_table.size());
+      // 哪条路径"的，改那些键等于让历史脚本对不上路。策略的信息量新起一行给。
+      std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu\n",
+                  config_path.c_str(), gateway_config.groups().size(),
+                  gateway_config.routes().size());
     }
     std::fflush(stdout);
 
@@ -518,12 +502,25 @@ int serve(int argc, char** argv) {
     return 0;
   }
 
+  // 单 Reactor 这一臂的均衡状态：必须**在 Reactor 构造之前**就进 config，因为 Reactor 存的
+  // 是 config 的一份副本——构造之后再写就等于没写，那份配对账会只加不减，
+  // 而 least_conn 的失败形态是"永远选第一个成员"，看起来完全像在正常工作。
+  std::shared_ptr<l7gate::route::LbState> lb_state;
+  if (has_groups) {
+    lb_state = std::make_shared<l7gate::route::LbState>(upstream_endpoints.size(),
+                                                        gateway_config.groups().size());
+    config.lb_state = lb_state;
+  }
   l7gate::net::Reactor reactor(config);
   // 链只能在 run() 之前改（S1-08 那条时序纪律：链在循环线程里被逐条读、没有锁）。
-  // 这一行必须在 start_listen/run 之前，而不是"反正现在还没跑"。
-  if (!route_table.empty()) {
+  // 顺序 = 路由在前、均衡在后——均衡读的那个组下标正是路由这一环写下的。
+  if (has_routes) {
     reactor.add_request_filter(
-        std::make_unique<l7gate::filter::RouteFilter>(route_table));
+        std::make_unique<l7gate::filter::RouteFilter>(gateway_config.routes()));
+  }
+  if (lb_state != nullptr) {
+    reactor.add_request_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(
+        gateway_config.groups(), std::move(lb_state)));
   }
   int error = 0;
   if (!reactor.start_listen(&error)) {
@@ -548,10 +545,11 @@ int serve(int argc, char** argv) {
               config.max_connections, shown_target.address.c_str(), shown_target.port,
               stop_after_requests, config.wait_timeout_ms,
               config.connection.inbound.high_water_mark, drain_timeout_ms);
-  if (!route_table.empty()) {
+  if (has_routes || has_groups) {
     // 同多 Reactor 那一臂：新起一行，不碰上面那条签名行。
-    std::printf("[serve] route_rules=%zu no_match_status=404 default_target=%u\n",
-                route_table.size(), config.default_target);
+    std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu default_target=%u\n",
+                config_path.c_str(), gateway_config.groups().size(),
+                gateway_config.routes().size(), config.default_target);
   }
   std::fflush(stdout);
 

@@ -23,12 +23,13 @@ filter::Decision RouteFilter::on_request(RequestInfo& info) {
   const std::optional<std::uint16_t> hit = table_.match(info.target);
   if (!hit.has_value()) {
     // kStop + reject_status：交给主路径上那条"有表态的停止"（S1-06 的 fail_pair_with_reply）。
-    // 注意**不写 upstream_target**——它保持 kNoUpstreamTarget，读它的代码在 kStop 分支里，
+    // 注意**不写 upstream_group 之外的任何字段**：upstream_group 保持哨兵、upstream_target 也
+    // 保持哨兵，读它们的代码在 kStop 分支里，
     // 不会拿这个未决定的值去索引目标表。
     info.reject_status = kNoRouteStatus;
     return Decision::kStop;
   }
-  info.upstream_target = *hit;
+  info.upstream_group = *hit;
   return Decision::kContinue;
 }
 

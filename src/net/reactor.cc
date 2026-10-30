@@ -654,6 +654,9 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
         // peer_fd 进池，下一条借它的下游就成了幽灵配对。
         paired->set_peer_fd(kInvalidFd);
         downstream->set_peer_fd(kInvalidFd);
+        // 这条上游不再配给任何下游 → 配对账减一次。减在 recycle 之前，因为 recycle
+        // 之后它就在桶里闲着，而『闲着』正是 least_conn 要看见的那个状态。
+        note_upstream_unpaired(upstream_target);
         recycle_upstream(paired);
       } else {
         return paired;  // 压住，不是失败
@@ -665,6 +668,7 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   // S2-02（ADR-15）：先从**这个目标自己的桶**里借一条热上游。借出**不新增连接**（它本来
   // 就在 connections_ 里），所以不受 fd 预算约束；桶空才落到下面新建那条受预算约束的路径。
   if (auto pooled = take_pooled_upstream(upstream_target)) {
+    note_upstream_paired(upstream_target);  // 借出即配对（S3-02 的账）
     pooled->set_peer_fd(downstream->fd());
     downstream->set_peer_fd(pooled->fd());
     // 借出时它已注册、只挂着 EPOLLIN（空闲监控态）。请求字节随后由 forward_request
@@ -689,6 +693,9 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   // 目标标签必须在这里就写：它决定这条上游将来归还进**哪一个**桶。写在 stats 之后、
   // 注册之前，是为了让任何一条"借出去又还回来"的路径都不可能碰到一条没标签的上游。
   upstream->set_upstream_target(upstream_target);
+  // 新建即配对。这一行与上面那行都必须存在：`ensure_upstream` 有两条拿到上游的路，
+  // 只在一处记账的话，另一个后端的配对数永远是个位数，least_conn 就会一直挑它。
+  note_upstream_paired(upstream_target);
   upstream->set_state(outcome.status == ConnectStatus::kConnected ? State::kOpen
                                                                   : State::kConnecting);
   int error = 0;
@@ -732,6 +739,14 @@ const std::vector<std::shared_ptr<Connection>>* Reactor::pool_bucket(
     std::uint16_t target) const noexcept {
   if (target >= upstream_pool_.size()) return nullptr;
   return &upstream_pool_[target];
+}
+
+void Reactor::note_upstream_paired(std::uint16_t target) noexcept {
+  if (config_.lb_state) config_.lb_state->note_paired(target);
+}
+
+void Reactor::note_upstream_unpaired(std::uint16_t target) noexcept {
+  if (config_.lb_state) config_.lb_state->note_unpaired(target);
 }
 
 std::size_t Reactor::pool_idle_count() const noexcept {
@@ -1738,6 +1753,10 @@ void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy
   conn->set_armed_events(0);
 
   std::shared_ptr<Connection> peer_to_close;
+  // 必须在下面那行 `conn->set_peer_fd(kInvalidFd)` 之前问一次：这条连接进来时有没有配对。
+  // 之后问就永远是『没有』，而配对账就会只加不减——那是 least_conn 最坏的一种错法
+  // （它会把负载越算越高，最后所有请求都堆在同一个后端上）。
+  const bool fd_was_paired = conn->peer_fd() != kInvalidFd;
   auto it = connections_.find(fd);
   if (it != connections_.end() && it->second.get() == conn.get()) {
     const int peer_fd = conn->peer_fd();
@@ -1758,6 +1777,15 @@ void Reactor::close_connection(const std::shared_ptr<Connection>& conn, CloseWhy
   conn->close_fd();  // 第 4 步：fd 编号从这一行起才可被复用
   retiring_.push_back(conn);
   stats_.connections_closed.fetch_add(1, std::memory_order_relaxed);
+
+  // S3-02（ADR-19 第四条）：配对的终结点只有这里与目标切换那两处。判据用角色——
+  // 被关的是上游且它进来时带着有效 peer_fd（=它当时是配对的），或者对端是上游，
+  // 两种情形恰好互斥，所以一次关闭最多减一次。
+  if (conn->role() == Role::kUpstream && fd_was_paired) {
+    note_upstream_unpaired(conn->upstream_target());
+  } else if (peer_to_close && peer_to_close->role() == Role::kUpstream) {
+    note_upstream_unpaired(peer_to_close->upstream_target());
+  }
 
   if (peer_to_close) {
     // S2-02（ADR-15）：只有「下游干净关闭」才把配对上游归还进池——上游因此活得比

@@ -54,6 +54,25 @@ GATEWAY_PORT="${GATEWAY_PORT:-18084}"      # 避开 18081（s1-p99）与 18083�
 # 打包成一项会被网关读成"无法识别的选项"，退化成"那一臂其实没配路由"那种安静错误。
 # A/B 的两臂必须只有这一个因子不同，所以它只作用在经网关那一臂，直连臂碰不到它。
 GATEWAY_EXTRA="${GATEWAY_EXTRA:-}"
+# S3-02 的成本 A/B（B-013）要的两个旋钮。**两个都取缺省值时，本脚本拼出来的 argv 与
+# S2/S3-01 时代逐字节相同**，所以 B-008/B-009/B-012 那批读数不作废——这条不是形式主义：
+# B-012 的判据是"跨臂差不超过本臂组内极差"，只要两臂的环境被动过，那个极差就不是同一把尺了。
+#   `UPSTREAM_COUNT=2`：多起一台压测上游（缺省 1）。
+#   `GATEWAY_CONFIG_TEMPLATE=<路径>`：经网关那一臂不再用 `--upstream`，改成读一份由本脚本现场
+#     渲染出来的 `--config`。为什么是模板而不是仓库里一份现成文件：压测上游的端口是内核选的，
+#     写死在配置里的那台根本没在监听，那一臂测的就不是"转发"而是"连不上"。
+#     注意 `--config` 与 `--upstream` 是互斥的（ADR-19 第一节），所以给了模板就必须**替换**掉
+#     `--upstream` 而不是追加——追加的那一臂会直接退出码 2，`wait_for_line 监听` 把它判成
+#     "网关起不来"，那种红至少还响；真正危险的是脚本将来改得允许两个都给，那就变成两份真相。
+UPSTREAM_COUNT="${UPSTREAM_COUNT:-1}"
+GATEWAY_CONFIG_TEMPLATE="${GATEWAY_CONFIG_TEMPLATE:-}"
+ARM_LABEL="${ARM_LABEL:-（未命名）}"
+[[ "$UPSTREAM_COUNT" == "1" || "$UPSTREAM_COUNT" == "2" ]] \
+  || fatal "UPSTREAM_COUNT 只支持 1 或 2：这条线要的是两臂只差一个因子，不是压上游容量"
+if [[ -n "$GATEWAY_CONFIG_TEMPLATE" ]]; then
+  [[ -r "$GATEWAY_CONFIG_TEMPLATE" ]] || fatal "配置模板读不到：$GATEWAY_CONFIG_TEMPLATE"
+  [[ "$UPSTREAM_COUNT" == "2" ]] || note "⚠ 给了模板但 UPSTREAM_COUNT=1：模板里的 __UP2_PORT__ 会被填成 up1 的值"
+fi
 SETTLE="${SETTLE:-5}"                      # 工具退场后给网关收连接的时间（S2-05 起这是排水，不是杀进程）
 STEADY_MIN_MS="${STEADY_MIN_MS:-60000}"    # SLO 写死「稳态采样 60 s」：达标看**实际跑出来的窗口**
 REPORT_EVERY_SECONDS="${REPORT_EVERY_SECONDS:-5}"
@@ -87,10 +106,11 @@ if (( HAVE_FD < NEED_FD )); then
   note "fd 软上限已抬到 $(ulimit -Sn)（需要 ${NEED_FD}，hard $(ulimit -Hn)）"
 fi
 
-UP_PID=0; G_PID=0; C_PID=0
+UP_PID=0; UP2_PID=0; G_PID=0; C_PID=0
 cleanup() {
   [[ "$C_PID" != 0 ]] && kill -TERM "$C_PID" 2>/dev/null
   [[ "$G_PID" != 0 ]] && kill -TERM "$G_PID" 2>/dev/null
+  [[ "$UP2_PID" != 0 ]] && kill -TERM "$UP2_PID" 2>/dev/null
   [[ "$UP_PID" != 0 ]] && kill -TERM "$UP_PID" 2>/dev/null
   return 0
 }
@@ -109,7 +129,19 @@ wait_for_line() { # pid logfile pattern seconds
 gval() { sed -n "s/^\[serve\] $1=\([0-9-]*\).*/\1/p" "$OUT/gateway.log" | head -1; }
 # 上游的账要按**键名**取：横幅与终局行都带 `accepted=`，用「最后一行匹配」会取到横幅。
 # 这里取最后一个匹配（终局行在横幅之后），与 s1-p99.sh 里那个 uval 同一形状。
-uval() { sed -n "s/^\[bench-upstream\].*$1=\([0-9]*\).*/\1/p" "$OUT/upstream.log" | tail -1; }
+uval() { sed -n "s/^\[bench-upstream\].*$1=\([0-9]*\).*/\1/p" "${2:-$OUT/upstream.log}" | tail -1; }
+# 两台上游时，等式与"上游有没有丢负载"都得按**两台之和**算：夹具只在退出时打终局，
+# 所以每台报的是自己那一份，漏加一台就变成"等式不闭合"那种假红（B-009 那次是按单臂比
+# 累计值被骗过一轮，同一个形状的错换个方向还会再犯）。
+uval_sum() { # key → 所有上游日志里该键的和
+  local key=$1 total=0 value log
+  for log in "$OUT/upstream.log" "$OUT/upstream2.log"; do
+    [[ -f "$log" ]] || continue
+    value=$(uval "$key" "$log")
+    total=$(( total + ${value:-0} ))
+  done
+  echo "$total"
+}
 
 start_upstream() {
   "$UPSTREAM" --body-bytes "$BODY_BYTES" --max-clients $((CONNECTIONS * 3 + 256)) \
@@ -119,6 +151,16 @@ start_upstream() {
   UP_PORT=$(sed -n 's/.*监听 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$OUT/upstream.log" | head -1)
   [[ -n "$UP_PORT" ]] || fatal "读不到上游监听端口"
   note "压测上游 pid=$UP_PID port=$UP_PORT body=${BODY_BYTES}B mode=normal（不是 --upgrade：这条线量的是每请求转发）"
+  if [[ "$UPSTREAM_COUNT" == "2" ]]; then
+    "$UPSTREAM" --body-bytes "$BODY_BYTES" --max-clients $((CONNECTIONS * 3 + 256)) \
+      --backlog $((CONNECTIONS * 3 + 256)) > "$OUT/upstream2.log" 2>&1 &
+    UP2_PID=$!
+    wait_for_line "$UP2_PID" "$OUT/upstream2.log" '\[bench-upstream\] 监听' 30 \
+      || fatal "第二台压测上游起不来（$OUT/upstream2.log）"
+    UP2_PORT=$(sed -n 's/.*监听 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$OUT/upstream2.log" | head -1)
+    [[ -n "$UP2_PORT" ]] || fatal "读不到第二台上游的监听端口"
+    note "第二台压测上游 pid=$UP2_PID port=$UP2_PORT（两臂的上游**进程数相同**，差的只有组里有几个成员）"
+  fi
 }
 
 # 跑一个 arm：$1=标签（direct|proxy） $2=targets 列表 $3=这一臂的请求数。
@@ -181,8 +223,18 @@ D_P50=$R_P50; D_P99=$R_P99; D_P999=$R_P999; D_P9999=$R_P9999; D_HW=$R_HALF_OK
 D_SAMPLES=$R_SAMPLES; D_MEAN=$R_MEAN; D_OBS=$R_OBS_CORES
 
 echo "-- 组 B：经网关转发（同一个上游、同一台机器、同样的连接数与请求数）"
-GW_ARGV=("$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" \
-           --upstream "127.0.0.1:$UP_PORT" --workers "$WORKERS")
+GW_ARGV=("$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" --workers "$WORKERS")
+if [[ -n "$GATEWAY_CONFIG_TEMPLATE" ]]; then
+  # 端口现场填进模板：这一步保证"配置里那台后端"就是"脚本刚起来的那台"。
+  GW_CONFIG="$OUT/gateway-config.json"
+  sed -e "s/__UP1_PORT__/$UP_PORT/g" -e "s/__UP2_PORT__/${UP2_PORT:-$UP_PORT}/g" \
+      "$GATEWAY_CONFIG_TEMPLATE" > "$GW_CONFIG" || fatal "渲染配置模板失败：$GATEWAY_CONFIG_TEMPLATE"
+  grep -q '__UP[12]_PORT__' "$GW_CONFIG" && fatal "渲染后模板里还剩占位符：这份配置的端口是假的"
+  GW_ARGV+=(--config "$GW_CONFIG")
+  note "经网关那一臂：--config $GW_CONFIG（模板 $GATEWAY_CONFIG_TEMPLATE，up1=$UP_PORT up2=${UP2_PORT:-同 up1}）"
+else
+  GW_ARGV+=(--upstream "127.0.0.1:$UP_PORT")
+fi
 if [[ -n "$GATEWAY_EXTRA" ]]; then
   read -r -a GW_EXTRA_ARGS <<< "$GATEWAY_EXTRA"
   GW_ARGV+=("${GW_EXTRA_ARGS[@]}")
@@ -190,6 +242,13 @@ fi
 "${GW_ARGV[@]}" > "$OUT/gateway.log" 2>&1 &
 G_PID=$!
 wait_for_line "$G_PID" "$OUT/gateway.log" '\[serve\] 监听' 30 || fatal "网关起不来（$OUT/gateway.log）"
+# 路径签名第二道：给了配置就必须看见 `policy=on`。**没有这道门，一臂"装了配置但配置没生效"
+# 和"根本没装配置"在延迟上长得一模一样**——而 B-013 比的恰恰就是这两臂的差。
+if [[ -n "$GATEWAY_CONFIG_TEMPLATE" ]]; then
+  grep -q '^\[serve\] policy=on' "$OUT/gateway.log" \
+    || fatal "给了 --config 但横幅里没有 policy=on：这一臂其实一环都没装，两臂差的是空气"
+  note "网关策略横幅：$(grep -m1 '\[serve\] policy=on' "$OUT/gateway.log")"
+fi
 # 路径签名当场核对：A/B 的两臂如果其实都是单 Reactor，报告里那两个 workers= 就是假话。
 if (( WORKERS >= 2 )); then
   grep -q "^\[serve\] 监听 .*（workers=$WORKERS " "$OUT/gateway.log" \
@@ -213,12 +272,16 @@ for _ in $(seq 1 200); do kill -0 "$G_PID" 2>/dev/null || break; sleep 0.1; done
 wait "$G_PID" 2>/dev/null; GW_RC=$?
 G_PID=0
 kill -TERM "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null; UP_PID=0
+if [[ "$UP2_PID" != 0 ]]; then
+  kill -TERM "$UP2_PID" 2>/dev/null; wait "$UP2_PID" 2>/dev/null; UP2_PID=0
+fi
 
 LIVE=$(gval live_connections); FD0=$(gval fd_start); FD1=$(gval fd_end)
 CONSTRUCTED=$(gval connections_constructed); DESTRUCTED=$(gval connections_destructed)
 GW_PARSED=$(gval requests_parsed); GW_COMPLETED=$(gval responses_completed)
-UP_REFUSED=$(uval refused_over_capacity); UP_ADDFAIL=$(uval refused_addfail)
-UP_SERVED=$(uval requests)
+GW_OPENED=$(gval upstream_opened); GW_BORROWS=$(gval pool_borrows)
+UP_REFUSED=$(uval_sum refused_over_capacity); UP_ADDFAIL=$(uval_sum refused_addfail)
+UP_SERVED=$(uval_sum requests)
 GW_WORKERS=$(gval workers); [[ -n "$GW_WORKERS" ]] || GW_WORKERS=1
 (( GW_RC == 0 )) || die "网关退出码 $GW_RC：优雅停止没生效，这一轮的账不完整"
 [[ "${LIVE:-x}" == "0" ]] || die "live_connections=${LIVE:-?}：排水没收干净"
@@ -247,6 +310,10 @@ REPORT="$OUT/s1-p999.summary.txt"
 {
   echo "# SLO #1 · p999 增量（s1-p999.sh）canonic=$CANONIC —— $(date -Is)"
   echo "参数: body=${BODY_BYTES}B conns=${CONNECTIONS} requests_direct=${REQUESTS_DIRECT} requests_proxy=${REQUESTS_PROXY} ramp_ms=${RAMP_MS} workers=${WORKERS}(自报 ${GW_WORKERS}) steady_min_ms=${STEADY_MIN_MS} gateway_extra=${GATEWAY_EXTRA:-（空）}"
+  # B-013 这一族要能看出"两臂只差一个因子"：臂名、上游进程数、以及经网关那一臂到底是 --upstream
+  # 还是 --config（连渲染出来的文件一起写进来，红了可以当场把那份文件cat一遍）。
+  echo "臂: label=${ARM_LABEL} upstream_count=${UPSTREAM_COUNT} 后端来源=$([[ -n "$GATEWAY_CONFIG_TEMPLATE" ]] && echo "config(${GATEWAY_CONFIG_TEMPLATE})" || echo "upstream(单端点)") 渲染=$OUT/gateway-config.json"
+  echo "网关那一侧: upstream_opened=${GW_OPENED:-?} pool_borrows=${GW_BORROWS:-?} parsed=${GW_PARSED} completed=${GW_COMPLETED}"
   echo "工具: l7gate_c100k 闭环形态（HDR 分位带误差棒）；malloc=$("$BIN/l7gate" --self-check | sed -n 's/.*malloc=\([^ ]*\).*/\1/p')；绑核：未做（同 s1-p99.sh）"
   echo "构建: 只在 release 上跑；sanitizer 下的延迟是检查开销的延迟，不是网关的延迟"
   echo

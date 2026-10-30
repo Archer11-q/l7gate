@@ -8,6 +8,7 @@
 #include <system_error>
 #include <utility>
 
+#include "filter/lb_filter.h"  // config_.groups 非空时给每个 worker 挂的均衡那一环
 #include "filter/route_filter.h"  // config_.route_table 非空时给每个 worker 挂的那一环
 #include "net/socket.h"
 
@@ -102,12 +103,25 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     wc.connection = config_.connection;
     wc.wait_timeout_ms = config_.wait_timeout_ms;
     wc.stop_after_requests = 0;
+    // 均衡状态必须**在 Reactor 构造之前**就进 wc：Reactor 存的是 config 的一份副本，
+    // 构造之后再往 wc 上写就等于没写——那份账会只加不减（本任务实测把这一格写错过一次，
+    // 表现是 least_conn 永远选第一个成员，而它看起来完全"在正常工作"）。
+    std::shared_ptr<l7gate::route::LbState> lb_state;
+    if (config_.groups != nullptr && !config_.groups->empty()) {
+      lb_state = std::make_shared<l7gate::route::LbState>(
+          config_.upstream_endpoints.size(), config_.groups->size());
+      wc.lb_state = lb_state;
+    }
     auto worker = std::make_unique<Reactor>(wc, *stats_);
-    // 路由 filter 只能在 run() 之前挂（链在循环线程里被逐条读、无锁，S1-08 那条时序纪律）。
-    // start_listen 恰好就在 run() 之前，而 worker 的 run() 由本组的 run() spawn——
-    // 所以这里是唯一合法的装配点，不是"顺手在哪都能加"。
-    if (config_.route_table != nullptr) {
+    // 两个 filter 都只能在 run() 之前挂（链在循环线程里被逐条读、无锁，S1-08 那条时序纪律）。
+    // **顺序 = 路由在前、均衡在后**：均衡读的那个组下标就是路由这一环写下的，
+    // 反过来的话链短路时没人决定过组，均衡只能退回默认目标。
+    if (config_.route_table != nullptr && !config_.route_table->empty()) {
       worker->add_request_filter(std::make_unique<filter::RouteFilter>(*config_.route_table));
+    }
+    if (lb_state != nullptr) {
+      worker->add_request_filter(
+          std::make_unique<filter::LoadBalanceFilter>(*config_.groups, std::move(lb_state)));
     }
     if (!worker->start_worker(error)) {
       // 已经建好的 worker 由本对象析构清理（它们的 start_worker 若成功则 wake_fd

@@ -3,8 +3,10 @@ include(FindThreads)
 find_package(Threads REQUIRED)
 
 add_executable(l7gate_tests
+  balance_test.cc
   build_info_test.cc
   buffer_test.cc
+  config_test.cc
   connection_test.cc
   filter_chain_test.cc
   framing_test.cc
@@ -23,6 +25,12 @@ target_link_libraries(l7gate_tests PRIVATE
   # 那是最糟的一类"构建通过、测试诡异"。
   Threads::Threads
 )
+
+# `S3_02_ConfigFile.TheShippedExampleConfigAssembles` 要把仓库里那份示例配置读进来装配一遍。
+# ctest 的工作目录是**构建目录**而不是源码目录，所以路径由 CMake 在这里给成绝对值。
+# 不用 `__FILE__` 拼：编译器传的是相对还是绝对路径取决于调用方式，一条靠它的路径用例
+# 迟早会在某个 preset 或某种调用姿势下变成"文件找不到"，而那时它报的是网关读不到配置。
+target_compile_definitions(l7gate_tests PRIVATE L7GATE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # 标签按**阶段**打，不按任务打。原因：gtest_discover_tests 的 PROPERTIES 作用于
 # 整个可执行目标，我没法给同一目标里的 build_info_test 和 buffer_test 分别打

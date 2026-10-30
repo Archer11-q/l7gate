@@ -133,8 +133,11 @@ message(STATUS "l7gate: GoogleTest ${L7GATE_GTEST_VERSION} (contract-locked v1.1
 find_package(Threads REQUIRED)
 
 add_library(l7gate_core STATIC
+  src/config/gateway_config.cc
+  src/config/json.cc
   src/core/build_info.cc
   src/filter/chain.cc
+  src/filter/lb_filter.cc
   src/filter/route_filter.cc
   src/net/buffer.cc
   src/net/connection.cc
@@ -146,6 +149,7 @@ add_library(l7gate_core STATIC
   src/http/request_parser.cc
   src/http/response_framing.cc
   src/http/response_head.cc
+  src/route/balance.cc
   src/route/router.cc
 )
 target_include_directories(l7gate_core PUBLIC src)

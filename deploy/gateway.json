@@ -1,0 +1,27 @@
+{
+  "upstreams": [
+    {
+      "name": "api",
+      "balance": "round_robin",
+      "targets": [
+        { "address": "127.0.0.1", "port": 18081 },
+        { "address": "127.0.0.1", "port": 18082 }
+      ]
+    },
+    {
+      "name": "shard",
+      "balance": "consistent_hash",
+      "hash_key": "target",
+      "vnodes": 160,
+      "targets": [
+        { "address": "127.0.0.1", "port": 18082 },
+        { "address": "127.0.0.1", "port": 18083 }
+      ]
+    }
+  ],
+  "routes": [
+    { "match": "regex", "pattern": "/v[0-9]+/orders", "upstream": "shard" },
+    { "match": "prefix", "pattern": "/api", "upstream": "api" },
+    { "match": "prefix", "pattern": "", "upstream": "api" }
+  ]
+}
