@@ -66,6 +66,11 @@ GATEWAY_EXTRA="${GATEWAY_EXTRA:-}"
 #     "网关起不来"，那种红至少还响；真正危险的是脚本将来改得允许两个都给，那就变成两份真相。
 UPSTREAM_COUNT="${UPSTREAM_COUNT:-1}"
 GATEWAY_CONFIG_TEMPLATE="${GATEWAY_CONFIG_TEMPLATE:-}"
+# S3-06 的成本对照（B-016）要的旋钮：配置模板带 `health` 段时探活会往上游打进请求，
+# 「direct + proxy == upstream served」的严格等式必须放宽成**有界账**——差值落在
+# [probe_ok, probe_ok+probe_fail] 之内（失败的探活里 connect 没成的那些不会到上游）。
+# 缺省 0：B-008/B-009/B-012/B-013 的等式语义一个字不动。
+HEALTH_PROBES="${HEALTH_PROBES:-0}"
 ARM_LABEL="${ARM_LABEL:-（未命名）}"
 [[ "$UPSTREAM_COUNT" == "1" || "$UPSTREAM_COUNT" == "2" ]] \
   || fatal "UPSTREAM_COUNT 只支持 1 或 2：这条线要的是两臂只差一个因子，不是压上游容量"
@@ -294,10 +299,31 @@ GW_WORKERS=$(gval workers); [[ -n "$GW_WORKERS" ]] || GW_WORKERS=1
 # 进程，而那个夹具只在退出时打印终局（跑的过程中不报进度），所以它报的 `requests=` 天然是
 # direct + proxy 的累计。标定那一轮就是被这里骗到的：客户端 2,000,000、网关 2,000,000、
 # 上游 4,000,000 —— 看着像"上游在重复计数"，其实是两臂各 2M。等式的正确形式是**总和**。
-[[ $(( ${D_DONE} + ${P_DONE} )) -eq ${UP_SERVED} ]] \
-  || die "等式不闭合：客户端 direct=${D_DONE} + proxy=${P_DONE} = $(( ${D_DONE} + ${P_DONE} )) ≠ 上游 served=${UP_SERVED}"
-[[ "${P_DONE}" == "${GW_PARSED}" && "${GW_PARSED}" == "${GW_COMPLETED}" ]] \
-  || die "网关那一侧不闭合：requests_done=${P_DONE} / parsed=${GW_PARSED} / completed=${GW_COMPLETED}"
+if [[ "${HEALTH_PROBES:-0}" == "1" ]]; then
+  # B-016 的探活口径：上游 served 里混着探活打进来的请求，严格等式放宽成有界账。
+  # 探活成功一定到上游（1 条请求）；探活失败只有连上了的才到上游——所以差值
+  # 落在 [probe_ok, probe_ok+probe_fail]，越界即账本有问题。
+  PROBES_OK=0; PROBES_FAIL=0
+  while read -r k; do
+    [[ -n "$k" ]] || continue
+    PROBES_OK=$(( PROBES_OK + $(gval "$k") ))
+  done < <(grep -o 'health_t[0-9]*_[^ ]*_probe_ok' "$OUT/gateway.log" | sort -u)
+  while read -r k; do
+    [[ -n "$k" ]] || continue
+    PROBES_FAIL=$(( PROBES_FAIL + $(gval "$k") ))
+  done < <(grep -o 'health_t[0-9]*_[^ ]*_probe_fail' "$OUT/gateway.log" | sort -u)
+  EXTRA=$(( ${UP_SERVED} - ${D_DONE} - ${P_DONE} ))
+  [[ ${EXTRA} -ge ${PROBES_OK} && ${EXTRA} -le $(( PROBES_OK + PROBES_FAIL )) ]] \
+    || die "探活账不闭合：upstream served ${UP_SERVED} − direct ${D_DONE} − proxy ${P_DONE} = ${EXTRA}，不在 [probe_ok=${PROBES_OK}, +probe_fail=$(( PROBES_OK + PROBES_FAIL ))] 内"
+  ok "等式（探活口径）：direct ${D_DONE} + proxy ${P_DONE} + 探活打进上游 ${EXTRA}（probe_ok=${PROBES_OK} / probe_fail=${PROBES_FAIL}）== upstream ${UP_SERVED}"
+  [[ "${P_DONE}" == "${GW_PARSED}" && "${GW_PARSED}" == "${GW_COMPLETED}" ]] \
+    || die "网关那一侧不闭合：requests_done=${P_DONE} / parsed=${GW_PARSED} / completed=${GW_COMPLETED}"
+else
+  [[ $(( ${D_DONE} + ${P_DONE} )) -eq ${UP_SERVED} ]] \
+    || die "等式不闭合：客户端 direct=${D_DONE} + proxy=${P_DONE} = $(( ${D_DONE} + ${P_DONE} )) ≠ 上游 served=${UP_SERVED}"
+  [[ "${P_DONE}" == "${GW_PARSED}" && "${GW_PARSED}" == "${GW_COMPLETED}" ]] \
+    || die "网关那一侧不闭合：requests_done=${P_DONE} / parsed=${GW_PARSED} / completed=${GW_COMPLETED}"
+fi
 ok "生命周期与等式：live=0、fd ${FD0}→${FD1}、constructed==destructed==${CONSTRUCTED}、上游 refused=0"
 ok "等式：direct ${D_DONE} + proxy ${P_DONE} == upstream ${UP_SERVED}；proxy 一侧 == 网关 parsed/completed ${GW_PARSED}/${GW_COMPLETED}"
 
