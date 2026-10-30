@@ -129,61 +129,12 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     return static_cast<std::uint16_t>(out->endpoints_.size() - 1);
   };
 
-  for (std::size_t i = 0; i < upstreams->items.size(); ++i) {
-    const JsonValue& group = upstreams->items[i];
-    const std::string where = "upstreams[" + std::to_string(i) + "]";
-    if (!group.is_object()) {
-      *error = where + " 不是对象，读到的是" + group.kind_name();
-      return false;
-    }
-    if (!forbid_unknown(group, {"name", "balance", "hash_key", "vnodes", "targets"}, error, where)) {
-      return false;
-    }
-    const JsonValue* name = nullptr;
-    const JsonValue* balance = nullptr;
-    const JsonValue* targets = nullptr;
-    if (!need(group, "name", JsonValue::Kind::kString, &name, error, where)) return false;
-    if (!need(group, "balance", JsonValue::Kind::kString, &balance, error, where)) return false;
-    if (!need(group, "targets", JsonValue::Kind::kArray, &targets, error, where)) return false;
-    if (name->text.empty()) {
-      *error = where + " 的 name 是空串";
-      return false;
-    }
-    route::Balance strategy{};
-    if (!route::parse_balance(balance->text, &strategy)) {
-      *error = where + " 的 balance 只认 round_robin / least_conn / consistent_hash，读到的是 \"" +
-               balance->text + "\"";
-      return false;
-    }
-    std::uint16_t group_index = route::kNoUpstreamGroup;
-    if (!out->groups_.add_group(name->text, strategy, &group_index)) {
-      *error = where + " 的 name 与前面某个组重复，或组数超过下标空间：" + name->text;
-      return false;
-    }
-    route::UpstreamGroup* built = const_cast<route::UpstreamGroup*>(out->groups_.group_at(group_index));
-    if (const JsonValue* hash_key = group.find("hash_key"); hash_key != nullptr) {
-      if (hash_key->kind != JsonValue::Kind::kString ||
-          !parse_hash_key(hash_key->text, &built->hash_key, error)) {
-        if (hash_key->kind != JsonValue::Kind::kString) {
-          *error = where + " 的 hash_key 必须是字符串";
-        }
-        return false;
-      }
-    }
-    if (const JsonValue* vnodes = group.find("vnodes"); vnodes != nullptr) {
-      if (vnodes->kind != JsonValue::Kind::kInt || vnodes->number <= 0 ||
-          vnodes->number > 1000000) {
-        *error = where + " 的 vnodes 要落在 1..1000000，读到的是 " + vnodes->kind_name();
-        return false;
-      }
-      built->vnodes = static_cast<std::uint32_t>(vnodes->number);
-    }
-    if (targets->items.empty()) {
-      *error = where + " 的 targets 是空数组：一个没有后端的组，选不出任何后端";
-      return false;
-    }
-    for (std::size_t j = 0; j < targets->items.size(); ++j) {
-      const JsonValue& member = targets->items[j];
+  // 把一个组的静态成员数组装配进组表 + 目标表（文件侧路径；mysql 组不走这里）。
+  // error 用外层那个参数（引用捕获），lambda 不另立出参——同一句话两份抄本是迟早漂移的东西。
+  auto add_targets_to_group = [&](const JsonValue& targets, std::uint16_t group_index,
+                                  const std::string& where) -> bool {
+    for (std::size_t j = 0; j < targets.items.size(); ++j) {
+      const JsonValue& member = targets.items[j];
       const std::string mwhere = where + ".targets[" + std::to_string(j) + "]";
       if (!member.is_object()) {
         *error = mwhere + " 不是对象，读到的是" + member.kind_name();
@@ -227,10 +178,94 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
         return false;
       }
     }
+    return true;
+  };
+
+  for (std::size_t i = 0; i < upstreams->items.size(); ++i) {
+    const JsonValue& group = upstreams->items[i];
+    const std::string where = "upstreams[" + std::to_string(i) + "]";
+    if (!group.is_object()) {
+      *error = where + " 不是对象，读到的是" + group.kind_name();
+      return false;
+    }
+    if (!forbid_unknown(group, {"name", "balance", "hash_key", "vnodes", "targets", "source"},
+                        error, where)) {
+      return false;
+    }
+    const JsonValue* name = nullptr;
+    const JsonValue* balance = nullptr;
+    const JsonValue* targets = nullptr;
+    if (!need(group, "name", JsonValue::Kind::kString, &name, error, where)) return false;
+    if (!need(group, "balance", JsonValue::Kind::kString, &balance, error, where)) return false;
+    // S3-04（ADR-20 第二节）：`source` 与 `targets` 互斥——一个组的成员有两个来源，
+    // "这个组有几个后端"就有两个答案。source 只认字面量 "mysql"。
+    bool source_mysql = false;
+    if (const JsonValue* source = group.find("source"); source != nullptr) {
+      if (source->kind != JsonValue::Kind::kString || source->text != "mysql") {
+        *error = where + " 的 source 只认 \"mysql\"，读到的是 \"" +
+                 (source->kind == JsonValue::Kind::kString ? source->text : source->kind_name()) +
+                 "\"";
+        return false;
+      }
+      if (group.find("targets") != nullptr) {
+        *error = where + " 的 source 与 targets 只能给一个（组成员有两个来源）";
+        return false;
+      }
+      source_mysql = true;
+    }
+    if (!source_mysql &&
+        !need(group, "targets", JsonValue::Kind::kArray, &targets, error, where)) {
+      return false;
+    }
+    if (name->text.empty()) {
+      *error = where + " 的 name 是空串";
+ return false;
+    }
+    route::Balance strategy{};
+    if (!route::parse_balance(balance->text, &strategy)) {
+      *error = where + " 的 balance 只认 round_robin / least_conn / consistent_hash，读到的是 \"" +
+ balance->text + "\"";
+      return false;
+    }
+    std::uint16_t group_index = route::kNoUpstreamGroup;
+    if (!out->groups_.add_group(name->text, strategy, &group_index)) {
+      *error = where + " 的 name 与前面某个组重复，或组数超过下标空间：" + name->text;
+ return false;
+    }
+    route::UpstreamGroup* built = const_cast<route::UpstreamGroup*>(out->groups_.group_at(group_index));
+    if (const JsonValue* hash_key = group.find("hash_key"); hash_key != nullptr) {
+      if (hash_key->kind != JsonValue::Kind::kString ||
+          !parse_hash_key(hash_key->text, &built->hash_key, error)) {
+        if (hash_key->kind != JsonValue::Kind::kString) {
+          *error = where + " 的 hash_key 必须是字符串";
+ }
+        return false;
+      }
+    }
+    if (const JsonValue* vnodes = group.find("vnodes"); vnodes != nullptr) {
+      if (vnodes->kind != JsonValue::Kind::kInt || vnodes->number <= 0 ||
+          vnodes->number > 1000000) {
+        *error = where + " 的 vnodes 要落在 1..1000000，读到的是 " + vnodes->kind_name();
+ return false;
+      }
+      built->vnodes = static_cast<std::uint32_t>(vnodes->number);
+    }
+    if (source_mysql) {
+      // 成员来自节点表：装载成功前 targets 为空。空成员组的 LB 语义（502）就是
+      // "成员还没到岗"的表态（ADR-20 第五节），这里不把它当装配错误。
+      built->source_mysql = true;
+    } else {
+      if (targets->items.empty()) {
+        *error = where + " 的 targets 是空数组：一个没有后端的组，选不出任何后端";
+ return false;
+      }
+      if (!add_targets_to_group(*targets, group_index, where)) return false;
+    }
   }
 
   // routes 段可以没有（`has_routes=false` → main.cc 一个 filter 都不装，链是空的）。
-  out->has_routes = document.find("routes") != nullptr;  if (const JsonValue* routes = document.find("routes"); routes != nullptr) {
+  out->has_routes = document.find("routes") != nullptr;
+  if (const JsonValue* routes = document.find("routes"); routes != nullptr) {
     if (!routes->is_array()) {
       *error = std::string("routes 必须是数组，读到的是") + routes->kind_name();
       return false;
@@ -318,6 +353,8 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
   }
 
   // 建环。只有 consistent_hash 的组装，别的组不付费也不需要它。
+  // source=mysql 的组在成员到岗前是空的——环没法建也不该建：它的环随第一份
+  // reload 快照一起发布（build_nodes_view），装配期跳过不是漏步。
   std::vector<std::string> endpoint_keys;
   endpoint_keys.reserve(out->endpoints_.size());
   for (const Endpoint& endpoint : out->endpoints_) {
@@ -326,6 +363,7 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
   for (std::uint16_t g = 0; g < static_cast<std::uint16_t>(out->groups_.size()); ++g) {
     const route::UpstreamGroup* group = out->groups_.group_at(g);
     if (group == nullptr || group->balance != route::Balance::kConsistentHash) continue;
+    if (group->source_mysql && group->targets.empty()) continue;
     route::UpstreamGroup* mutable_group = const_cast<route::UpstreamGroup*>(group);
     if (!route::build_hash_ring(mutable_group, endpoint_keys)) {
       *error = "组 " + group->name + " 的一致性哈希环建不起来（成员或端点表有空）";

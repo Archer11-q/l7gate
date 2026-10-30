@@ -3153,10 +3153,6 @@ TEST(S2_05_GracefulStop, GroupDrainQuiescesEveryWorkerAndDeliversEveryInFlightRe
 
 // ===========================================================================
 // S2-06a：回源多端点 + per-worker 静态映射（ADR-17 已裁候选 A）
-// ===========================================================================
-//
-// 这一组只测一件事：**第 i 条 worker 的回源目的地址是第 i mod E 个端点，而且它一辈子只用
-// 那一个**。端点靠"响应体长度不同"来区分——两个 TestUpstream 各自 set_response_body_bytes
 // 一个不同值，客户端拿到多长的体就是被派到了哪个端点，不需要任何新的观测计数。
 //
 // 客户端落到哪条 worker 由 S2-01 的 round-robin 决定（`DispatchIsRoundRobinBalanced` 已把
@@ -4561,6 +4557,155 @@ TEST(S3_02_LoadBalance, ConsistentHashPinsTheSameKeyAcrossConnections) {
   harness.shutdown_all();
   targets.stop();
 }
+
+// ===========================================================================
+//
+// 这一组只测一件事：**第 i 条 worker 的回源目的地址是第 i mod E 个端点，而且它一辈子只用
+// 那一个**。端点靠"响应体长度不同"来区分——两个 TestUpstream 各自 set_response_body_bytes
+// ======================= S3-04：节点表 reload 端到端（不依赖 Docker）=======================
+//
+// reload 全链路里不依赖 MySQL 的那一段：快照发布 → worker 对账 tick 追加目标 →
+// 新成员接得到流量 → 删除的成员不再接流量 → ever-seen 下标复用。真 MySQL 的
+// fetch 与行变更在首次连通取证与 scripts/smoke-s3-04.sh 里。
+
+namespace {
+
+// 把 registry 的当前目标表翻成 Reactor::Config::Target（main.cc 同一个搬运，
+// 测试里再抄一份是因为夹具不经过 main.cc）。
+std::vector<Reactor::Config::Target> targets_from_registry(const l7gate::route::TargetRegistry& registry) {
+  std::vector<Reactor::Config::Target> out;
+  for (std::uint16_t i = 0; i < registry.size(); ++i) {
+    const auto* node = registry.at(i);
+    Reactor::Config::Target target;
+    if (node == nullptr) break;
+    target.address = node->address;
+    target.port = node->port;
+    target.health_path = node->health_path;
+    out.push_back(target);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST(S3_04_NodesE2E, ReloadAddsRemovesAndReAddsMembersWithoutRestart) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  TestUpstream backend2;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend2, 192, &why)) << why;
+
+  // 文件侧的组（catch-all 指一个 rr 组）+ 注册表初始只有 0/1 两台。
+  l7gate::route::RouteTable table;
+  l7gate::route::GroupTable file_groups;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+  ASSERT_TRUE(file_groups.add_group("all", l7gate::route::Balance::kRoundRobin, &group));
+  auto publisher = std::make_shared<l7gate::route::NodesPublisher>();
+  auto registry = std::make_shared<l7gate::route::TargetRegistry>();
+  registry->intern({"127.0.0.1", static_cast<std::uint16_t>(backend0.port())});
+  registry->intern({"127.0.0.1", static_cast<std::uint16_t>(backend1.port())});
+  auto publish_members = [&](const std::vector<std::uint16_t>& ports) {
+    l7gate::route::NodesFetch fetch;
+    l7gate::route::NodesFetch::GroupMembers members;
+    members.name = "all";
+    for (const std::uint16_t port : ports) {
+      members.members.push_back({"127.0.0.1", port});
+    }
+    fetch.groups.push_back(std::move(members));
+    std::string build_error;
+    auto view = l7gate::route::build_nodes_view(file_groups, fetch, *registry, &build_error);
+    EXPECT_NE(view, nullptr) << build_error;
+    publisher->publish(std::move(view));
+  };
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets = targets_from_registry(*registry);
+  options.config.default_target = 0;
+  l7gate::route::HealthPolicy policy;  // 探活关着：这一条只证 reload 的成员增删
+  policy.probe_interval_ms = 0;
+  auto health = std::make_shared<l7gate::route::HealthTable>(options.config.upstream_targets.size(),
+                                                             policy, /*capacity=*/16);
+  auto state = std::make_shared<l7gate::route::LbState>(options.config.upstream_targets.size(), 1);
+  options.config.health = health;
+  options.config.nodes = publisher;
+  options.config.lb_state = state;
+  ASSERT_TRUE(table.add_prefix("", group));
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+  harness.add_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(
+      file_groups, state, health, publisher));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  publish_members({static_cast<std::uint16_t>(backend0.port()),
+                   static_cast<std::uint16_t>(backend1.port())});
+
+  // 基线：成员 {0,1}，轮询两条都通。
+  Client c0;
+  ASSERT_TRUE(c0.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c0.write_all(get_request("/warm")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c0.read_response(&status, &body, &why)) << why;
+  ASSERT_TRUE(body.size() == 64u || body.size() == 128u) << "基线响应不属于已知成员";
+  c0.close();
+
+  // 增员：第三个成员进表 → 不重启，流量必须到达它（对账 tick + ensure_upstream 懒对账）。
+  publish_members({static_cast<std::uint16_t>(backend0.port()),
+                   static_cast<std::uint16_t>(backend1.port()),
+                   static_cast<std::uint16_t>(backend2.port())});
+  bool reached_new = false;
+  for (int i = 0; i < 50 && !reached_new; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/grow")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    reached_new = body.size() == 192u;
+    c.close();
+  }
+  EXPECT_TRUE(reached_new) << "reload 50 轮之后新成员仍接不到流量：发布/对账链路有一头断了";
+  EXPECT_EQ(backend2.connections_accepted() >= 1, true);
+
+  // 删员：0 号出表 → 它不再接流量（1/2 继续服务）。
+  publish_members({static_cast<std::uint16_t>(backend1.port()),
+                   static_cast<std::uint16_t>(backend2.port())});
+  const std::uint64_t served0_before = backend0.requests_served();
+  for (int i = 0; i < 10; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/shrink")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    ASSERT_NE(body.size(), 64u) << "被删的成员还在接流量";
+    c.close();
+  }
+  EXPECT_EQ(backend0.requests_served(), served0_before) << "被删成员的计数不该再涨";
+
+  // 复员：0 号回到表里 → ever-seen 下标复用，流量回到它。
+  publish_members({static_cast<std::uint16_t>(backend0.port()),
+                   static_cast<std::uint16_t>(backend1.port()),
+                   static_cast<std::uint16_t>(backend2.port())});
+  bool re_reached = false;
+  for (int i = 0; i < 50 && !re_reached; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/regrow")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    re_reached = body.size() == 64u;
+    c.close();
+  }
+  EXPECT_TRUE(re_reached) << "重新到岗的成员接不到流量：ever-seen 复用断了";
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
+  backend2.stop_and_join();
+}
+
 
 }  // namespace l7gate::net
 

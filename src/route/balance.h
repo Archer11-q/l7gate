@@ -59,6 +59,10 @@ struct UpstreamGroup {
   std::uint32_t vnodes = kDefaultVnodes;
   std::vector<std::uint16_t> targets;   // 全局目标下标（`Reactor::Config::upstream_targets` 的值域）
   std::vector<std::pair<std::uint64_t, std::uint16_t>> ring;  // 仅 kConsistentHash：按哈希值排序
+  // S3-04（ADR-20 第二节）：成员来自节点表（文件里 `"source": "mysql"`）。
+  // **与 `targets` 互斥**（装配期拒绝双给）；装载成功前 targets 为空——
+  // 空成员组的 LB 语义（502）就是"成员还没到岗"的表态。
+  bool source_mysql = false;
 };
 
 // 组表。装配期建好、运行期只读——**这条时序纪律和 filter 链、路由表是同一条**：
@@ -111,6 +115,11 @@ class LbState {
   // 轮询游标：返回这次该用的偏移量并把游标推进。**推进发生在同一次调用里**，
   // 因为"取"和"加"分成两个方法就会有人漏掉其中一个，而漏掉的后果是同一个后端被连选。
   std::size_t advance_rr(std::uint16_t group, std::size_t member_count) noexcept;
+
+  // S3-04（ADR-20）：ever-seen 增员后由 **owner worker** 在对账 tick 里扩容配对账。
+  // 只能在 owner 循环线程调用（与 note_paired 同一条纪律）；resize 保住已有账目，
+  // 新槽位记 0（新成员没有历史配对）。组数不扩：组是文件的静态段，reload 不改它。
+  void ensure_capacity(std::size_t target_count) noexcept;
 
   std::size_t target_count() const noexcept { return target_pairings_.size(); }
 

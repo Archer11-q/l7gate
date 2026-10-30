@@ -7,6 +7,7 @@
 #include "filter/chain.h"
 #include "route/balance.h"
 #include "route/health.h"
+#include "route/nodes.h"
 
 namespace l7gate::filter {
 
@@ -29,8 +30,12 @@ namespace l7gate::filter {
 class LoadBalanceFilter : public RequestFilter {
  public:
   // `health` 可空：空 = 健康检查整套未装配（S3-02 形状，行为逐字节不变）。
+  // `nodes` 可空：空 = 本网关不跑节点表 reload（组表用构造给的那份，S3-02 形状）。
+  // 非 null 时**每请求 load 一根快照指针**（一次原子读）：reload 发布的新成员表
+  // 从下一条请求开始生效——这是"reload 生效耗时"的请求侧实现位置。
   LoadBalanceFilter(const route::GroupTable& table, std::shared_ptr<route::LbState> state,
-                    std::shared_ptr<const route::HealthTable> health = nullptr) noexcept;
+                    std::shared_ptr<const route::HealthTable> health = nullptr,
+                    std::shared_ptr<const route::NodesPublisher> nodes = nullptr) noexcept;
 
   std::string_view name() const noexcept override { return "load-balance"; }
 
@@ -52,6 +57,7 @@ class LoadBalanceFilter : public RequestFilter {
   const route::GroupTable& table_;
   std::shared_ptr<route::LbState> state_;
   std::shared_ptr<const route::HealthTable> health_;
+  std::shared_ptr<const route::NodesPublisher> nodes_;
   std::vector<std::uint16_t> candidates_scratch_;
 };
 

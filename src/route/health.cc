@@ -1,15 +1,25 @@
 #include "route/health.h"
 
 #include <algorithm>
+#include <exception>
 
 namespace l7gate::route {
 
-HealthTable::HealthTable(std::size_t target_count, HealthPolicy policy) noexcept
-    : policy_(policy), entries_(target_count) {}
+HealthTable::HealthTable(std::size_t target_count, HealthPolicy policy,
+                         std::size_t capacity) noexcept
+    : policy_(policy),
+      entries_(capacity == 0 ? target_count : std::max(target_count, capacity)),
+      active_(target_count) {
+  // ever-seen 上界给小于初始启用数是装配错误：宁可这里崩（构造期）也别让 reload
+  // 在运行期把启用数抬进一个不存在的槽位。
+  if (capacity != 0 && capacity < target_count) {
+    std::terminate();
+  }
+}
 
 FailureVerdict HealthTable::note_failure(std::uint16_t target, std::int64_t now_ms,
                                          std::int64_t epoch_ms) noexcept {
-  if (target >= entries_.size()) return FailureVerdict::kRecorded;  // 越界只可能是装配漏项；不猜、不扩表
+  if (target >= active_.load(std::memory_order_relaxed)) return FailureVerdict::kRecorded;  // 越界只可能是装配漏项；不猜、不扩表
   Entry& e = entries_[target];
 
   const std::int64_t until = e.ejected_until_ms.load(std::memory_order_relaxed);
@@ -36,13 +46,13 @@ FailureVerdict HealthTable::note_failure(std::uint16_t target, std::int64_t now_
 }
 
 void HealthTable::note_success(std::uint16_t target) noexcept {
-  if (target >= entries_.size()) return;
+  if (target >= active_.load(std::memory_order_relaxed)) return;
   entries_[target].consecutive_failures.store(0, std::memory_order_relaxed);
 }
 
 void HealthTable::note_probe_result(std::uint16_t target, bool alive, std::int64_t now_ms,
                                     std::int64_t epoch_ms) noexcept {
-  if (target >= entries_.size()) return;
+  if (target >= active_.load(std::memory_order_relaxed)) return;
   Entry& e = entries_[target];
   if (alive) {
     e.probe_ok_total.fetch_add(1, std::memory_order_relaxed);
@@ -55,7 +65,7 @@ void HealthTable::note_probe_result(std::uint16_t target, bool alive, std::int64
 }
 
 bool HealthTable::revive(std::uint16_t target) noexcept {
-  if (target >= entries_.size()) return false;
+  if (target >= active_.load(std::memory_order_relaxed)) return false;
   Entry& e = entries_[target];
   const std::int64_t until = e.ejected_until_ms.load(std::memory_order_relaxed);
   if (until == 0) return false;  // 没被摘过：探活成功没有账要还
@@ -66,7 +76,7 @@ bool HealthTable::revive(std::uint16_t target) noexcept {
 
 std::size_t HealthTable::sweep_expired(std::int64_t now_ms) noexcept {
   std::size_t revived = 0;
-  for (std::size_t i = 0; i < entries_.size(); ++i) {
+  for (std::size_t i = 0; i < active_.load(std::memory_order_relaxed); ++i) {
     Entry& e = entries_[i];
     const std::int64_t until = e.ejected_until_ms.load(std::memory_order_relaxed);
     if (until == 0 || until > now_ms) continue;
@@ -79,14 +89,16 @@ std::size_t HealthTable::sweep_expired(std::int64_t now_ms) noexcept {
 }
 
 bool HealthTable::is_ejected(std::uint16_t target, std::int64_t now_ms) const noexcept {
-  if (target >= entries_.size()) return false;
+  if (target >= active_.load(std::memory_order_relaxed)) return false;
   return entries_[target].ejected_until_ms.load(std::memory_order_relaxed) > now_ms;
 }
 
 std::size_t HealthTable::max_ejected_count() const noexcept {
   // floor 语义："被摘除容量 ≤ 比例%" 的字面读法。N<比例的小组按它就是"一个都不能摘"，
   // 想要摘除能力的配置该把比例调大，而不是我在这里偷偷放宽成 ceil。
-  const std::uint64_t count = entries_.size();
+  // 分母 = **当前启用的成员数**（ADR-12 追加节：去重目标表），不是 ever-seen 的
+  // 槽位容量——被摘除比例量的是"现在的容量"，不是"历史上见过的总量"。
+  const std::uint64_t count = active_.load(std::memory_order_relaxed);
   return static_cast<std::size_t>(count * policy_.max_ejection_percent / 100u);
 }
 
@@ -123,9 +135,20 @@ bool HealthTable::try_mark_healthy(std::uint16_t target, std::int64_t expected_u
   return true;
 }
 
+void HealthTable::ensure_active(std::size_t n) noexcept {
+  // fetch_max：多个 worker 同时看到同一份新快照时，抬到同一个数，赢家无所谓。
+  std::size_t cur = active_.load(std::memory_order_relaxed);
+  while (cur < n && n <= entries_.size()) {
+    if (active_.compare_exchange_weak(cur, n, std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
 TargetHealthSnapshot HealthTable::snapshot(std::uint16_t target) const noexcept {
   TargetHealthSnapshot out;
-  if (target >= entries_.size()) return out;
+  if (target >= active_.load(std::memory_order_relaxed)) return out;
   const Entry& e = entries_[target];
   out.failures_total = e.failures_total.load(std::memory_order_relaxed);
   out.ejections_total = e.ejections_total.load(std::memory_order_relaxed);

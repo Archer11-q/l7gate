@@ -135,6 +135,7 @@ find_package(Threads REQUIRED)
 add_library(l7gate_core STATIC
   src/config/gateway_config.cc
   src/config/json.cc
+  src/config/nodes_store.cc
   src/core/build_info.cc
   src/filter/chain.cc
   src/filter/lb_filter.cc
@@ -151,9 +152,16 @@ add_library(l7gate_core STATIC
   src/http/response_head.cc
   src/route/balance.cc
   src/route/health.cc
+  src/route/nodes.cc
   src/route/router.cc
 )
 target_include_directories(l7gate_core PUBLIC src)
+# S3-04（ADR-20）：libmysqlclient 是产品依赖（节点表的读取器 nodes_store.cc 链它），
+# 全库一起链接——找不到就直接配置失败，不"编译时再说"（同 9.2 的版本铁律）。
+find_library(L7GATE_MYSQLCLIENT_LIB mysqlclient REQUIRED)
+find_path(L7GATE_MYSQL_INCLUDE_DIR mysql.h PATHS /usr/include/mysql REQUIRED)
+target_include_directories(l7gate_core PRIVATE ${L7GATE_MYSQL_INCLUDE_DIR})
+target_link_libraries(l7gate_core PUBLIC ${L7GATE_MYSQLCLIENT_LIB})
 target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers Threads::Threads)
 target_compile_definitions(l7gate_core PUBLIC
   L7GATE_VERSION="${PROJECT_VERSION}"

@@ -525,3 +525,40 @@ TEST(S3_03_ConfigHealth, SameBackendDifferentHealthPathIsRejectedSamePathDedups)
   ASSERT_TRUE(build_from(two_groups_on("", ""), &both_default, &error)) << error;
   EXPECT_EQ(both_default.endpoints().size(), 1u);
 }
+
+// --- S3-04（ADR-20 第二节）：组级 source 字段 -----------------------------------------
+// 与 targets 互斥、只认字面量 "mysql"；mysql 组在成员到岗前就是空组。
+
+TEST(S3_04_ConfigNodes, SourceAndTargetsAreMutuallyExclusive) {
+  expect_rejected(
+      R"({"upstreams":[{"name":"api","balance":"round_robin","source":"mysql",)"
+      R"("targets":[{"address":"127.0.0.1","port":18081}]}]})",
+      "source");
+}
+
+TEST(S3_04_ConfigNodes, SourceOnlyAcceptsTheMysqlLiteral) {
+  expect_rejected(
+      R"({"upstreams":[{"name":"api","balance":"round_robin","source":"file"}]})",
+      "source");
+  expect_rejected(
+      R"({"upstreams":[{"name":"api","balance":"round_robin","source":3}]})",
+      "source");
+}
+
+TEST(S3_04_ConfigNodes, MysqlGroupAssemblesEmptyUntilMembersArrive) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(
+      R"({"upstreams":[{"name":"api","balance":"consistent_hash","source":"mysql",)"
+      R"("vnodes":160}]})",
+      &config, &error))
+      << error;
+  ASSERT_EQ(config.groups().size(), 1u);
+  const auto* group = config.groups().group_at(0);
+  ASSERT_NE(group, nullptr);
+  EXPECT_TRUE(group->source_mysql);
+  EXPECT_TRUE(group->targets.empty()) << "成员没到岗就是空组，502 是它的表态";
+  EXPECT_TRUE(group->ring.empty()) << "环随第一份有成员的快照发布，装配期不建";
+  // 哈希组缺环的 502 语义由 S3_02_LoadBalanceFilter.HashGroupWithoutRingRejectsFiveOhTwo 钉着，
+  // mysql 组到岗前的行为与它同一条路。
+}

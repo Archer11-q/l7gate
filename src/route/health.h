@@ -60,7 +60,12 @@ struct TargetHealthSnapshot {
 
 class HealthTable {
  public:
-  HealthTable(std::size_t target_count, HealthPolicy policy) noexcept;
+  // `capacity` 是目标槽位的**构造期上界**（S3-04 节点表 ever-seen：新成员只能在这个
+  // 空间里"启用"，不能让它运行期 resize——这张表被同组全部 worker 共享，运行期
+  // 变长就是数据竞争）。0 = 容量与 target_count 相同（静态文件配置的现状形状，
+  // 一字节不多花）。`target_count` 是**初始启用数**。
+  HealthTable(std::size_t target_count, HealthPolicy policy,
+              std::size_t capacity = 0) noexcept;
 
   // 失败判据成立时调用（被动：业务请求撞上失败；主动：探活判死）。
   // `now_ms` 是单调毫秒（决策纯靠它，测试可以喂任意时间线）；`epoch_ms` 是墙钟毫秒，
@@ -91,7 +96,14 @@ class HealthTable {
   std::size_t max_ejected_count() const noexcept;
 
   const HealthPolicy& policy() const noexcept { return policy_; }
-  std::size_t target_count() const noexcept { return entries_.size(); }
+  // 当前启用的目标数（valve 分母、sweep 范围、一切越界检查的界）。
+  std::size_t target_count() const noexcept {
+    return active_.load(std::memory_order_relaxed);
+  }
+  // ever-seen 增员（S3-04 reload）：把启用数抬到 n。多 worker 竞争取 max，
+  // 槽位在构造期已全部置零，所以"启用"只是抬一个数。
+  void ensure_active(std::size_t n) noexcept;
+  std::size_t capacity() const noexcept { return entries_.size(); }
 
   // --- 观测面（全原子，聚合由读者自己做）-------------------------------------
   TargetHealthSnapshot snapshot(std::uint16_t target) const noexcept;
@@ -123,7 +135,8 @@ class HealthTable {
   };
 
   HealthPolicy policy_;
-  std::vector<Entry> entries_;
+  std::vector<Entry> entries_;  // 容量 = 构造期上界；[0, active_) 才是被启用的目标
+  std::atomic<std::size_t> active_;
   std::atomic<std::uint32_t> ejected_now_{0};
   std::atomic<std::uint64_t> blocked_by_valve_{0};
 };

@@ -110,6 +110,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 
 - 服务端镜像仍锁 `mysql:8.0.36`（未改）。8.4 客户端连 8.0 服务端在 Oracle 的支持矩阵内是允许的方向（新客户端连旧服务端）。
 - **这条兼容性目前只是推断，不是事实。** 要到 S3 第一次真正建立 MySQL 连接时实测取证，写进 `FAULT-INJECTION.md` 或首次连通记录里才算成立。
+- **✅ 已取证（2026-10-30，S3-04）**：`l7gate_mysql_probe` 五步全通（connect → CREATE TABLE → INSERT → SELECT 读回 → DELETE），`client=8.4.11 ↔ server=8.0.36`。环境：Docker Desktop WSL Integration（server 29.4.3）、镜像 `mysql:8.0.36`（digest `sha256:a53272402242…`）、端口发布形态 `127.0.0.1:13306 → 3306`。探针可复跑：`build/release/tools/l7gate_mysql_probe --port 13306`。**8.4 客户端 ↔ 8.0 服务端兼容性从"推断"转正为"实测成立"。**
 - 客户端 8.4 / 服务端 8.0 是否一并对齐到 8.4，留到 S3 触到 MySQL 时决策，现在不动镜像 tag——镜像 tag 一旦中途更换，历史数据就断代。
 - **客户端侧就位取证（2026-10-30，S3-04 认领时）**：`libmysqlclient-dev 8.4.11-0ubuntu0.26.04.1` 已在（用户此前 apt 安装，`mysql_config --version` = 8.4.11、`--libs` 带出 `-lmysqlclient -lz -lzstd -lssl -lcrypto -lresolv -lm`）；探针（`g++ -std=c++20` 编译 + 链接 + 运行时 `mysql_get_client_info()`）返回 **8.4.11**——只验库、不建连接，服务端连通取证仍待 Docker WSL Integration（阻塞在项目所有人侧，已量化报告：Desktop 未运行 + WSL Integration 未开启）。
 

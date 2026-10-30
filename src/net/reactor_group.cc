@@ -107,6 +107,7 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     // 同一条教训：Reactor 存 config 的副本，构造之后写等于没写）。探活分派按
     // `target % N == i` 切——探活流量不随 worker 数放大。
     wc.health = config_.health;
+    wc.nodes = config_.nodes;
     wc.worker_index = static_cast<std::size_t>(i);
     wc.worker_group_size = static_cast<std::size_t>(n);
     // 均衡状态必须**在 Reactor 构造之前**就进 wc：Reactor 存的是 config 的一份副本，
@@ -127,7 +128,7 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     }
     if (lb_state != nullptr) {
       worker->add_request_filter(std::make_unique<filter::LoadBalanceFilter>(
-          *config_.groups, std::move(lb_state), config_.health));
+          *config_.groups, std::move(lb_state), config_.health, config_.nodes));
     }
     if (!worker->start_worker(error)) {
       // 已经建好的 worker 由本对象析构清理（它们的 start_worker 若成功则 wake_fd

@@ -316,3 +316,22 @@ clang 21 放不过**，所以 `asan-ubsan` 与 `tsan` 两个 preset 从我接手
 全套 246 条里就有两条持续红。**"删掉标记"不等于"还原了改动"**：临时改动的还原必须以
 `git diff`（或对拍原句）为准，不是以标记注释消失为准。这条与 §8 的"阳性验证要真打红"是
 同一族纪律的另一半：红要红得真，绿也要绿得真。
+
+## 11. S3-04 的阳性验证与工具侧发现（2026-10-30，节点表 reload 这一层）
+
+**先说立场**：§8/§9/§10 的尺子原样用——每条断言单独打红过一次，改回即全绿，
+`grep -rn 'TEMP-POSITIVE' src/ tests/` 是 0 条。
+
+| 我把代码改成什么 | 哪条用例该红 | 实测 |
+|---|---|---|
+| `LoadBalanceFilter` 忽略发布器（`if (false && nodes_ != nullptr)`，永远用构造给的文件表） | `S3_04_NodesE2E.ReloadAddsRemovesAndReAddsMembersWithoutRestart` | **红**：新成员 50 轮内接不到流量——reload 生效的请求侧入口就是这次 load |
+| `Reactor::sync_nodes_snapshot()` 开头短路（对账 tick 与 ensure_upstream 懒对账一起断） | 同上 | **红**：新成员永远进不了 worker 的目标表，请求全部压在下游缓冲 |
+| `build_nodes_view` 不拒绝 fetch 里文件没有的组 | `S3_04_Nodes.UnknownGroupNameIsRejectedWholesale` | **红**：ghost 组被安静吞掉而不是整批拒绝——数据库偷偷扩配置面 |
+| `source` 与 `targets` 互斥检查跳过报错话（保留拒绝但话为空） | `S3_04_ConfigNodes.SourceAndTargetsAreMutuallyExclusive` | **红**：拒绝本身还在，但话里没点名——那条用例断的就是"点名"这一半 |
+
+**工具侧发现（照记，防复发）**：① 冒烟脚本第一版的 DELETE 判定没有给 reload 生效宽限——
+DELETE 后第一拍 curl 撞上旧快照的尾巴，"还没生效"被读成了"没生效"，两格假红；
+给一个完整 reload 周期的宽限后同一路径全绿。**判定窗口必须覆盖被测机制的生效粒度**——
+这条与 §8"阳性验证要真打红"是同一族：红要红得真，绿也要绿得真。② 收尾信号循环写成
+`${PIDS[@]:1}` 漏掉 1 号上游，脚本 `wait` 一个永不退出的进程——bash 数组切片从 0 起，
+`:1` 不是"跳过网关"是"跳过第一个成员"。

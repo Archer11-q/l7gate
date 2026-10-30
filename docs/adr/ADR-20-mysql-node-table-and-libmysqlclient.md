@@ -63,3 +63,16 @@ CREATE TABLE IF NOT EXISTS l7gate_nodes (
 - reload 生效耗时：MySQL 里 INSERT 一个成员（T0）→ 网关把请求发到它（T1），两端钉住报秒数；DELETE 后对称测"不再收请求"。
 - 降级：mysqld stop 后业务零中断（错误响应数 = 0）、恢复后新成员到岗；全程 `requests_parsed` 不掺 reload 的查询。
 - 阳性验证：`source` 与 `targets` 同给 → 启动拒绝；MySQL 中未知组名 → 整批拒载保留旧表；reload 线程掐掉后（`nodes_reload_ms=0`）成员变更永不生效。
+
+## 追加（2026-10-30，S3-04 落地时）：第三节"跨组允许不同 health_path"被实现推翻，更正为拒绝
+
+第三节说两个组对同一台机器各配各的探活路径"允许"——落地时这格立不住：**探活是每目标的
+一条状态机，而 ever-seen 注册表按 `地址:端口` 认机器**（下标跨 reload 稳定是池桶/配对账/
+健康表全部成立的地基），同一台机器在注册表里只有一行、一个 `health_path`（取第一次 intern
+的定义）。所以文件侧"同一台机器两个 health_path = 拒绝"的老规矩在 MySQL 形态下原样成立：
+`nodes_store` 与 `build_nodes_view` 双重拦截，同一端点带着不同 `health_path` 出现 = 整批拒载。
+当时写"允许"的理由（"没有同一份配置可争"）忽略了探活机的粒度——**语义跟着机制走，
+机制变了语义就得重新对**，这是这条更正的教训。
+
+其余各节按落地原样成立，除了两处细化的补充：reload 生效粒度 = `--nodes-reload-ms`（B-015
+实测 406/536 ms @ 500ms 间隔）；ever-seen 槽位不回收（O(成员历史) 的账记在 ARCHITECTURE 1.26）。

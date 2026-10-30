@@ -135,6 +135,10 @@ std::size_t LbState::advance_rr(std::uint16_t group, std::size_t member_count) n
   return picked;
 }
 
+void LbState::ensure_capacity(std::size_t target_count) noexcept {
+  if (target_count > target_pairings_.size()) target_pairings_.resize(target_count, 0u);
+}
+
 std::uint64_t fnv1a64(std::string_view text) noexcept {
   std::uint64_t hash = kFnvOffsetBasis;
   for (const char c : text) {

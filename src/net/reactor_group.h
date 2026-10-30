@@ -87,6 +87,11 @@ class ReactorGroup {
     // （先例 ReactorStats）；它由装配方（main.cc / 用例）创建并持有，必须比本组活得久。
     std::shared_ptr<l7gate::route::HealthTable> health;
 
+    // S3-04（ADR-20 第四节）：节点表发布器。**nullptr = 不跑 reload**（纯文件配置）。
+    // 由装配方创建并持有，必须比本组活得久；每条 worker 的 LB filter 与对账 tick
+    // 都从它 load 当前快照。
+    std::shared_ptr<const l7gate::route::NodesPublisher> nodes;
+
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，
     // 由 main.cc 的 --workers 覆盖（缺省仍走单 Reactor，见 ADR-14 后果段）。

@@ -16,14 +16,17 @@
 #include <dirent.h>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "config/gateway_config.h"
+#include "config/nodes_store.h"
 #include "core/build_info.h"
 #include "filter/lb_filter.h"
 #include "filter/route_filter.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
+#include "route/nodes.h"
 #include "route/router.h"
 
 namespace {
@@ -36,6 +39,8 @@ void usage(std::FILE* out) {
       "               [--serve-requests N] [--max-connections N]\n"
       "               [--high-water-mark BYTES] [--workers N] [--drain-timeout-ms MS]\n"
       "               [--config <path>]\n"
+      "               [--nodes-db <host:port>] [--nodes-user U] [--nodes-password P]\n"
+      "               [--nodes-schema DB] [--nodes-reload-ms MS] [--nodes-timeout-ms MS]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -61,6 +66,12 @@ void usage(std::FILE* out) {
       "路由：前缀取最长命中、正则全串锚定且优先于前缀，匹配原始 origin-form（含 query、不解码、不规范化）；\n"
       "无匹配回 404 并关连接。balance 只认 round_robin / least_conn / consistent_hash。\n"
       "不给 --config 时一个 filter 都不装，链是空的，行为与 S2-06a 逐字节同形。\n"
+      "--nodes-*（S3-04，ADR-20）：节点表的 MySQL 来源。文件里声明了 \"source\": \"mysql\"\n"
+      "的组，其成员从 <schema>.l7gate_nodes 表读取（组名/address/port/health_path），\n"
+      "每 --nodes-reload-ms（默认 5000，0 = 只在启动时读一次）reload 一次。reload 失败\n"
+      "保留上一份成员继续服务（不拒绝、不 500），恢复后自动换上新表。MySQL 连不上时\n"
+      "mysql 组按空成员启动。配置声明了 source=mysql 但没给 --nodes-schema 是配置矛盾，\n"
+      "退出码 2。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：摘掉监听（新连接从此拿 RST）→ 不再接受新请求 →\n"
       "在飞请求逐条响应完 + 刷完出向 → 空闲连接立即关 → 到点兜底强关 → 退出循环、join worker。\n"
       "带 upgrade 的隧道**只能硬关**：ADR-09 不解析帧就发不出 WS close 握手，刷完已缓冲的\n"
@@ -187,6 +198,15 @@ bool parse_number(const char* text, long long* out) {
   return true;
 }
 
+// 墙钟毫秒。与 reactor.cc 里那份同一口径（system_clock）：健康表的
+// last_ejection_epoch_ms 和节点表的 last_publish_epoch_ms 都走这根轴，
+// 压测脚本才能把自己的时间线和它们钉在一起。
+std::int64_t wall_ms() noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 // 只在循环退出之后调用：ReactorStats 全原子，但这份快照要的是"这一次运行的最终账"，
 // 在循环还在跑的时候打印会得到一个中间态，那种数字最容易被当成结论抄进文档。
 // S2-01 起它接收**显式的聚合量**而不是 Reactor&：单 Reactor 传自己的、ReactorGroup
@@ -198,7 +218,8 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
                   std::size_t read_disarmed_connections, std::int64_t fd_start,
                   std::int64_t rss_start, long long elapsed_ms,
                   const l7gate::route::HealthTable* health = nullptr,
-                  const std::vector<std::string>& target_names = {}) {
+                  const std::vector<std::string>& target_names = {},
+                  const l7gate::route::NodesPublisher* nodes = nullptr) {
   const std::int64_t fd_now = count_open_fds();
   const std::int64_t rss_now = current_rss_kib();
   // 一行一个 key=value，键名用 ASCII。理由不是审美：这份输出是冒烟脚本的输入，
@@ -305,6 +326,12 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
       put(key + "last_ejection_epoch_ms", static_cast<long long>(s.last_ejection_epoch_ms));
     }
   }
+  if (nodes != nullptr) {
+    // S3-04 节点表的观测面（B-015 的"网关自报那一端"）。
+    put("nodes_reloads_ok", static_cast<long long>(nodes->reloads_ok()));
+    put("nodes_reloads_failed", static_cast<long long>(nodes->reloads_failed()));
+    put("nodes_last_publish_epoch_ms", static_cast<long long>(nodes->last_publish_epoch_ms()));
+  }
 }
 
 int serve(int argc, char** argv) {
@@ -324,6 +351,10 @@ int serve(int argc, char** argv) {
   // （八份 canonic 档 + B-007 + B-012 不作废的凭据就在这句上）。
   l7gate::config::GatewayConfig gateway_config;
   std::string config_path;
+  // S3-04（ADR-20）：节点表的 MySQL 来源。--nodes-schema 给了才启用。
+  bool have_nodes_schema = false;
+  l7gate::config::NodesDbParams nodes_params;
+  long long nodes_reload_ms = 5000;
 
   for (int i = 2; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -351,6 +382,38 @@ int serve(int argc, char** argv) {
         return 2;
       }
       config_path = value;
+      ++i;
+    } else if (flag == "--nodes-db" && value != nullptr) {
+      if (!parse_addr_port(value, &nodes_params.host, &nodes_params.port)) {
+        std::fprintf(stderr, "参数错误: --nodes-db 要的是 <host:port>，收到 %s\n", value);
+        return 2;
+      }
+      ++i;
+    } else if (flag == "--nodes-user" && value != nullptr) {
+      nodes_params.user = value;
+      ++i;
+    } else if (flag == "--nodes-password" && value != nullptr) {
+      nodes_params.password = value;
+      ++i;
+    } else if (flag == "--nodes-schema" && value != nullptr) {
+      nodes_params.database = value;
+      have_nodes_schema = true;
+      ++i;
+    } else if (flag == "--nodes-reload-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 86400000) {
+        std::fprintf(stderr, "参数错误: --nodes-reload-ms 要的是 0..86400000，收到 %s\n", value);
+        return 2;
+      }
+      nodes_reload_ms = n;
+      ++i;
+    } else if (flag == "--nodes-timeout-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 1 || n > 60000) {
+        std::fprintf(stderr, "参数错误: --nodes-timeout-ms 要的是 1..60000，收到 %s\n", value);
+        return 2;
+      }
+      nodes_params.timeout_ms = n;
       ++i;
     } else if (flag == "--serve-requests" && value != nullptr) {
       long long n = 0;
@@ -449,6 +512,56 @@ int serve(int argc, char** argv) {
           UpstreamEndpoint{endpoint.address, endpoint.port, endpoint.health_path});
     }
   }
+
+  // --- S3-04（ADR-20）：节点表装配 -----------------------------------------------
+  // 文件里声明了 source=mysql 的组，成员从 l7gate_nodes 读。启动时 MySQL 连不上
+  // **不退出**（mysql 组按空成员启动、LB 回 502，reload 恢复后补上——ADR-20 第五节）；
+  // 但"配置声明了 mysql 而网关没给 --nodes-schema"是配置矛盾，退出码 2。
+  std::shared_ptr<l7gate::route::NodesPublisher> nodes_publisher;
+  auto nodes_registry = std::make_shared<l7gate::route::TargetRegistry>();
+  std::vector<std::string> mysql_group_names;
+  for (std::uint16_t g = 0; g < static_cast<std::uint16_t>(gateway_config.groups().size()); ++g) {
+    const auto* group = gateway_config.groups().group_at(g);
+    if (group != nullptr && group->source_mysql) mysql_group_names.push_back(group->name);
+  }
+  if (!mysql_group_names.empty() && !have_nodes_schema) {
+    std::fprintf(stderr,
+                 "配置错误: 有组声明了 source=mysql 但没给 --nodes-schema（组成员没有来源）\n");
+    return 2;
+  }
+  if (!mysql_group_names.empty()) {
+    nodes_publisher = std::make_shared<l7gate::route::NodesPublisher>();
+    // 静态端点先 intern：它们的下标必须与文件端点表一一对应（0..E-1），
+    // ever-seen 的追加从这之后开始。
+    for (const l7gate::config::Endpoint& endpoint : gateway_config.endpoints()) {
+      nodes_registry->intern(
+          l7gate::route::NodeTarget{endpoint.address, endpoint.port, endpoint.health_path});
+    }
+    l7gate::config::NodesStore store{nodes_params};
+    l7gate::route::NodesFetch fetch;
+    std::string why;
+    if (store.fetch(mysql_group_names, &fetch, &why)) {
+      auto view = l7gate::route::build_nodes_view(gateway_config.groups(), fetch,
+                                                  *nodes_registry, &why);
+      if (view != nullptr) {
+        nodes_publisher->publish(view);
+        nodes_publisher->note_reload(true, wall_ms(), 0);
+      } else {
+        std::fprintf(stderr, "节点表装配失败（按空成员启动）: %s\n", why.c_str());
+      }
+    } else {
+      std::fprintf(stderr, "启动时 MySQL 不可用（mysql 组按空成员启动，reload 恢复后补上）: %s\n",
+                   why.c_str());
+    }
+    // worker 的初始目标表 = 注册表现状（静态 + 已到岗成员）；之后的增员走对账 tick。
+    upstream_endpoints.clear();
+    for (std::uint16_t i = 0; i < nodes_registry->size(); ++i) {
+      const auto* node = nodes_registry->at(i);
+      if (node == nullptr) break;
+      upstream_endpoints.push_back(
+          UpstreamEndpoint{node->address, node->port, node->health_path});
+    }
+  }
   // 单 Reactor 路径（workers < 2）只有一条循环。它的默认目标是第 0 个端点；装了路由/均衡
   // 就会按请求连到策略指的那个。不给它做"一个 worker 自己轮换多端点"的机制照旧成立——
   // 轮换就是没有理由的选择，理由是策略给的，不是循环自己编的。
@@ -463,14 +576,67 @@ int serve(int argc, char** argv) {
   // 同一份，摘除的账才只有一个答案。
   std::shared_ptr<l7gate::route::HealthTable> health_table;
   if (gateway_config.health().present) {
-    health_table = std::make_shared<l7gate::route::HealthTable>(upstream_endpoints.size(),
-                                                                gateway_config.health().policy);
+    // 节点表启用时健康表按**下标空间全量**开容量（ever-seen：新成员只"启用"新槽位，
+    // 不 resize 共享表——ADR-20 第四节）。纯文件配置维持"容量 = 成员数"的现状，
+    // 一字节不多花。
+    const std::size_t capacity =
+        nodes_publisher != nullptr
+            ? static_cast<std::size_t>(l7gate::route::kMaxUpstreamTarget) + 1
+            : 0;
+    health_table = std::make_shared<l7gate::route::HealthTable>(
+        upstream_endpoints.size(), gateway_config.health().policy, capacity);
   }
   // 逐目标健康计数器的键名后缀（health_t0_127_0_0_1_18081_ejections=…）。
   std::vector<std::string> health_target_names;
   health_target_names.reserve(upstream_endpoints.size());
   for (const UpstreamEndpoint& endpoint : upstream_endpoints) {
     health_target_names.push_back(endpoint.address + "_" + std::to_string(endpoint.port));
+  }
+
+  // S3-04（ADR-20 第四节）：reload 线程。MySQL 查询是阻塞 IO，不进 worker 事件循环；
+  // 它与 worker 的唯一接触面是 NodesPublisher 那根原子快照指针。成员没变就不发布：
+  // 查了一遍不等于发布了一次，观测面不把两者混成同一个数。
+  std::thread nodes_reload_thread;
+  std::atomic<bool> nodes_stop{false};
+  if (nodes_publisher != nullptr && nodes_reload_ms > 0) {
+    nodes_reload_thread = std::thread([&] {
+      const l7gate::config::NodesStore store{nodes_params};
+      std::string last_signature;
+      while (!nodes_stop.load(std::memory_order_relaxed)) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(nodes_reload_ms);
+        while (!nodes_stop.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (nodes_stop.load(std::memory_order_relaxed)) break;
+        l7gate::route::NodesFetch fetch;
+        std::string why;
+        const std::int64_t started = wall_ms();
+        if (!store.fetch(mysql_group_names, &fetch, &why)) {
+          nodes_publisher->note_reload(false, started, wall_ms() - started);
+          std::fprintf(stderr, "节点表 reload 失败（保留上一份）: %s\n", why.c_str());
+          continue;
+        }
+        std::string signature;
+        for (const auto& group : fetch.groups) {
+          for (const auto& member : group.members) {
+            signature += group.name + "|" + member.endpoint_key() + "|" + member.health_path + ";";
+          }
+        }
+        if (signature == last_signature) continue;
+        auto view = l7gate::route::build_nodes_view(gateway_config.groups(), fetch,
+                                                    *nodes_registry, &why);
+        if (view == nullptr) {
+          nodes_publisher->note_reload(false, started, wall_ms() - started);
+          std::fprintf(stderr, "节点表快照装配失败（保留上一份）: %s\n", why.c_str());
+          continue;
+        }
+        nodes_publisher->publish(view);
+        last_signature = signature;
+        nodes_publisher->note_reload(true, wall_ms(), wall_ms() - started);
+      }
+    });
   }
 
   // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
@@ -484,6 +650,7 @@ int serve(int argc, char** argv) {
     gconfig.route_table = has_routes ? &gateway_config.routes() : nullptr;
     gconfig.groups = has_groups ? &gateway_config.groups() : nullptr;
     gconfig.health = health_table;
+    gconfig.nodes = nodes_publisher;
     gconfig.listen_backlog = config.listen_backlog;
     gconfig.worker_count = workers;
     gconfig.max_connections_per_worker = config.max_connections;
@@ -532,12 +699,20 @@ int serve(int argc, char** argv) {
                     static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
                     health_table->target_count());
       }
+      if (nodes_publisher != nullptr) {
+        std::printf("[serve] nodes=on schema=%s host=%s:%u reload_ms=%lld timeout_ms=%lld "
+                    "mysql_groups=%zu\n",
+                    nodes_params.database.c_str(), nodes_params.host.c_str(), nodes_params.port,
+                    nodes_reload_ms, static_cast<long long>(nodes_params.timeout_ms), mysql_group_names.size());
+      }
     }
     std::fflush(stdout);
 
     const auto started = std::chrono::steady_clock::now();
     const std::uint64_t batches = group.run();
     g_group_for_signal.store(nullptr, std::memory_order_relaxed);
+    nodes_stop.store(true, std::memory_order_relaxed);
+    if (nodes_reload_thread.joinable()) nodes_reload_thread.join();
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
@@ -545,7 +720,7 @@ int serve(int argc, char** argv) {
     report_stats(group.stats(), group.epoll_registrations(), group.epoll_unregistrations(),
                  group.epoll_modifications(), group.connections_with_read_disarmed(), fd_start,
                  rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
-                 health_target_names);
+                 health_target_names, nodes_publisher.get());
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
     return 0;
@@ -562,6 +737,7 @@ int serve(int argc, char** argv) {
   }
   // 同一条构造期纪律：健康表在 Reactor 构造之前进 config（Reactor 存 config 的副本）。
   config.health = health_table;
+  config.nodes = nodes_publisher;
   l7gate::net::Reactor reactor(config);
   // 链只能在 run() 之前改（S1-08 那条时序纪律：链在循环线程里被逐条读、没有锁）。
   // 顺序 = 路由在前、均衡在后——均衡读的那个组下标正是路由这一环写下的。
@@ -571,7 +747,7 @@ int serve(int argc, char** argv) {
   }
   if (lb_state != nullptr) {
     reactor.add_request_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(
-        gateway_config.groups(), std::move(lb_state), health_table));
+        gateway_config.groups(), std::move(lb_state), health_table, nodes_publisher));
   }
   int error = 0;
   if (!reactor.start_listen(&error)) {
@@ -610,12 +786,20 @@ int serve(int argc, char** argv) {
                   static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
                   health_table->target_count());
     }
+    if (nodes_publisher != nullptr) {
+      std::printf("[serve] nodes=on schema=%s host=%s:%u reload_ms=%lld timeout_ms=%lld "
+                  "mysql_groups=%zu\n",
+                  nodes_params.database.c_str(), nodes_params.host.c_str(), nodes_params.port,
+                  nodes_reload_ms, static_cast<long long>(nodes_params.timeout_ms), mysql_group_names.size());
+    }
   }
   std::fflush(stdout);
 
   const auto started = std::chrono::steady_clock::now();
   const std::uint64_t batches = reactor.run();
   g_reactor_for_signal.store(nullptr, std::memory_order_relaxed);
+  nodes_stop.store(true, std::memory_order_relaxed);
+  if (nodes_reload_thread.joinable()) nodes_reload_thread.join();
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - started)
                               .count();
@@ -625,7 +809,7 @@ int serve(int argc, char** argv) {
   report_stats(reactor.stats(), reactor.epoll_registrations(), reactor.epoll_unregistrations(),
                reactor.epoll_modifications(), reactor.connections_with_read_disarmed(), fd_start,
                rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
-               health_target_names);
+               health_target_names, nodes_publisher.get());
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   return 0;
 }

@@ -15,6 +15,7 @@
 #include "net/stats.h"
 #include "route/balance.h"
 #include "route/health.h"
+#include "route/nodes.h"
 
 namespace l7gate::net {
 
@@ -84,6 +85,12 @@ class Reactor {
     // 单 Reactor（worker_group_size = 1）探全部目标。
     std::size_t worker_index = 0;
     std::size_t worker_group_size = 1;
+
+    // S3-04（ADR-20 第四节）：节点表发布器。**nullptr = 不跑 reload**（纯文件配置，
+    // 零行为差异）。非 null 时循环的对账 tick 读快照：ever-seen 目标只增不减，
+    // 新目标在本 worker 线程里追加进 `upstream_targets` / 池桶 / 配对账 /
+    // 探活槽位（四个面都是 owner 线程私有的，扩容无竞争）。
+    std::shared_ptr<const l7gate::route::NodesPublisher> nodes;
 
     int listen_backlog = 1024;
     // fd 预算。超过就直接把新连接关掉而不是排队：一个网关在 fd 耗尽时的正确
@@ -387,16 +394,16 @@ class Reactor {
   void note_health_failure(std::uint16_t target) noexcept;
   void note_health_success(std::uint16_t target) noexcept;
 
-  // --- 主动探活（S3-03，ADR-19 追加第四条；已裁第 3 条③）------------------------
+  // --- S3-03 主动探活（S3-03，ADR-19 追加第四条；已裁第 3 条③）------------------------
   // 探活连接**不是** `Connection`：它没有配对下游、没有业务帧、不进业务计数
   // （requests_parsed/responses_completed 对它永远不动——这条是验收，不是注释）。
   // 它是本 worker 循环线程私有的小型状态机，fd 注册在**同一个** epoll 上，
   // 事件分发靠 user_data 低位标签与连接对象区分（见 handle_events 与 kProbeTagBit）。
   //
-  // 槽位在构造时按"本 worker 负责探的目标数"定长（**运行期不 push/erase**——
-  // user_data 里存的是 Probe*，vector 一搬家事件批里就全是悬垂指针；定长 + 槽位
-  // 复用让地址永远稳定，这是注册表反查之外的另一层防护）。每个槽同一时刻至多一条
-  // 在飞探活；上一条没回来时到点的新探活跳过（下一拍再试）。
+  // user_data 里编码的是**槽位下标**（`(index << 1) | 1`，不是指针）：S3-04 的
+  // ever-seen 增员会让槽位表追加（grow_probe_slots），vector 搬家不会让下标失效——
+  // 这是把"地址稳定"换成"下标稳定"的原因。槽位只追加、永不 erase（finish 只把槽
+  // 清回 kIdle），下标与槽位一一对应到析构为止。
   struct Probe {
     enum class Phase : std::uint8_t {
       kIdle,        // 槽位空闲
@@ -423,6 +430,13 @@ class Reactor {
   void on_probe_event(std::size_t slot, std::uint32_t revents) noexcept;
   // 构造期把探活槽位表定长（健康表在、探活间隔 > 0 才建；分派规则 target % group == index）。
   void build_probe_slots() noexcept;
+  // S3-04：ever-seen 增员的对账。**只在 owner 循环线程调用**（tick 与 ensure_upstream
+  // 的懒对账两个入口）：读发布器快照，把新目标追加进四个 owner 线程私有的面
+  // （upstream_targets / 池桶 / 配对账 / 探活槽位）+ 共享健康表的启用数。
+  // 空转成本 = 一次原子 load + 一次长度比较，没有新成员时为零。
+  void sync_nodes_snapshot() noexcept;
+  // 为对账后新出现的目标追加探活槽（延续 build_probe_slots 的分派规则）。
+  void grow_probe_slots(std::size_t from_target, std::size_t to_target) noexcept;
 
   // --- 负载均衡的配对账（S3-02，ADR-19 第四条）--------------------------------------
   // 尺子是"当前被配给下游的上游连接条数"，不是"这个后端有多少条连接"——池里空闲的那条

@@ -47,8 +47,10 @@ std::optional<std::string_view> find_header(std::span<const l7gate::http::Header
 
 LoadBalanceFilter::LoadBalanceFilter(const route::GroupTable& table,
                                      std::shared_ptr<route::LbState> state,
-                                     std::shared_ptr<const route::HealthTable> health) noexcept
-    : table_(table), state_(std::move(state)), health_(std::move(health)) {}
+                                     std::shared_ptr<const route::HealthTable> health,
+                                     std::shared_ptr<const route::NodesPublisher> nodes) noexcept
+    : table_(table), state_(std::move(state)), health_(std::move(health)),
+      nodes_(std::move(nodes)) {}
 
 const std::vector<std::uint16_t>& LoadBalanceFilter::candidates_for(
     const route::UpstreamGroup& group) {
@@ -70,7 +72,16 @@ Decision LoadBalanceFilter::on_request(RequestInfo& info) {
   if (info.upstream_group == route::kNoUpstreamGroup) {
     return Decision::kContinue;  // 没人决定过组：交给 reactor 的默认目标，这一环不表态
   }
-  const route::UpstreamGroup* group = table_.group_at(info.upstream_group);
+  // 节点表 reload（S3-04，ADR-20 第四节）：有发布器且已有快照时，**每请求 load 一根
+  // 指针**——组表读的是当前快照，不是构造给的那份。快照的下标顺序 = 文件顺序
+  // （build_nodes_view 的保证），所以 `upstream_group` 的值在换表前后是同一个组。
+  const route::GroupTable* current_table = &table_;
+  std::shared_ptr<const route::NodesView> snapshot;
+  if (nodes_ != nullptr) {
+    snapshot = nodes_->load();
+    if (snapshot != nullptr) current_table = &snapshot->groups;
+  }
+  const route::UpstreamGroup* group = current_table->group_at(info.upstream_group);
   if (group == nullptr || group->targets.empty() || state_ == nullptr) {
     info.reject_status = kBrokenConfigStatus;
     return Decision::kStop;

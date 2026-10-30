@@ -321,6 +321,10 @@ std::uint64_t Reactor::run() {
       if (config_.health->policy().probe_interval_ms > 0) health_tick(now);
     }
 
+    // S3-04 节点表对账（ADR-20 第四节）：reload 发布的新成员在这里进入本 worker。
+    // 无发布器时是空转前的一次判空，成本为零。
+    sync_nodes_snapshot();
+
     if (config_.stop_after_requests > 0 &&
         stats_.requests_parsed.load(std::memory_order_relaxed) >= config_.stop_after_requests) {
       // 这条 break **不排水**：它的语义是"解析满 N 条就停循环"，帮助文本一直明写着
@@ -422,19 +426,12 @@ void Reactor::handle_events(const std::vector<Epoll::Event>& events) {
       continue;
     }
 
-    // 探活的 user_data 低位被 OR 成 1（见 start_probe）。连接对象只能出自 make_shared，
-    // 对齐 ≥ 8、最低位恒为 0，所以这一位不会与真实 Connection* 撞上。
-    // 还原成 Probe* 后按地址在槽位表里认人——槽位定长不复用地址，认不到的
-    // （理论上不可能）按陈旧事件丢掉，与注册表反查同一条纪律。
+    // 探活的 user_data 低位被 OR 成 1（见 Probe 的注释）：还原出**槽位下标**而不是
+    // 指针——槽位表会因 ever-seen 增员追加（vector 搬家不动下标）。越界的下标
+    // （理论上不可能：槽位只增不删）按陈旧事件丢掉，与注册表反查同一条纪律。
     if ((reinterpret_cast<std::uintptr_t>(ev.user_data) & 1u) != 0) {
-      auto* slot_ptr = reinterpret_cast<Probe*>(
-          reinterpret_cast<std::uintptr_t>(ev.user_data) & ~static_cast<std::uintptr_t>(1));
-      for (std::size_t i = 0; i < probes_.size(); ++i) {
-        if (&probes_[i] == slot_ptr) {
-          on_probe_event(i, ev.events);
-          break;
-        }
-      }
+      const std::size_t slot = reinterpret_cast<std::uintptr_t>(ev.user_data) >> 1;
+      if (slot < probes_.size()) on_probe_event(slot, ev.events);
       continue;
     }
 
@@ -691,6 +688,11 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   // 索引目标表之前先认这条下标。`upstream_target` 是 filter 写回来的值（见链调用点），
   // 而这里的失败形态不是"回错一个后端"而是越界读，所以检查必须在索引它的那一处。
   if (upstream_target >= config_.upstream_targets.size()) {
+    // S3-04：filter 可能拿到了比对账 tick 更新的快照（发布发生在两次 tick 之间）。
+    // 先懒对账一次再判——对账在 owner 线程做，没有竞争；仍然越界才是真的装配漏检。
+    sync_nodes_snapshot();
+  }
+  if (upstream_target >= config_.upstream_targets.size()) {
     return nullptr;  // 装配漏检：当作"这一轮拿不到上游"，请求留在下游缓冲里，
                      // 不猜一个目标把请求发出去（猜 = 把配置错误读成后端脾气）。
   }
@@ -824,16 +826,40 @@ void Reactor::note_health_success(std::uint16_t target) noexcept {
 
 void Reactor::build_probe_slots() noexcept {
   if (config_.health == nullptr || config_.health->policy().probe_interval_ms <= 0) return;
+  grow_probe_slots(0, config_.upstream_targets.size());
+}
+
+void Reactor::grow_probe_slots(std::size_t from_target, std::size_t to_target) noexcept {
+  if (config_.health == nullptr || config_.health->policy().probe_interval_ms <= 0) return;
   const std::size_t group = config_.worker_group_size == 0 ? 1 : config_.worker_group_size;
-  for (std::size_t t = 0; t < config_.upstream_targets.size(); ++t) {
+  for (std::size_t t = from_target; t < to_target && t < config_.upstream_targets.size(); ++t) {
     if (t % group != config_.worker_index % group) continue;
     probe_targets_.push_back(t);
-    probe_next_due_ms_.push_back(0);  // 0 = 立即到期：循环第一拍就探一轮
+    probe_next_due_ms_.push_back(0);  // 0 = 立即到期：下一拍就探新成员
+    probes_.emplace_back();           // 槽位只追加：user_data 编码的是下标，搬家不失效
   }
-  // **槽位表到此定长**：user_data 里存的是 &probes_[i]，vector 搬家/erase 都会让
-  // 事件批里已排队的指针悬垂。定长 + 槽位复用（finish 只把槽清回 kIdle，不删元素）
-  // 让地址永远稳定，这是注册表反查之外的第二层防护。
-  probes_.resize(probe_targets_.size());
+}
+
+void Reactor::sync_nodes_snapshot() noexcept {
+  if (config_.nodes == nullptr) return;
+  const std::shared_ptr<const route::NodesView> view = config_.nodes->load();
+  if (view == nullptr) return;
+  const std::size_t seen = view->targets.size();
+  if (seen <= config_.upstream_targets.size()) return;  // 空转：一次原子 load + 一次比较
+  // ever-seen 只增：新目标在本 worker 线程里追加进四个私有面 + 共享健康表的启用数。
+  const std::size_t prev = config_.upstream_targets.size();
+  for (std::size_t t = prev; t < seen; ++t) {
+    const route::NodeTarget& node = view->targets[t];
+    Config::Target target;
+    target.address = node.address;
+    target.port = node.port;
+    target.health_path = node.health_path;
+    config_.upstream_targets.push_back(target);
+  }
+  upstream_pool_.resize(seen);
+  if (config_.lb_state != nullptr) config_.lb_state->ensure_capacity(seen);
+  if (config_.health != nullptr) config_.health->ensure_active(seen);
+  grow_probe_slots(prev, seen);
 }
 
 void Reactor::health_tick(std::int64_t now_ms) noexcept {
@@ -885,7 +911,7 @@ void Reactor::start_probe(std::size_t slot, std::int64_t now_ms) noexcept {
   p.phase = Probe::Phase::kConnecting;
   p.deadline_ms = now_ms + config_.health->policy().probe_timeout_ms;
   int error = 0;
-  void* tag = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+  void* tag = reinterpret_cast<void*>((static_cast<std::uintptr_t>(slot) << 1) | 1u);
   if (!epoll_.add(p.fd.get(), EPOLLOUT, tag, &error)) {
     config_.health->note_probe_result(static_cast<std::uint16_t>(index), false, now_ms, wall_ms());
     p.fd.close_now();
@@ -935,7 +961,7 @@ void Reactor::on_probe_event(std::size_t slot, std::uint32_t revents) noexcept {
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         int error = 0;
         void* tag = reinterpret_cast<void*>(
-            reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+            (static_cast<std::uintptr_t>(slot) << 1) | 1u);
         (void)epoll_.modify(p.fd.get(), EPOLLOUT, tag, &error);
         return;  // 等下一拍 EPOLLOUT
       }
@@ -947,7 +973,7 @@ void Reactor::on_probe_event(std::size_t slot, std::uint32_t revents) noexcept {
     p.phase = Probe::Phase::kReading;
     int error = 0;
     void* tag =
-        reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+        reinterpret_cast<void*>((static_cast<std::uintptr_t>(slot) << 1) | 1u);
     (void)epoll_.modify(p.fd.get(), EPOLLIN, tag, &error);
   }
 
