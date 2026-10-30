@@ -14,6 +14,7 @@
 #include "net/fd.h"
 #include "net/stats.h"
 #include "route/balance.h"
+#include "route/health.h"
 
 namespace l7gate::net {
 
@@ -52,6 +53,9 @@ class Reactor {
     struct Target {
       std::string address = "127.0.0.1";
       std::uint16_t port = 0;
+      // S3-03（ADR-19 追加第四条）：这个目标的主动探活路径（默认 "/"）。探活是
+      // 后端的属性，不是组的属性——同一台后端被两个组引用时它只有一台机器、一个探活。
+      std::string health_path = "/";
     };
     // 空表 = 没配上游（与 S2 时代 `upstream_port == 0` 同一口径，`ensure_upstream`
     // 那条短路一致）。**没有 filter 表态时一律用 `default_target`**，而 ReactorGroup
@@ -65,6 +69,21 @@ class Reactor {
     // `shared_ptr` 不表示跨线程共享：持有者是 reactor 的记账路径与 `LoadBalanceFilter`，
     // 两者都在同一个 worker 的循环线程里跑（ADR-14 的红线；理由见 ADR-19「为什么」第一条）。
     std::shared_ptr<l7gate::route::LbState> lb_state;
+
+    // S3-03（ADR-12 落地 + ADR-19 追加第四条）：健康状态表。**nullptr = 健康检查整套
+    // 不装配**（S3-02 形状，行为逐字节不变；所有既有用例与压测都是这一格）。
+    // 与 `ReactorStats` 同一类共享面：全原子、同组全部 worker 指向同一份——
+    // "这个后端死没死"是关于后端的事实，不是策略；策略才 per-worker。
+    // 它不承载 fd、不承载连接对象，所以 ADR-14 的接触面不因它变大。
+    std::shared_ptr<l7gate::route::HealthTable> health;
+
+    // S3-03 主动探活的分派（已裁第 3 条③：探活连接归 owner worker 的事件循环，
+    // 不开独立探活线程）。本 worker 只探 `target % worker_group_size == worker_index`
+    // 的那些目标——16 个 worker 对同一台后端各探各的会把探活流量放大 16 倍，
+    // 而健康状态本来就在共享表里，一份探活结论全组都看得见。
+    // 单 Reactor（worker_group_size = 1）探全部目标。
+    std::size_t worker_index = 0;
+    std::size_t worker_group_size = 1;
 
     int listen_backlog = 1024;
     // fd 预算。超过就直接把新连接关掉而不是排队：一个网关在 fd 耗尽时的正确
@@ -361,6 +380,50 @@ class Reactor {
   std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) noexcept;
   const std::vector<std::shared_ptr<Connection>>* pool_bucket(std::uint16_t target) const noexcept;
 
+  // --- 健康检查（S3-03，ADR-12 落地）--------------------------------------------
+  // 被动失败的记账点只有四个（连不上 / 头之前断 / 头坏 / 5xx），成功一个（< 500 的
+  // 完整头）。记账点少是刻意的：这类计数一旦散开写，就有"少记一次"的分支在等着。
+  // `config_.health` 为空时两者都是 no-op——所有既有路径不为健康检查付费。
+  void note_health_failure(std::uint16_t target) noexcept;
+  void note_health_success(std::uint16_t target) noexcept;
+
+  // --- 主动探活（S3-03，ADR-19 追加第四条；已裁第 3 条③）------------------------
+  // 探活连接**不是** `Connection`：它没有配对下游、没有业务帧、不进业务计数
+  // （requests_parsed/responses_completed 对它永远不动——这条是验收，不是注释）。
+  // 它是本 worker 循环线程私有的小型状态机，fd 注册在**同一个** epoll 上，
+  // 事件分发靠 user_data 低位标签与连接对象区分（见 handle_events 与 kProbeTagBit）。
+  //
+  // 槽位在构造时按"本 worker 负责探的目标数"定长（**运行期不 push/erase**——
+  // user_data 里存的是 Probe*，vector 一搬家事件批里就全是悬垂指针；定长 + 槽位
+  // 复用让地址永远稳定，这是注册表反查之外的另一层防护）。每个槽同一时刻至多一条
+  // 在飞探活；上一条没回来时到点的新探活跳过（下一拍再试）。
+  struct Probe {
+    enum class Phase : std::uint8_t {
+      kIdle,        // 槽位空闲
+      kConnecting,  // connect 已发起，等 EPOLLOUT 上的 SO_ERROR
+      kSending,     // 已连上，GET 还没写完（部分写）
+      kReading,     // 请求写完，等响应头
+    };
+    UniqueFd fd;
+    Phase phase = Phase::kIdle;
+    std::int64_t deadline_ms = 0;  // 单调毫秒：连接 + 发送 + 响应头共用这一个预算
+    // 探活请求在 start_probe 里一次成型，kSending 阶段从这里部分写出。
+    static constexpr std::size_t kProbeRequestBytes = 512;
+    char request[kProbeRequestBytes];
+    std::size_t request_len = 0;
+    std::size_t request_written = 0;
+    std::size_t response_filled = 0;
+    // 响应头预算。探活只认状态行，2 KiB 覆盖任何讲道理的头；超预算 = 判死。
+    static constexpr std::size_t kProbeBufferBytes = 2048;
+    char response[kProbeBufferBytes];
+  };
+  void health_tick(std::int64_t now_ms) noexcept;
+  void start_probe(std::size_t slot, std::int64_t now_ms) noexcept;
+  void finish_probe(std::size_t slot, bool alive) noexcept;
+  void on_probe_event(std::size_t slot, std::uint32_t revents) noexcept;
+  // 构造期把探活槽位表定长（健康表在、探活间隔 > 0 才建；分派规则 target % group == index）。
+  void build_probe_slots() noexcept;
+
   // --- 负载均衡的配对账（S3-02，ADR-19 第四条）--------------------------------------
   // 尺子是"当前被配给下游的上游连接条数"，不是"这个后端有多少条连接"——池里空闲的那条
   // 不算负载（它闲着的，这正是 least_conn 想看见的事）。
@@ -442,6 +505,13 @@ class Reactor {
   // 出向缓冲刷完之前，这条 fd 一直带着 EPOLLOUT。放在 map 外面单独记没有意义，
   // 状态就在连接对象自己身上（state + outbound 是否为空），这里不重复。
   std::atomic<bool> running_{false};
+
+  // --- S3-03 探活槽位表 --------------------------------------------------------
+  // 下标 = probe_targets_ 的下标，probe_targets_[i] 是第 i 个槽负责的目标下标；
+  // probes_[i] 是它的在飞状态（kIdle = 没有在飞探活）。两表都在构造时定长。
+  std::vector<std::size_t> probe_targets_;
+  std::vector<std::int64_t> probe_next_due_ms_;
+  std::vector<Probe> probes_;
   // 停止请求独立于"循环在不在跑"。两个状态合成一个的原因我踩过一次：
   // 用 running_ 同时表达"我在循环里"和"我还没被要求停"，那么 run() 开头的
   // store(true) 就会把在那之前送达的 stop() 抹掉，循环再也不停。

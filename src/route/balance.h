@@ -148,4 +148,17 @@ bool build_hash_ring(UpstreamGroup* group, const std::vector<std::string>& endpo
 std::optional<std::uint16_t> select_from_ring(const UpstreamGroup& group,
                                               std::string_view key) noexcept;
 
+// 带候选集的环查找（S3-03）：从 hash(key) 落点起顺时针走，**跳过不在候选集里的成员的点**，
+// 最多绕环一整圈；全员的点都不在候选集里返回 nullopt（调用方回退到全员集合）。
+// 候选集 = 全体成员时结果与两参版本逐点相同——健康检查没摘任何人时零行为差异。
+// 候选集必须按成员下标升序给（`is_member` 用二分；乱序的候选集是调用方的装配错误，
+// 二分查不到会把"被摘除的成员"当成健康的放回来——那是摘除语义整体的失败）。
+std::optional<std::uint16_t> select_from_ring(const UpstreamGroup& group, std::string_view key,
+                                              const std::vector<std::uint16_t>& candidates) noexcept;
+
+// 候选集判成员（二分）。lb_filter 的三个策略共用这一个谓词：候选集"是不是升序"
+// 只在这一处被依赖，注释只需要写在这里。
+bool is_candidate(const std::vector<std::uint16_t>& sorted_candidates,
+                  std::uint16_t target) noexcept;
+
 }  // namespace l7gate::route

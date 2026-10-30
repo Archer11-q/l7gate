@@ -59,7 +59,7 @@ void usage(std::FILE* out) {
       "l7gate_test_upstream —— 冒烟/联调用极简上游（只服务测试，不参与任何 SLO 测量）\n"
       "用法: l7gate_test_upstream [--listen <ipv4:port>]   (端口 0 = 内核选，默认)\n"
       "               [--body-bytes N] [--delay-ms N] [--close-after-first-response]\n"
-      "               [--fixed-body TEXT] [--stall-reads-ms N]\n"
+      "               [--fixed-body TEXT] [--stall-reads-ms N] [--path-status PREFIX:CODE]\n"
       "行为: 凑齐一个完整请求（\\r\\n\\r\\n 再加 Content-Length 那么多 body）就回一段\n"
       "      Content-Length 已知的 200，正文形如 seq=<累计条数>....，序号用来发现串号。\n"
       "--fixed-body 把正文钉成同一个字符串：S1-06 要证\"直连与经网关逐字节一致\"，\n"
@@ -86,6 +86,8 @@ int main(int argc, char** argv) {
   long stall_reads_ms = 0;
   bool close_after = false;
   std::string fixed_body;  // 空 = 不钉，继续用带 seq 的模板体
+  std::string path_status_prefix;
+  int path_status_code = 0;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -119,6 +121,19 @@ int main(int argc, char** argv) {
       ++i;
     } else if (flag == "--close-after-first-response") {
       close_after = true;
+    } else if (flag == "--path-status" && value != nullptr) {
+      // 形如 /gone:404：命中该前缀的请求回固定状态码（S3-03 探活与被动 5xx 的可控上游形态）。
+      const std::string_view spec = value;
+      const std::size_t sep = spec.rfind(':');
+      long code = 0;
+      if (sep == std::string_view::npos || spec.empty() || spec[0] != '/' ||
+          !parse_bounded(std::string(spec.substr(sep + 1)).c_str(), 100, 599, &code)) {
+        std::fprintf(stderr, "参数错误: --path-status 要的是 <前缀>:<100..599>，收到 %s\n", value);
+        return 2;
+      }
+      path_status_prefix = std::string(spec.substr(0, sep));
+      path_status_code = static_cast<int>(code);
+      ++i;
     } else if (flag == "--help" || flag == "-h") {
       usage(stdout);
       return 0;
@@ -141,6 +156,9 @@ int main(int argc, char** argv) {
   upstream.set_stall_reads_first_ms(static_cast<int>(stall_reads_ms));
   upstream.set_close_after_first_response(close_after);
   if (!fixed_body.empty()) upstream.set_fixed_response_body(fixed_body);
+  if (!path_status_prefix.empty()) {
+    upstream.set_path_status(path_status_prefix, path_status_code);
+  }
   std::string failure;
   if (!upstream.start(&failure, listen_address, listen_port)) {
     std::fprintf(stderr, "上游启动失败: %s\n", failure.c_str());

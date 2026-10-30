@@ -150,6 +150,7 @@ add_library(l7gate_core STATIC
   src/http/response_framing.cc
   src/http/response_head.cc
   src/route/balance.cc
+  src/route/health.cc
   src/route/router.cc
 )
 target_include_directories(l7gate_core PUBLIC src)

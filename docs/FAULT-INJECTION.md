@@ -297,3 +297,22 @@ clang 21 放不过**，所以 `asan-ubsan` 与 `tsan` 两个 preset 从我接手
 119,998 ms 的真稳态窗口，但那一轮被工具自己判成"没资格进文档"。
 **处置**：B-013 的配额按"窗口内真吃得完"定标（直连 100k/conn、经网关 18k/conn、稳态门 ≥50 s），
 六轮全部 `rc=0`、✗ 计数 0；**B-012 要不要按同一定标复测是项目所有人的裁决**，我不回头改已记的数。
+
+## 10. S3-03 的阳性验证（2026-10-30，健康检查这一层）
+
+**先说立场**：§8/§9 的尺子原样用——每条断言单独打红过一次，改回即全绿，
+`grep -rn 'TEMP-POSITIVE' src/ tests/` 是 0 条。
+
+| 我把代码改成什么 | 哪条用例该红 | 实测 |
+|---|---|---|
+| `least_conn` 平手分支改回"取成员顺序第一条"（ADR-19 追加三的旧规则） | `S3_03_LeastConnTie.FullTieRotatesWithinTheTiedSet` + 两条 `S3_02_LoadBalance.LeastConnections*` 端到端 | **三条红**。纯函数那条是 B-013 那条落盘今天缺的断言（平手集合内不轮转 → 12 条全落成员 0）；端到端两条红在"第二条没有配对到轮询该给的下一个" |
+| `candidates_for` 直接回全员（摘除对候选集不生效） | `S3_03_Candidates.RoundRobinRotatesOnlyWithinCandidates`、`...LeastConnSkipsEjectedEvenWhenIdlest` | **两条红**（被摘除的成员照常接到流量 / "最闲但被摘"的成员被选中）。`AllEjectedFallsBackToFullMemberSet` 照绿——它证的是回退路径，本就不经过候选集过滤 |
+| 探活判据把 4xx 判死（`status < 400`） | `S3_03_HealthE2E.ProbesKeepA404BackendAliveWithoutTouchingBusinessCounters` | **一条红**：固定回 404 的后端在 3 s 内被摘——"一次路径配错引发全量摘除"就是这行代码写的 |
+| 安全阀检查短路（`if (false && ejected_now >= …)`） | `S3_03_Health.ValveCapsEjectionAtConfiguredPercent` + `S3_03_HealthE2E.ValveCapsEjectionWhenEveryBackendFails` | **两条红**：纯函数那条 10 台全摘（期望恰好 1），e2e 那条 `ejected_now=2` 越过 floor(2×50%) |
+| 5xx 失败不记账（条件恒假 → 全记成功） | `S3_03_HealthE2E.PassiveFiveXxEjectsAndFailTimeoutRevives` | **一条红**：两次 503 后没有被摘，被动判据形同虚设 |
+
+**工具侧发现（照记，防复发）**：打红之后"改回"这一步我自己错了两次——还原的 `sed` 只删掉了
+`// TEMP-POSITIVE` 注释、没还原被改的条件（`status < 400` 与 `if (false && …)` 原样留在代码里），
+全套 246 条里就有两条持续红。**"删掉标记"不等于"还原了改动"**：临时改动的还原必须以
+`git diff`（或对拍原句）为准，不是以标记注释消失为准。这条与 §8 的"阳性验证要真打红"是
+同一族纪律的另一半：红要红得真，绿也要绿得真。

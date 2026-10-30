@@ -6,6 +6,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -93,7 +94,7 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     *error = "配置顶层必须是对象（有 upstreams 与 routes 两个键）";
     return false;
   }
-  if (!forbid_unknown(document, {"upstreams", "routes"}, error, "配置顶层")) return false;
+  if (!forbid_unknown(document, {"upstreams", "routes", "health"}, error, "配置顶层")) return false;
 
   const JsonValue* upstreams = nullptr;
   if (!need(document, "upstreams", JsonValue::Kind::kArray, &upstreams, error, "配置顶层")) {
@@ -104,14 +105,25 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     return false;
   }
 
-  auto find_or_add_endpoint = [&](const Endpoint& endpoint) -> std::uint16_t {
+  // 返回去重后的目标下标；失败（下标空间用尽 / 同一后端两个 health_path）写 *why。
+  auto find_or_add_endpoint = [&](const Endpoint& endpoint,
+                                  std::string* why) -> std::optional<std::uint16_t> {
     for (std::size_t i = 0; i < out->endpoints_.size(); ++i) {
       if (out->endpoints_[i].address == endpoint.address && out->endpoints_[i].port == endpoint.port) {
+        // 去重的 S3-03 补充（ADR-19 追加第四条）：同一台后端只允许一个探活定义。
+        // 两个组给同一台机器配了不同的 health_path，"活着"就有两个答案——拒绝。
+        if (out->endpoints_[i].health_path != endpoint.health_path) {
+          *why = "同一后端 " + endpoint.address + ":" + std::to_string(endpoint.port) +
+                 " 在两处带着不同的 health_path（\"" + out->endpoints_[i].health_path +
+                 "\" 与 \"" + endpoint.health_path + "\"）：一台机器不能有两个\"活着\"的定义";
+          return std::nullopt;
+        }
         return static_cast<std::uint16_t>(i);
       }
     }
     if (out->endpoints_.size() > static_cast<std::size_t>(route::kMaxUpstreamTarget)) {
-      return route::kNoUpstreamTarget;  // 下标空间用尽；调用方负责报错
+      *why = "目标下标空间用尽（上限 " + std::to_string(route::kMaxUpstreamTarget) + "）";
+      return std::nullopt;
     }
     out->endpoints_.push_back(endpoint);
     return static_cast<std::uint16_t>(out->endpoints_.size() - 1);
@@ -177,7 +189,7 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
         *error = mwhere + " 不是对象，读到的是" + member.kind_name();
         return false;
       }
-      if (!forbid_unknown(member, {"address", "port"}, error, mwhere)) return false;
+      if (!forbid_unknown(member, {"address", "port", "health_path"}, error, mwhere)) return false;
       const JsonValue* address = nullptr;
       const JsonValue* port = nullptr;
       if (!need(member, "address", JsonValue::Kind::kString, &address, error, mwhere)) return false;
@@ -190,13 +202,27 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
         *error = mwhere + " 的 port 要落在 1..65535";
         return false;
       }
-      const Endpoint endpoint{address->text, static_cast<std::uint16_t>(port->number)};
-      const std::uint16_t target = find_or_add_endpoint(endpoint);
-      if (target == route::kNoUpstreamTarget) {
-        *error = where + "：目标下标空间用尽（上限 " + std::to_string(route::kMaxUpstreamTarget) + "）";
+      std::string health_path = "/";
+      if (const JsonValue* path = member.find("health_path"); path != nullptr) {
+        if (path->kind != JsonValue::Kind::kString) {
+          *error = mwhere + " 的 health_path 必须是字符串，读到的是" + path->kind_name();
+          return false;
+        }
+        if (path->text.empty() || path->text[0] != '/') {
+          *error = mwhere + " 的 health_path 必须以 / 开头且非空（探活发的是 GET <path>），读到的是 \"" +
+                   path->text + "\"";
+          return false;
+        }
+        health_path = path->text;
+      }
+      const Endpoint endpoint{address->text, static_cast<std::uint16_t>(port->number), health_path};
+      std::string why;
+      const std::optional<std::uint16_t> target = find_or_add_endpoint(endpoint, &why);
+      if (!target.has_value()) {
+        *error = where + "：" + why;
         return false;
       }
-      if (!out->groups_.add_member(group_index, target)) {
+      if (!out->groups_.add_member(group_index, *target)) {
         *error = mwhere + " 与这个组里前面的成员指向同一个后端";
         return false;
       }
@@ -204,8 +230,7 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
   }
 
   // routes 段可以没有（`has_routes=false` → main.cc 一个 filter 都不装，链是空的）。
-  out->has_routes = document.find("routes") != nullptr;
-  if (const JsonValue* routes = document.find("routes"); routes != nullptr) {
+  out->has_routes = document.find("routes") != nullptr;  if (const JsonValue* routes = document.find("routes"); routes != nullptr) {
     if (!routes->is_array()) {
       *error = std::string("routes 必须是数组，读到的是") + routes->kind_name();
       return false;
@@ -240,6 +265,55 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
                          "（读到的是 match=\"" + match->text + "\" pattern=\"" + pattern->text + "\"）";
         return false;
       }
+    }
+  }
+
+  // health 段可选（S3-03，ADR-19 追加第四条）：段不存在 = 健康检查整套不装配，
+  // 存在则五个字段全部可选、缺省值在 HealthPolicy 里。严格性原样适用：
+  // 未知字段 / 类型不对 / 取值越界，全部整体拒绝。
+  out->health_.present = document.find("health") != nullptr;
+  if (const JsonValue* health = document.find("health"); health != nullptr) {
+    if (!health->is_object()) {
+      *error = std::string("health 必须是对象，读到的是") + health->kind_name();
+      return false;
+    }
+    if (!forbid_unknown(*health,
+                        {"max_fails", "fail_timeout_ms", "probe_interval_ms", "probe_timeout_ms",
+                         "max_ejection_percent"},
+                        error, "health")) {
+      return false;
+    }
+    auto need_int = [&](std::string_view key, std::int64_t low, std::uint64_t high,
+                        std::int64_t* out_value) {
+      const JsonValue* v = health->find(key);
+      if (v == nullptr) return true;  // 可选：缺省值留在 HealthPolicy 里
+      if (v->kind != JsonValue::Kind::kInt) {
+        *error = std::string("health 的 ") + std::string(key) + " 必须是整数，读到的是" +
+                 v->kind_name();
+        return false;
+      }
+      if (v->number < low || v->number > static_cast<std::int64_t>(high)) {
+        *error = std::string("health 的 ") + std::string(key) + " 要落在 " +
+                 std::to_string(low) + ".." + std::to_string(high) + "，读到的是 " +
+                 std::to_string(v->number);
+        return false;
+      }
+      *out_value = v->number;
+      return true;
+    };
+    std::int64_t v = 0;
+    route::HealthPolicy& policy = out->health_.policy;
+    if (!need_int("max_fails", 1, 1000000, &v)) return false;
+    if (health->find("max_fails") != nullptr) policy.max_fails = static_cast<std::uint32_t>(v);
+    if (!need_int("fail_timeout_ms", 1, 86400000, &v)) return false;
+    if (health->find("fail_timeout_ms") != nullptr) policy.fail_timeout_ms = v;
+    if (!need_int("probe_interval_ms", 0, 86400000, &v)) return false;
+    if (health->find("probe_interval_ms") != nullptr) policy.probe_interval_ms = v;
+    if (!need_int("probe_timeout_ms", 1, 3600000, &v)) return false;
+    if (health->find("probe_timeout_ms") != nullptr) policy.probe_timeout_ms = v;
+    if (!need_int("max_ejection_percent", 0, 100, &v)) return false;
+    if (health->find("max_ejection_percent") != nullptr) {
+      policy.max_ejection_percent = static_cast<std::uint32_t>(v);
     }
   }
 

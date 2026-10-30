@@ -109,6 +109,12 @@ class TestUpstream {
   // 请求路径带 /dies，或全局开关打开时对**所有**请求生效。它是"坏上游"的
   // 可控版本：截断的位置由测试定，断的行为由内核定。
   void set_die_after_response_bytes(std::size_t n) noexcept { die_after_bytes_ = n; }
+  // S3-03：命中指定路径前缀的请求回固定状态码（探活的"固定回 404 的后端样本"与
+  // 被动 5xx 的可控版本都靠它）。reason 文案给一个占位——网关的框架判定不读 reason。
+  void set_path_status(std::string_view prefix, int status) {
+    status_path_prefix_ = std::string(prefix);
+    status_path_code_ = status;
+  }
 
   // --- S1-07 的慢读上游 ---------------------------------------------------
   // `stall_reads` 为真时，这个夹具**一个客户端 fd 都不再读**：不 read_into、不按存活
@@ -292,6 +298,15 @@ class TestUpstream {
       // S1-06 的故障与框架模式。判定口径只看请求 target 里的路径前缀——
       // 上游不需要 HTTP 语义，只需要"看到不同路径回不同字节"，聪明留给网关。
       const std::string_view target = first_line_target(headers);
+      // S3-03 的路径状态码旋钮（放在故障前缀之前：/gone 这类探活路径与故障前缀
+      // 互不重叠，先到先判）。
+      if (!status_path_prefix_.empty() && target.rfind(status_path_prefix_, 0) == 0) {
+        respond(client, "HTTP/1.1 " + std::to_string(status_path_code_) +
+                            " Probe\r\nContent-Length: 0\r\n\r\n",
+                block_end + body_len);
+        if (client.closed_by_close_header) return;
+        continue;
+      }
       // **顺序就是正确性**：/dies 是 /dies-mid-body 的前缀，先匹配短的那条，
       // 长的那条永远轮不到——我第一次跑冒烟时"回半条 body"这一步实际打的是
       // "一个字节都不回"的分支，而两边的断言恰好都能被"502 + 计数"糊过去。
@@ -520,6 +535,8 @@ class TestUpstream {
   bool close_after_response_ = false;
   std::string fixed_body_;
   std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
+  std::string status_path_prefix_;
+  int status_path_code_ = 0;
   std::atomic<bool> stall_reads_{false};
   int stall_reads_ms_ = 0;
   std::chrono::steady_clock::time_point stalled_until_{};

@@ -2,12 +2,15 @@
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -31,6 +34,15 @@ using State = Connection::State;
 std::int64_t monotonic_ms() noexcept {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// 墙钟毫秒。只进健康表的观测格（`last_ejection_epoch_ms`），决策一概不用它——
+// 决策读的是单调轴；墙钟那格存在的唯一理由是让压测脚本能把"网关自报的摘除时刻"
+// 与脚本自己的时间线钉在同一根轴上（摘除耗时两端的另一端）。
+std::int64_t wall_ms() noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
       .count();
 }
 
@@ -122,6 +134,7 @@ Reactor::Reactor(Config config)
   // 热重载的话题，那时按 ADR-10 换成"整张表换一根指针"，而不是往一个正在被循环读的
   // 容器里 push（那和"运行期改链"是同一条 race）。
   upstream_pool_.resize(config_.upstream_targets.size());
+  build_probe_slots();
 }
 
 Reactor::Reactor(Config config, ReactorStats& shared_stats)
@@ -135,6 +148,7 @@ Reactor::Reactor(Config config, ReactorStats& shared_stats)
   }
   wake_fd_ = UniqueFd{fd};
   upstream_pool_.resize(config_.upstream_targets.size());  // 同上：定长在构造时
+  build_probe_slots();
 }
 
 Reactor::~Reactor() {
@@ -148,6 +162,15 @@ Reactor::~Reactor() {
   }
   connections_.clear();
   retiring_.clear();
+  // 在飞的探活 fd 同一条收尾顺序：摘 epoll、close（健康表的状态不清理——
+  // 析构发生在进程/组退出，表由它的持有者整体处置）。
+  for (Probe& p : probes_) {
+    if (!p.fd.valid()) continue;
+    int error = 0;
+    (void)epoll_.remove(p.fd.get(), &error);
+    p.fd.close_now();
+    p.phase = Probe::Phase::kIdle;
+  }
   // 池里的空闲上游也在 connections_ 里（上面已 close_fd），这里释放池表持有的那份
   // shared_ptr，让引用计数归零、对象析构（constructed==destructed 的最终兑现点）。
   upstream_pool_.clear();
@@ -266,8 +289,17 @@ std::uint64_t Reactor::run() {
     // 最坏要等一个 config_.wait_timeout_ms（生产 200ms）才被下一轮扫描看见，
     // 而兜底 deadline 也是只有扫描时才检查的量。
     const bool draining = draining_.load(std::memory_order_relaxed);
-    const int wait_ms = draining ? std::min(config_.wait_timeout_ms, kDrainTickMs)
-                                 : config_.wait_timeout_ms;
+    int wait_ms = draining ? std::min(config_.wait_timeout_ms, kDrainTickMs)
+                           : config_.wait_timeout_ms;
+    // S3-03：探活在跑时，epoll_wait 的上限夹到探活间隔——健康 tick 只在循环醒来的
+    // 时候做，200ms 的默认上限会把"每 20ms 一拍"的探活拖成每 200ms 一拍（B-014
+    // 阶段 2 实测 25 s 只跑了 189 轮，就是被这个上限拉长的）。只在探活启用时夹，
+    // 空闲路径（SLO #2 那些场景探活不装配）一分钟都不多醒。
+    if (config_.health && config_.health->policy().probe_interval_ms > 0 && !draining) {
+      const std::int64_t interval = config_.health->policy().probe_interval_ms;
+      const int cap = static_cast<int>(std::min<std::int64_t>(interval, 200));
+      wait_ms = std::min(wait_ms, cap > 0 ? cap : 1);
+    }
     const int n = epoll_.wait(wait_ms, &events_, &error);
     if (n < 0) {
       // Epoll::wait 已经把 EINTR 内部重试掉了，走到这里就是 EBADF/EINVAL 这一类
@@ -277,6 +309,16 @@ std::uint64_t Reactor::run() {
     if (!events_.empty()) {
       handle_events(events_);
       ++batches;
+    }
+
+    // S3-03 健康检查 tick。与排水扫描同一形状：扫描 → 判完成，都只能在循环线程做。
+    // sweep 每拍都跑（N 个目标的一次线性扫 + 全是原子的读写，E 是个位数到几十的量）；
+    // 探活只在配置了间隔时跑。到期未扫的摘除在 LB 读侧按健康算（is_ejected 的口径），
+    // 这里的 sweep 只是让状态账（ejected_now / recoveries）尽快对上。
+    if (config_.health) {
+      const std::int64_t now = monotonic_ms();
+      config_.health->sweep_expired(now);
+      if (config_.health->policy().probe_interval_ms > 0) health_tick(now);
     }
 
     if (config_.stop_after_requests > 0 &&
@@ -377,6 +419,22 @@ void Reactor::handle_events(const std::vector<Epoll::Event>& events) {
     }
     if (ev.user_data == listener_tag()) {
       accept_all();
+      continue;
+    }
+
+    // 探活的 user_data 低位被 OR 成 1（见 start_probe）。连接对象只能出自 make_shared，
+    // 对齐 ≥ 8、最低位恒为 0，所以这一位不会与真实 Connection* 撞上。
+    // 还原成 Probe* 后按地址在槽位表里认人——槽位定长不复用地址，认不到的
+    // （理论上不可能）按陈旧事件丢掉，与注册表反查同一条纪律。
+    if ((reinterpret_cast<std::uintptr_t>(ev.user_data) & 1u) != 0) {
+      auto* slot_ptr = reinterpret_cast<Probe*>(
+          reinterpret_cast<std::uintptr_t>(ev.user_data) & ~static_cast<std::uintptr_t>(1));
+      for (std::size_t i = 0; i < probes_.size(); ++i) {
+        if (&probes_[i] == slot_ptr) {
+          on_probe_event(i, ev.events);
+          break;
+        }
+      }
       continue;
     }
 
@@ -684,6 +742,9 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   ConnectOutcome outcome = start_connect(target.address, target.port);
   if (outcome.status == ConnectStatus::kFailed) {
     stats_.upstream_connect_failed.fetch_add(1, std::memory_order_relaxed);
+    // 被动健康检查的失败记账点之一（S3-03）：连不上就是后端的事，与本地 fd 预算
+    // 无关——下面 max_connections / register_connection 那两条失败分支**不**记账。
+    note_health_failure(upstream_target);
     return nullptr;
   }
 
@@ -747,6 +808,194 @@ void Reactor::note_upstream_paired(std::uint16_t target) noexcept {
 
 void Reactor::note_upstream_unpaired(std::uint16_t target) noexcept {
   if (config_.lb_state) config_.lb_state->note_unpaired(target);
+}
+
+// --- 健康检查（S3-03，ADR-12 落地 + ADR-19 追加第四条）---------------------------
+
+void Reactor::note_health_failure(std::uint16_t target) noexcept {
+  if (config_.health == nullptr) return;
+  config_.health->note_failure(target, monotonic_ms(), wall_ms());
+}
+
+void Reactor::note_health_success(std::uint16_t target) noexcept {
+  if (config_.health == nullptr) return;
+  config_.health->note_success(target);
+}
+
+void Reactor::build_probe_slots() noexcept {
+  if (config_.health == nullptr || config_.health->policy().probe_interval_ms <= 0) return;
+  const std::size_t group = config_.worker_group_size == 0 ? 1 : config_.worker_group_size;
+  for (std::size_t t = 0; t < config_.upstream_targets.size(); ++t) {
+    if (t % group != config_.worker_index % group) continue;
+    probe_targets_.push_back(t);
+    probe_next_due_ms_.push_back(0);  // 0 = 立即到期：循环第一拍就探一轮
+  }
+  // **槽位表到此定长**：user_data 里存的是 &probes_[i]，vector 搬家/erase 都会让
+  // 事件批里已排队的指针悬垂。定长 + 槽位复用（finish 只把槽清回 kIdle，不删元素）
+  // 让地址永远稳定，这是注册表反查之外的第二层防护。
+  probes_.resize(probe_targets_.size());
+}
+
+void Reactor::health_tick(std::int64_t now_ms) noexcept {
+  for (std::size_t i = 0; i < probes_.size(); ++i) {
+    Probe& p = probes_[i];
+    if (p.phase == Probe::Phase::kIdle) {
+      if (now_ms >= probe_next_due_ms_[i]) start_probe(i, now_ms);
+      continue;
+    }
+    // 在飞探活只有一个出口先到：事件，或超时。deadline 是"连接 + 发送 + 响应头"
+    // 共用的一个预算，超时即判死（已裁第 3 条②：超时算失败）。
+    if (now_ms >= p.deadline_ms) finish_probe(i, false);
+  }
+}
+
+void Reactor::start_probe(std::size_t slot, std::int64_t now_ms) noexcept {
+  Probe& p = probes_[slot];
+  const std::size_t index = probe_targets_[slot];
+  if (index >= config_.upstream_targets.size() || p.phase != Probe::Phase::kIdle) return;
+  const Config::Target& target = config_.upstream_targets[index];
+  probe_next_due_ms_[slot] = now_ms + config_.health->policy().probe_interval_ms;
+
+  // 请求一次成型。Connection: close 让响应边界等于"头读完即完"，探活不需要 body。
+  std::size_t len = 0;
+  auto put = [&len, &p](std::string_view text) {
+    const std::size_t room = Probe::kProbeRequestBytes - len;
+    const std::size_t n = std::min(room, text.size());
+    if (n > 0) std::memcpy(p.request + len, text.data(), n);
+    len += n;
+  };
+  put("GET ");
+  put(target.health_path);
+  put(" HTTP/1.1\r\nHost: ");
+  put(target.address);
+  put(":");
+  put(std::to_string(target.port));
+  put("\r\nConnection: close\r\nUser-Agent: l7gate-health-probe/1\r\n\r\n");
+  p.request_len = len;
+  p.request_written = 0;
+  p.response_filled = 0;
+
+  ConnectOutcome outcome = start_connect(target.address, target.port);
+  if (outcome.status == ConnectStatus::kFailed) {
+    // 同步失败（回环上的 ECONNREFUSED 常走这条路）：没有 fd 可注册，直接按判死结算。
+    config_.health->note_probe_result(static_cast<std::uint16_t>(index), false, now_ms, wall_ms());
+    return;
+  }
+  p.fd = std::move(outcome.fd);
+  p.phase = Probe::Phase::kConnecting;
+  p.deadline_ms = now_ms + config_.health->policy().probe_timeout_ms;
+  int error = 0;
+  void* tag = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+  if (!epoll_.add(p.fd.get(), EPOLLOUT, tag, &error)) {
+    config_.health->note_probe_result(static_cast<std::uint16_t>(index), false, now_ms, wall_ms());
+    p.fd.close_now();
+    p.phase = Probe::Phase::kIdle;
+  }
+}
+
+void Reactor::finish_probe(std::size_t slot, bool alive) noexcept {
+  Probe& p = probes_[slot];
+  const auto target = static_cast<std::uint16_t>(probe_targets_[slot]);
+  if (p.fd.valid()) {
+    int error = 0;
+    (void)epoll_.remove(p.fd.get(), &error);
+    p.fd.close_now();
+  }
+  p.phase = Probe::Phase::kIdle;
+  p.response_filled = 0;
+  p.request_written = 0;
+  p.deadline_ms = 0;
+  if (config_.health != nullptr) {
+    config_.health->note_probe_result(target, alive, monotonic_ms(), wall_ms());
+  }
+}
+
+void Reactor::on_probe_event(std::size_t slot, std::uint32_t revents) noexcept {
+  Probe& p = probes_[slot];
+  if (p.phase == Probe::Phase::kIdle || !p.fd.valid()) return;  // 陈旧事件：槽已结算
+
+  if (p.phase == Probe::Phase::kConnecting) {
+    if ((revents & EPOLLOUT) == 0) return;
+    int so_error = 0;
+    if (!get_so_error(p.fd.get(), &so_error) || so_error != 0) {
+      finish_probe(slot, false);
+      return;
+    }
+    p.phase = Probe::Phase::kSending;  // 落到下面的发送段（回环上连接常已就绪）
+  }
+
+  if (p.phase == Probe::Phase::kSending) {
+    while (p.request_written < p.request_len) {
+      const ssize_t n = ::send(p.fd.get(), p.request + p.request_written,
+                               p.request_len - p.request_written, MSG_NOSIGNAL);
+      if (n > 0) {
+        p.request_written += static_cast<std::size_t>(n);
+        continue;
+      }
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        int error = 0;
+        void* tag = reinterpret_cast<void*>(
+            reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+        (void)epoll_.modify(p.fd.get(), EPOLLOUT, tag, &error);
+        return;  // 等下一拍 EPOLLOUT
+      }
+      finish_probe(slot, false);  // EPIPE / ECONNRESET：判死
+      return;
+    }
+    // 请求写完：转读。边沿触发不为注册前已缓冲的字节负责（ADR-14 第 5 条的同一条
+    // 纪律），挂上 EPOLLIN 之后必须立刻自己读一次。
+    p.phase = Probe::Phase::kReading;
+    int error = 0;
+    void* tag =
+        reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(&probes_[slot]) | 1u);
+    (void)epoll_.modify(p.fd.get(), EPOLLIN, tag, &error);
+  }
+
+  if (p.phase != Probe::Phase::kReading) return;
+  while (true) {
+    if (p.response_filled >= Probe::kProbeBufferBytes) {
+      finish_probe(slot, false);  // 头预算打满仍未见结束：判死（与响应头超限同一口径）
+      return;
+    }
+    const ssize_t n = ::read(p.fd.get(), p.response + p.response_filled,
+                             Probe::kProbeBufferBytes - p.response_filled);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return;  // 半包：等下一拍
+      finish_probe(slot, false);
+      return;
+    }
+    if (n == 0) {
+      // EOF 而头没读完 = 连接失败（已裁第 3 条②）。头已读完的探活在下面就地结算，
+      // 走不到这里。
+      finish_probe(slot, false);
+      return;
+    }
+    p.response_filled += static_cast<std::size_t>(n);
+    const std::string_view data(p.response, p.response_filled);
+    const std::size_t head_end = data.find("\r\n\r\n");
+    if (head_end == std::string_view::npos) continue;  // 头还没齐，继续读
+    // 状态行：HTTP/1.x SP CCC。形态不对的头按判死结算（探活的判据里没有"半懂"）。
+    const std::string_view line = data.substr(0, data.find("\r\n"));
+    bool alive = false;
+    if (line.size() >= 12 && line.starts_with("HTTP/1.") &&
+        ::isdigit(static_cast<unsigned char>(line[7])) != 0 &&
+        ::isdigit(static_cast<unsigned char>(line[9])) != 0 &&
+        ::isdigit(static_cast<unsigned char>(line[10])) != 0 &&
+        ::isdigit(static_cast<unsigned char>(line[11])) != 0) {
+      const unsigned status = static_cast<unsigned>(line[9] - '0') * 100u +
+                              static_cast<unsigned>(line[10] - '0') * 10u +
+                              static_cast<unsigned>(line[11] - '0');
+      // 已裁第 3 条②：任何 2xx/3xx/4xx 算活着，只有 5xx（连接失败/超时另算）判死。
+      // 把 4xx 判死等于"一次路径配错引发全量摘除"，误摘率测的会是后端脾气。
+      alive = status >= 200 && status < 500;
+      if (status < 200) {
+        // 1xx：最终头还在后面，继续读（下一个头才是表态）。
+        continue;
+      }
+    }
+    finish_probe(slot, alive);
+    return;
+  }
 }
 
 std::size_t Reactor::pool_idle_count() const noexcept {
@@ -1313,6 +1562,7 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
           // 表态要发的那一方；上游由它顺着 peer_fd 反查后按丢弃关闭。
           // 计数口径见 stats.h：这一支和"上游在头之前 EOF"是同一类表态。
           stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+          note_health_failure(upstream->upstream_target());  // S3-03 被动记账点
           fail_pair_with_reply(downstream, 0);
           return;
         }
@@ -1327,8 +1577,20 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
         // 上游在说话。
         // 计数与"头之前 EOF"同一口径：网关还没把最终头交出去，表态资格还在。
         stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+        note_health_failure(upstream->upstream_target());  // 头坏 = 后端坏（S3-03 被动记账点）
         fail_pair_with_reply(downstream, 0);
         return;
+      }
+      // 被动健康检查的主记账点（S3-03）：最终头的状态码在这里揭晓。
+      // ≥ 500 记失败、< 500（2xx/3xx/4xx）记活着并清连续失败计数；1xx 不是最终头，
+      // 不表态（它后面还有真正的那条）。记账点收在这一处而不是散在完结/截断各分支，
+      // 与"这条泵有七个 return 点"的教训同一条。
+      if (info.framing != Framing::kProvisional) {
+        if (info.status_code >= 500) {
+          note_health_failure(upstream->upstream_target());
+        } else {
+          note_health_success(upstream->upstream_target());
+        }
       }
       // 头必须**整块**排：半个响应头排出去就是把语法不完整的字节喂给客户端，
       // 而且头是框架结论的唯一来源——拆散发等于让"判定"和"发出"看到不同的字节。
@@ -1404,6 +1666,7 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
       if (forward == 0) {
         if (broken_framing) {
           stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+          note_health_failure(upstream->upstream_target());  // S3-03 被动记账点：帧坏了 = 后端坏
           close_connection(upstream);  // 级联下游：EOF 语义就是截断的表态
           return;
         }
@@ -1423,6 +1686,7 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
 
       if (broken_framing) {
         stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+        note_health_failure(upstream->upstream_target());  // S3-03 被动记账点
         close_connection(upstream);
         return;
       }
@@ -1567,6 +1831,8 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
     int so_error = 0;
     if (!get_so_error(conn->fd(), &so_error) || so_error != 0) {
       stats_.upstream_connect_failed.fetch_add(1, std::memory_order_relaxed);
+      // 被动健康检查的失败记账点之一：异步 connect 的结果在这里揭晓。
+      note_health_failure(conn->upstream_target());
       // 握手都没成的上游，它出向缓冲里排着的请求永远发不出去：丢弃，别等刷完。
       // 对端（下游）用默认的 flush 意图关闭 —— 那边可能正有一个响应要发给客户端。
       close_connection(conn, CloseWhy::kDiscardOutbound);
@@ -1644,6 +1910,7 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
         if (!r.final_head_forwarded && !complete_by_eof) {
           // 含"一个字节都没回"和"只回了 1xx"两种：都还没有最终头，502 合法。
           stats_.upstream_truncated_before_head.fetch_add(1, std::memory_order_relaxed);
+          note_health_failure(conn->upstream_target());  // S3-03 被动记账点：头之前断 = 后端坏
           auto pit = connections_.find(conn->peer_fd());
           if (pit == connections_.end()) {
             // 下游已经不在了：没人需要这条表态，直接把上游按丢弃关掉。
@@ -1658,6 +1925,7 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
           // CL/chunked 的 body 没走完就断了：框架意义上的截断，客户端会看到
           // 断流；网关不追加任何字节（头已经发出，追加就是伪造）。
           stats_.upstream_truncated_in_body.fetch_add(1, std::memory_order_relaxed);
+          note_health_failure(conn->upstream_target());  // S3-03 被动记账点
         }
       }
       // 其余（完结、close-delimited 的 EOF=完结、隧道）跟着关：S2 建池之前

@@ -103,6 +103,12 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     wc.connection = config_.connection;
     wc.wait_timeout_ms = config_.wait_timeout_ms;
     wc.stop_after_requests = 0;
+    // S3-03（ADR-12 落地）：健康表与探活分派同样必须在构造前进 wc（与上面 lb_state
+    // 同一条教训：Reactor 存 config 的副本，构造之后写等于没写）。探活分派按
+    // `target % N == i` 切——探活流量不随 worker 数放大。
+    wc.health = config_.health;
+    wc.worker_index = static_cast<std::size_t>(i);
+    wc.worker_group_size = static_cast<std::size_t>(n);
     // 均衡状态必须**在 Reactor 构造之前**就进 wc：Reactor 存的是 config 的一份副本，
     // 构造之后再往 wc 上写就等于没写——那份账会只加不减（本任务实测把这一格写错过一次，
     // 表现是 least_conn 永远选第一个成员，而它看起来完全"在正常工作"）。
@@ -120,8 +126,8 @@ bool ReactorGroup::start_listen(int* error) noexcept {
       worker->add_request_filter(std::make_unique<filter::RouteFilter>(*config_.route_table));
     }
     if (lb_state != nullptr) {
-      worker->add_request_filter(
-          std::make_unique<filter::LoadBalanceFilter>(*config_.groups, std::move(lb_state)));
+      worker->add_request_filter(std::make_unique<filter::LoadBalanceFilter>(
+          *config_.groups, std::move(lb_state), config_.health));
     }
     if (!worker->start_worker(error)) {
       // 已经建好的 worker 由本对象析构清理（它们的 start_worker 若成功则 wake_fd

@@ -7,6 +7,7 @@
 
 #include "config/json.h"
 #include "route/balance.h"
+#include "route/health.h"
 #include "route/router.h"
 
 // 配置文件到网关内部结构的装配（S3-02，ADR-19）。
@@ -24,6 +25,16 @@ namespace l7gate::config {
 struct Endpoint {
   std::string address;
   std::uint16_t port = 0;
+  // S3-03（ADR-19 追加第四条）：这个目标的主动探活路径，默认 "/"。
+  // 去重的老规矩多一条：同一个 地址:端口 在两处出现而 health_path 不同 = 拒绝
+  // （同一台机器不能有两个"活着"的定义）。
+  std::string health_path = "/";
+};
+
+// S3-03：`health` 段（可选）。段不存在 = 健康检查整套不装配。
+struct HealthSection {
+  bool present = false;
+  route::HealthPolicy policy{};  // 缺省值即 ADR-19 追加第四条定下的那五个
 };
 
 class GatewayConfig {
@@ -42,6 +53,9 @@ class GatewayConfig {
   // 而不是"隐式地有一条 catch-all 路由"。
   bool has_routes = false;
 
+  // 文件里的 `health` 段（可选；`present=false` 时 main.cc 不建 HealthTable）。
+  const HealthSection& health() const noexcept { return health_; }
+
  private:
   // 两个装配入口都要写私有成员，所以两个都得是 friend。只 friend 一个的话，
   // 另一个（用例直接喂文本的那条）会编不过——而这两条**必须走同一段校验代码**，
@@ -51,6 +65,7 @@ class GatewayConfig {
   std::vector<Endpoint> endpoints_;
   route::GroupTable groups_;
   route::RouteTable routes_;
+  HealthSection health_;
 };
 
 // 读文件 + 解析 + 校验 + 建环，一次做完。任何一步失败都返回 false。

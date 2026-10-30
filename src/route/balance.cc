@@ -196,4 +196,30 @@ std::optional<std::uint16_t> select_from_ring(const UpstreamGroup& group,
   return it->second;
 }
 
+bool is_candidate(const std::vector<std::uint16_t>& sorted_candidates,
+                  std::uint16_t target) noexcept {
+  return std::binary_search(sorted_candidates.begin(), sorted_candidates.end(), target);
+}
+
+std::optional<std::uint16_t> select_from_ring(const UpstreamGroup& group, std::string_view key,
+                                              const std::vector<std::uint16_t>& candidates) noexcept {
+  if (group.ring.empty()) return std::nullopt;
+  // 候选集 = 全员：与两参版本逐点同解，直接走快路径（健康检查没摘人时不付扫描的钱）。
+  if (candidates.size() == group.targets.size()) {
+    return select_from_ring(group, key);
+  }
+  const std::uint64_t h = ring_hash(key);
+  auto it = std::lower_bound(group.ring.begin(), group.ring.end(), h,
+                             [](const std::pair<std::uint64_t, std::uint16_t>& node,
+                                std::uint64_t value) { return node.first < value; });
+  // 最多绕环一整圈：环上每个点都查一遍谓词，全员被摘时落到 nullopt，
+  // 由调用方回退全员集合——"宁可发给坏后端，不让请求无去处"（自产响应归 S4）。
+  for (std::size_t seen = 0; seen < group.ring.size(); ++seen) {
+    if (it == group.ring.end()) it = group.ring.begin();
+    if (is_candidate(candidates, it->second)) return it->second;
+    ++it;
+  }
+  return std::nullopt;
+}
+
 }  // namespace l7gate::route

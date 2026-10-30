@@ -2,9 +2,11 @@
 
 #include <memory>
 #include <string_view>
+#include <vector>
 
 #include "filter/chain.h"
 #include "route/balance.h"
+#include "route/health.h"
 
 namespace l7gate::filter {
 
@@ -20,9 +22,15 @@ namespace l7gate::filter {
 // 连同这一环 filter 一起）。这里的 `shared_ptr` 不表示跨线程共享——持有它的两个对象
 // （reactor 的记账路径与这一环 filter）都在同一个 worker 的循环线程里跑，
 // 所以整条链仍然无锁、`tsan` 仍然零 data race（ADR-14 的红线，ADR-19「为什么」第一条）。
+//
+// S3-03 追加：`health` 表被**同组全部 worker 共享**（全原子，先例 ReactorStats），
+// 本环每请求只读一个问句——"这个成员现在被摘除了吗"。共享表不违反 ADR-14：
+// 它不承载 fd，也不承载连接对象。
 class LoadBalanceFilter : public RequestFilter {
  public:
-  LoadBalanceFilter(const route::GroupTable& table, std::shared_ptr<route::LbState> state) noexcept;
+  // `health` 可空：空 = 健康检查整套未装配（S3-02 形状，行为逐字节不变）。
+  LoadBalanceFilter(const route::GroupTable& table, std::shared_ptr<route::LbState> state,
+                    std::shared_ptr<const route::HealthTable> health = nullptr) noexcept;
 
   std::string_view name() const noexcept override { return "load-balance"; }
 
@@ -35,8 +43,16 @@ class LoadBalanceFilter : public RequestFilter {
   // 空串会让所有没带那个头的请求钉在同一个后端上，那是一次谁也不会去查的哈希倾斜。
   std::string_view hash_key_of(const RequestInfo& info, const route::HashKey& key) const noexcept;
 
+  // 本请求的候选集（被摘除的成员不在其中；全员被摘时回退全员——ADR-12 的立场是
+  // "故意保留一段错误"，而请求无去处（不自产错误响应）是 S4 的空格子）。
+  // 复用同一个成员缓冲：本 filter 每 worker 一份、只在 owner 循环线程跑，
+  // 所以热路径上不付每次请求一次堆分配的钱。
+  const std::vector<std::uint16_t>& candidates_for(const route::UpstreamGroup& group);
+
   const route::GroupTable& table_;
   std::shared_ptr<route::LbState> state_;
+  std::shared_ptr<const route::HealthTable> health_;
+  std::vector<std::uint16_t> candidates_scratch_;
 };
 
 }  // namespace l7gate::filter

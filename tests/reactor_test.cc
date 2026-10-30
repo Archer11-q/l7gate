@@ -4014,16 +4014,18 @@ TEST(S3_02_LoadBalance, RoundRobinCyclesAcrossBackendsOnOneKeepAliveConnection) 
   targets.stop();
 }
 
-// 二、**最少连接断方向**：人为把两个后端压成"各挂一条在飞"，第三个后端仍然闲着，
-// 于是新请求必须落到第三个上。这里用 `set_stall_reads` 造"已转发、响应没回"那一格
-// （S2-05 同一个手法），所以 0 号和 1 号后端各被占住一条配对连接、且永远不会有响应。
-// **比较符翻转（`<` 改成 `>`）就是这条红**（ADR-19 阳性验证第三条）。
+// 二、**最少连接断方向**：人为把三个后端都压成"收到请求不回"（`set_stall_reads`，S2-05 同一个
+// 手法），让两条下游各占住一个后端的配对连接。平手规则是 ADR-19 追加第三条（S3-03 开工裁决①）
+// 改过的：**平手集合内轮询**，不再"取成员顺序第一条"——所以头两条的落点是轮询的确定值
+// （0 号、2 号），唯一没被占住的是 1 号。放开 1 号之后新请求必须去它：被占住的后端**确实
+// 少分到**。**比较符翻转（`<` 改成 `>`）就是这条红**（ADR-19 阳性验证第三条）。
 TEST(S3_02_LoadBalance, LeastConnectionsSendsNewWorkToTheIdleBackend) {
   std::string why;
   ThreeTargets targets;
   ASSERT_TRUE(targets.start(&why)) << why;
   targets.first.set_stall_reads(true);   // 0 号：收了请求不回
   targets.second.set_stall_reads(true);  // 1 号：收了请求不回
+  targets.third.set_stall_reads(true);   // 2 号：收了请求不回
 
   l7gate::route::RouteTable table;
   LbRig rig;
@@ -4041,7 +4043,9 @@ TEST(S3_02_LoadBalance, LeastConnectionsSendsNewWorkToTheIdleBackend) {
   ASSERT_TRUE(harness.start(options, &why)) << why;
   ReactorStats& stats = harness.reactor()->stats();
 
-  // 前两条下游各占一个后端；等到"确实连上了"再发下一条，否则三条会在全零的账上平手取第一个。
+  // 头两条各占一个后端；等到"确实连上了"再发下一条，否则两条会在全零的账上叠在同一个后端。
+  // 平手集合内轮询的确定落点：第一条（游标初值 0）→ 0 号；第二条（平手集合 {1,2}、游标推进）
+  // → 2 号。**这条断言同时就是平手规则的下界**（ADR-19 追加三：全零的账不许全落成员 0）。
   Client held_first;
   ASSERT_TRUE(held_first.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(held_first.write_all(get_request("/hold/1")));
@@ -4051,26 +4055,27 @@ TEST(S3_02_LoadBalance, LeastConnectionsSendsNewWorkToTheIdleBackend) {
   Client held_second;
   ASSERT_TRUE(held_second.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(held_second.write_all(get_request("/hold/2")));
-  ASSERT_TRUE(wait_until([&] { return targets.second.connections_accepted() == 1u; }, 3000))
-      << "第二条没有配对到 1 号后端：最少连接在两个都空时应当取成员顺序的下一个";
+  ASSERT_TRUE(wait_until([&] { return targets.third.connections_accepted() == 1u; }, 3000))
+      << "第二条没有配对到 2 号后端：平手集合内轮询没有轮转（退回了'取第一条'的旧规则）";
 
-  // 此刻 0 号和 1 号各挂着一条在飞、2 号一条都没有。新请求必须去 2 号。
+  // 此刻 0 号和 2 号各挂着一条在飞、1 号一条都没有。放开 1 号，新请求必须去它。
+  targets.second.set_stall_reads(false);
   Client fresh;
   ASSERT_TRUE(fresh.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(fresh.write_all(get_request("/now")));
   std::string status;
   std::string body;
   ASSERT_TRUE(fresh.read_response(&status, &body, &why)) << why;
-  EXPECT_EQ(body.size(), 192u) << "把活派给了正忙的后端：最少连接的比较方向是反的";
-  EXPECT_EQ(targets.third.requests_served(), 1u);
+  EXPECT_EQ(body.size(), 128u) << "把活派给了正忙的后端：最少连接的比较方向是反的";
+  EXPECT_EQ(targets.second.requests_served(), 1u);
   EXPECT_EQ(stats.load(stats.upstream_opened), 3u) << "三个后端各一条，没有多开";
 
   // 收尾：放开 stall，让两条压着的下游把响应收完，否则"停环之后 live==0"就靠硬关而不是排空。
   targets.first.set_stall_reads(false);
-  targets.second.set_stall_reads(false);
+  targets.third.set_stall_reads(false);
   std::string released_body;
   ASSERT_TRUE(held_first.read_response(&status, &released_body, &why)) << "0 号放开后该补响应";
-  ASSERT_TRUE(held_second.read_response(&status, &released_body, &why)) << "1 号放开后该补响应";
+  ASSERT_TRUE(held_second.read_response(&status, &released_body, &why)) << "2 号放开后该补响应";
   fresh.close();
   held_first.close();
   held_second.close();
@@ -4108,24 +4113,27 @@ TEST(S3_02_LoadBalance, LeastConnectionsReleasesCapacityWhenTheDownstreamGoesAwa
 
   std::string status;
   std::string body;
-  // 三条各自活着的下游，依次配到 0、1、2（每次都是"当前最闲"，所以三台各一条）。
+  // 三条各自活着的下游。平手规则是 ADR-19 追加第三条改过的（平手集合内轮询，不再
+  // "取成员顺序第一条"），所以落点是轮询的确定值：0 号、2 号、1 号——每次都是
+  // "当前最闲（且平手时轮到谁就是谁）"，三台各一条。
   Client keep_first;
   Client keep_second;
   Client keep_third;
   ASSERT_TRUE(keep_first.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(keep_first.write_all(get_request("/a")));
   ASSERT_TRUE(keep_first.read_response(&status, &body, &why)) << why;
-  ASSERT_EQ(body.size(), 64u) << "第一条在全零的账上应当取成员顺序的第一个";
+  ASSERT_EQ(body.size(), 64u) << "第一条在全零的账上应当取游标的第一个（0 号）";
   ASSERT_TRUE(keep_second.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(keep_second.write_all(get_request("/b")));
   ASSERT_TRUE(keep_second.read_response(&status, &body, &why)) << why;
-  ASSERT_EQ(body.size(), 128u) << "0 号已经挂了一条，第二条不该再派给它";
+  ASSERT_EQ(body.size(), 192u) << "0 号已经挂了一条，平手集合 {1,2} 内轮询该给 2 号";
   ASSERT_TRUE(keep_third.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(keep_third.write_all(get_request("/c")));
   ASSERT_TRUE(keep_third.read_response(&status, &body, &why)) << why;
-  ASSERT_EQ(body.size(), 192u) << "两条都挂着，第三条该去唯一空闲的那个";
+  ASSERT_EQ(body.size(), 128u) << "两条都挂着，第三条该去唯一空闲的 1 号";
 
-  // 只关掉中间那条。它的上游按 ADR-15 归还进 1 号桶，账回落。
+  // 只关掉 2 号上那条（keep_second 拿到的是 192 B 那条配对）。它的上游按 ADR-15
+  // 归还进 2 号桶，账回落。
   ASSERT_TRUE(wait_until([&] { return stats.load(stats.pool_returns) == 0u; }, 200))
       << "三条都还空闲在配对，此刻不该有归还";
   keep_second.shutdown_write();
@@ -4137,10 +4145,10 @@ TEST(S3_02_LoadBalance, LeastConnectionsReleasesCapacityWhenTheDownstreamGoesAwa
   ASSERT_TRUE(next.connect_to(harness.port(), &why)) << why;
   ASSERT_TRUE(next.write_all(get_request("/d")));
   ASSERT_TRUE(next.read_response(&status, &body, &why)) << why;
-  EXPECT_EQ(body.size(), 128u)
+  EXPECT_EQ(body.size(), 192u)
       << "释放掉的那条容量没被重新算进去：这就是'账只加不减、永远选第一个成员'那一格";
-  EXPECT_EQ(targets.second.connections_accepted(), 1u) << "1 号桶里有热上游，不该再开新的";
-  EXPECT_EQ(targets.second.requests_served(), 2u);
+  EXPECT_EQ(targets.third.connections_accepted(), 1u) << "2 号桶里有热上游，不该再开新的";
+  EXPECT_EQ(targets.third.requests_served(), 2u);
   EXPECT_EQ(stats.load(stats.pool_borrows), 1u) << "借那一步没发生：说明它是重开的而不是复用的";
 
   // 收尾必须**等循环侧真的处理完 FIN**再停环：三条下游各归还一条上游（连同前面 keep_second
@@ -4161,6 +4169,314 @@ TEST(S3_02_LoadBalance, LeastConnectionsReleasesCapacityWhenTheDownstreamGoesAwa
   EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
   harness.shutdown_all();
   targets.stop();
+}
+
+// ======================= S3-03：健康检查端到端（探活 / 被动 / 安全阀）=======================
+//
+// 纯函数那一半在 health_test.cc；这里的四条要的是真 socket：
+// 探活连接机真的在 owner 循环里发 GET、真的判 404 活 / 5xx 死、真的在摘除后把流量
+// 挪到别的成员、真的被安全阀按停。可见性沿用 S3-01 的立场：后端收到什么由
+// `TestUpstream` 自报，摘除的账由 HealthTable 的原子计数自报（它的第一个读者就是它）。
+
+namespace {
+
+// 两台后端 + 一个单组 + catch-all 路由 + 健康表的装配具。成员数随 targets 走，
+// 不写死 3——安全阀那条要用"两台全死"的最小形状。
+struct HealthRig {
+  l7gate::route::RouteTable table;
+  l7gate::route::GroupTable groups;
+  std::shared_ptr<l7gate::route::LbState> state;
+  std::shared_ptr<l7gate::route::HealthTable> health;
+
+  void install(Harness::Options* options, Harness* harness, std::size_t target_count,
+               l7gate::route::Balance balance, const std::vector<std::string>& endpoint_keys,
+               const l7gate::route::HealthPolicy& policy) {
+    health = std::make_shared<l7gate::route::HealthTable>(target_count, policy);
+    state = std::make_shared<l7gate::route::LbState>(target_count, 1);
+    std::uint16_t group = l7gate::route::kNoUpstreamGroup;
+    std::vector<std::uint16_t> members;
+    for (std::size_t i = 0; i < target_count; ++i) {
+      members.push_back(static_cast<std::uint16_t>(i));
+    }
+    std::string why;
+    const bool ok = l7gate::testing::add_balanced_group(&groups, "all", balance, members,
+                                                        endpoint_keys, &group, &why);
+    EXPECT_TRUE(ok) << why;
+    catch_all_to_route_table(&table, group);
+    // 健康表必须在 Reactor 构造之前进 config（S3-02 那条"构造期副本"的教训同一格）。
+    options->config.health = health;
+    options->config.lb_state = state;
+    harness->add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+    harness->add_filter(
+        std::make_unique<l7gate::filter::LoadBalanceFilter>(groups, state, health));
+  }
+};
+
+}  // namespace
+
+// 一、**探活不污染业务计数 + 404 后端活着**（验收两条判据各自的钉子）：
+// 探活打在一个固定回 404 的路径上，判据是"任何 4xx 算活着"——这条样本就是
+// 误摘率最坏情形的阳性载体。跑若干轮之后：探活有账（下界：探活真的发生了）、
+// 没有任何摘除、`requests_parsed == responses_completed == 0`（零业务流量）。
+TEST(S3_03_HealthE2E, ProbesKeepA404BackendAliveWithoutTouchingBusinessCounters) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 64, &why)) << why;
+  backend.set_path_status("/gone", 404);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "127.0.0.1";
+  target.port = static_cast<std::uint16_t>(backend.port());
+  target.health_path = "/gone";
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 30;
+  policy.probe_timeout_ms = 500;
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 10;
+  auto health = std::make_shared<l7gate::route::HealthTable>(1, policy);
+  options.config.health = health;
+
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  ASSERT_TRUE(wait_until([&] { return health->snapshot(0).probe_ok_total >= 5; }, 3000))
+      << why << "（30ms 间隔 3 秒该跑出几十轮，5 轮都没有说明探活机没在转）";
+  EXPECT_EQ(health->snapshot(0).ejections_total, 0u) << "404 被判死：一次路径配错引发全量摘除";
+  EXPECT_EQ(health->ejected_now(), 0u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), 0u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u) << "探活不许进业务计数";
+
+  // 业务请求照常 200，且业务计数从这一条才开始动。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/business")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(body.size(), 64u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 1u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend.stop_and_join();
+}
+
+// 二、**杀死后端 → 探活判死 → 摘除 → 流量全去活的那台 → 同端口复活 → 探活判活 → 流量回来**。
+// fail_timeout 配 60s：恢复只能走探活成功这条路，这条用例因此是"探活能摘也能放"两个方向的
+// 共同证据。摘除耗时在这台机器上的量级由 wait_until 的 3 秒预算兜底（正式读数归压测脚本）。
+TEST(S3_03_HealthE2E, DeadBackendIsEjectedAndProbeSuccessRevivesIt) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(backend1.start(&why)) << why;
+  backend1.set_response_body_bytes(128);
+  const std::uint16_t port1 = backend1.port();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend0.port())});
+  options.config.upstream_targets.push_back(
+      Reactor::Config::Target{std::string("127.0.0.1"), port1});
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 30;
+  policy.probe_timeout_ms = 500;
+  policy.max_fails = 2;
+  policy.fail_timeout_ms = 60000;  // 恢复只能靠探活成功
+  policy.max_ejection_percent = 50;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend0.port()),
+               "127.0.0.1:" + std::to_string(port1)},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  // 预热一条（落到 0 号，游标初值），确认转发面正常。
+  Client warm;
+  ASSERT_TRUE(warm.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(warm.write_all(get_request("/warm")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(warm.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(body.size(), 64u);
+
+  const auto killed_at = std::chrono::steady_clock::now();
+  backend1.stop_and_join();
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).ejections_total >= 1; }, 3000))
+      << "后端死了却没有被摘除：探活判死或摘除链路至少一头是断的";
+  const auto eject_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - killed_at)
+                            .count();
+  EXPECT_LT(eject_ms, 3000) << "摘除等了太久：30ms 间隔 × 2 次失败不该用秒计";
+
+  // 摘除之后流量只能去 0 号：连发四条全部成功，且没有一条是 128 B（1 号已经死了）。
+  for (int i = 0; i < 4; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/after-eject")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    ASSERT_EQ(body.size(), 64u) << "第 " << i << " 条被派给了死后端";
+    c.close();
+  }
+  EXPECT_EQ(health.snapshot(1).ejections_total, 1u);
+
+  // 同端口复活：探活成功 → 立即恢复（不等 60s 的 fail_timeout）。
+  ASSERT_TRUE(backend1.start(&why, "127.0.0.1", port1)) << why;
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).recoveries_total >= 1; }, 3000))
+      << "探活成功没有把摘除的后端捞回来";
+  // 恢复后轮询回到它：连发四条里至少一条是 128 B。
+  bool saw_revived = false;
+  for (int i = 0; i < 4 && !saw_revived; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/after-revive")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    saw_revived = body.size() == 128u;
+    c.close();
+  }
+  EXPECT_TRUE(saw_revived) << "恢复的后端接不到流量：'恢复了'不等于'恢复后接得到流量'";
+
+  warm.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
+}
+
+// 三、**安全阀**（ADR-12 第一次真正落地的那格）：两台后端都死着、上限 50%
+// （floor(2×50/100)=1 台）——摘除必须停在 1 台、第二次摘除请求被挡且有账。
+// 断言形状是"最坏只损失 50% 容量"，不是"我没摘除"；挡掉的次数有可观测计数。
+TEST(S3_03_HealthE2E, ValveCapsEjectionWhenEveryBackendFails) {
+  std::string why;
+  // 两台"后端"先起再停：拿到的端口确定没人监听（比写死端口少一次撞车），探活必然
+  // connect 失败。
+  TestUpstream dead0;
+  TestUpstream dead1;
+  ASSERT_TRUE(dead0.start(&why)) << why;
+  ASSERT_TRUE(dead1.start(&why)) << why;
+  const std::uint16_t port0 = dead0.port();
+  const std::uint16_t port1 = dead1.port();
+  dead0.stop_and_join();
+  dead1.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(
+      Reactor::Config::Target{std::string("127.0.0.1"), port0});
+  options.config.upstream_targets.push_back(
+      Reactor::Config::Target{std::string("127.0.0.1"), port1});
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 30;
+  policy.probe_timeout_ms = 200;
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 50;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(port0), "127.0.0.1:" + std::to_string(port1)},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  // 等到第一台被摘、并且第二台的摘除请求至少被挡过两次（两拍探活）。
+  ASSERT_TRUE(
+      wait_until([&] { return health.ejections_blocked_by_valve() >= 2; }, 3000))
+      << "两台全死却没有触发阀：要么没在摘，要么挡了没记账";
+  EXPECT_EQ(health.ejected_now(), 1u) << "被摘除容量越过了 floor(N×50%)";
+  std::uint64_t total = 0;
+  for (std::uint16_t t = 0; t < 2; ++t) total += health.snapshot(t).ejections_total;
+  EXPECT_EQ(total, 1u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 四、**被动摘除与到期恢复**（探活关着：interval=0）：业务 5xx 是被动判据的来源，
+// max_fails 次之后摘；fail_timeout 到期由循环 sweep 恢复，恢复后流量回来。
+// 50% 上限、两台成员 → 两台都允许摘（percent=100 的语义就是"全摘也没关系"）。
+TEST(S3_03_HealthE2E, PassiveFiveXxEjectsAndFailTimeoutRevives) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+  backend0.set_path_status("/boom", 503);
+  backend1.set_path_status("/boom", 503);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend0.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend1.port())});
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;  // 被动专场：不探活
+  policy.probe_timeout_ms = 500;
+  policy.max_fails = 2;
+  policy.fail_timeout_ms = 400;
+  policy.max_ejection_percent = 100;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend0.port()),
+               "127.0.0.1:" + std::to_string(backend1.port())},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  // 四条 /boom：轮询轮流派，每台各吃 2 次 503 → 各被摘一次。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 503 Probe") << i;
+  }
+  ASSERT_TRUE(wait_until([&] {
+    return health.snapshot(0).ejections_total == 1 && health.snapshot(1).ejections_total == 1;
+  }, 3000)) << "两次 5xx 没有把这台后端摘掉：被动判据没接上";
+  EXPECT_EQ(health.ejected_now(), 2u);
+
+  // 全员被摘 → 回退全员（ADR-12 的"故意保留一段错误"）：/ok 照样有人接。
+  ASSERT_TRUE(client.write_all(get_request("/ok")));
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+
+  // fail_timeout=400ms 到期，循环 sweep 恢复两台。
+  ASSERT_TRUE(wait_until([&] {
+    return health.snapshot(0).recoveries_total == 1 && health.snapshot(1).recoveries_total == 1;
+  }, 3000)) << "到期没有恢复：摘除变成单程票";
+  EXPECT_EQ(health.ejected_now(), 0u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
 }
 
 // 四、**一致性哈希端到端**：同一个 key 换一条连接也落在同一个后端。环本身的性质

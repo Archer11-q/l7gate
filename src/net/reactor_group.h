@@ -82,6 +82,11 @@ class ReactorGroup {
     // 表是只读数据，状态才是私有的，所以共享表不违反 ADR-14。
     const l7gate::route::GroupTable* groups = nullptr;
 
+    // S3-03（ADR-12 落地 + ADR-19 追加第四条）：健康状态表。**nullptr = 健康检查整套
+    // 不装配**（不摘除、不探活，行为与 S3-02 逐字节同形）。全原子、全 worker 共享一份
+    // （先例 ReactorStats）；它由装配方（main.cc / 用例）创建并持有，必须比本组活得久。
+    std::shared_ptr<l7gate::route::HealthTable> health;
+
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，
     // 由 main.cc 的 --workers 覆盖（缺省仍走单 Reactor，见 ADR-14 后果段）。

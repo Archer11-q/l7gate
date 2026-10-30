@@ -196,7 +196,9 @@ bool parse_number(const char* text, long long* out) {
 void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registrations,
                   std::uint64_t epoll_unregistrations, std::uint64_t epoll_modifications,
                   std::size_t read_disarmed_connections, std::int64_t fd_start,
-                  std::int64_t rss_start, long long elapsed_ms) {
+                  std::int64_t rss_start, long long elapsed_ms,
+                  const l7gate::route::HealthTable* health = nullptr,
+                  const std::vector<std::string>& target_names = {}) {
   const std::int64_t fd_now = count_open_fds();
   const std::int64_t rss_now = current_rss_kib();
   // 一行一个 key=value，键名用 ASCII。理由不是审美：这份输出是冒烟脚本的输入，
@@ -284,6 +286,25 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   put("fd_end", static_cast<long long>(fd_now));
   put("rss_start_kib", static_cast<long long>(rss_start));
   put("rss_end_kib", static_cast<long long>(rss_now));
+  if (health != nullptr) {
+    // S3-03 的观测面。逐目标三行：ejections（误摘率与摘除耗时下界的分子）、
+    // probe_ok/probe_fail（探活轮数的分母来源）、last_ejection_epoch_ms（摘除耗时的
+    // "网关自报那一端"，与脚本时间线同一根墙钟轴）。键名里的地址冒号换成下划线，
+    // 让 grep 不用处理两套分隔符。
+    put("health_ejected_now", static_cast<long long>(health->ejected_now()));
+    put("health_ejections_blocked_by_valve",
+        static_cast<long long>(health->ejections_blocked_by_valve()));
+    for (std::uint16_t t = 0; t < health->target_count(); ++t) {
+      const l7gate::route::TargetHealthSnapshot s = health->snapshot(t);
+      std::string key = "health_t" + std::to_string(t) + "_";
+      if (t < target_names.size()) key += target_names[t] + "_";
+      put(key + "ejections", static_cast<long long>(s.ejections_total));
+      put(key + "probe_ok", static_cast<long long>(s.probe_ok_total));
+      put(key + "probe_fail", static_cast<long long>(s.probe_fail_total));
+      put(key + "recoveries", static_cast<long long>(s.recoveries_total));
+      put(key + "last_ejection_epoch_ms", static_cast<long long>(s.last_ejection_epoch_ms));
+    }
+  }
 }
 
 int serve(int argc, char** argv) {
@@ -424,7 +445,8 @@ int serve(int argc, char** argv) {
       return 2;
     }
     for (const l7gate::config::Endpoint& endpoint : gateway_config.endpoints()) {
-      upstream_endpoints.push_back(UpstreamEndpoint{endpoint.address, endpoint.port});
+      upstream_endpoints.push_back(
+          UpstreamEndpoint{endpoint.address, endpoint.port, endpoint.health_path});
     }
   }
   // 单 Reactor 路径（workers < 2）只有一条循环。它的默认目标是第 0 个端点；装了路由/均衡
@@ -436,6 +458,20 @@ int serve(int argc, char** argv) {
   // 有没有装任何 filter，只看文件里有没有对应的那一段。
   const bool has_routes = gateway_config.has_routes;
   const bool has_groups = !gateway_config.groups().empty();
+  // S3-03（ADR-19 追加第四条）：health 段在才建健康表。**必须在这里建而不是在两条路径里
+  // 各建一份**——共享表的读者是全部 worker + LB filter + report_stats，三处拿的必须是
+  // 同一份，摘除的账才只有一个答案。
+  std::shared_ptr<l7gate::route::HealthTable> health_table;
+  if (gateway_config.health().present) {
+    health_table = std::make_shared<l7gate::route::HealthTable>(upstream_endpoints.size(),
+                                                                gateway_config.health().policy);
+  }
+  // 逐目标健康计数器的键名后缀（health_t0_127_0_0_1_18081_ejections=…）。
+  std::vector<std::string> health_target_names;
+  health_target_names.reserve(upstream_endpoints.size());
+  for (const UpstreamEndpoint& endpoint : upstream_endpoints) {
+    health_target_names.push_back(endpoint.address + "_" + std::to_string(endpoint.port));
+  }
 
   // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
   if (workers >= 2) {
@@ -447,6 +483,7 @@ int serve(int argc, char** argv) {
     // S2-06a 那一臂（B-012 成本对照的"空链"那一臂也是这么来的，不是靠我另编一个 binary）。
     gconfig.route_table = has_routes ? &gateway_config.routes() : nullptr;
     gconfig.groups = has_groups ? &gateway_config.groups() : nullptr;
+    gconfig.health = health_table;
     gconfig.listen_backlog = config.listen_backlog;
     gconfig.worker_count = workers;
     gconfig.max_connections_per_worker = config.max_connections;
@@ -484,6 +521,17 @@ int serve(int argc, char** argv) {
       std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu\n",
                   config_path.c_str(), gateway_config.groups().size(),
                   gateway_config.routes().size());
+      if (health_table != nullptr) {
+        // 健康检查装了什么，一条都不省：误摘率与摘除耗时的分母（探活轮数由间隔与
+        // 运行时长决定、健康后端数由这行横幅的成员数背书）从这里对账。
+        const l7gate::route::HealthPolicy& hp = gateway_config.health().policy;
+        std::printf("[serve] health=on max_fails=%u fail_timeout_ms=%lld probe_interval_ms=%lld "
+                    "probe_timeout_ms=%lld max_ejection_percent=%u targets=%zu\n",
+                    hp.max_fails, static_cast<long long>(hp.fail_timeout_ms),
+                    static_cast<long long>(hp.probe_interval_ms),
+                    static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
+                    health_table->target_count());
+      }
     }
     std::fflush(stdout);
 
@@ -496,7 +544,8 @@ int serve(int argc, char** argv) {
 
     report_stats(group.stats(), group.epoll_registrations(), group.epoll_unregistrations(),
                  group.epoll_modifications(), group.connections_with_read_disarmed(), fd_start,
-                 rss_start, static_cast<long long>(elapsed_ms));
+                 rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
+                 health_target_names);
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
     return 0;
@@ -511,6 +560,8 @@ int serve(int argc, char** argv) {
                                                         gateway_config.groups().size());
     config.lb_state = lb_state;
   }
+  // 同一条构造期纪律：健康表在 Reactor 构造之前进 config（Reactor 存 config 的副本）。
+  config.health = health_table;
   l7gate::net::Reactor reactor(config);
   // 链只能在 run() 之前改（S1-08 那条时序纪律：链在循环线程里被逐条读、没有锁）。
   // 顺序 = 路由在前、均衡在后——均衡读的那个组下标正是路由这一环写下的。
@@ -520,7 +571,7 @@ int serve(int argc, char** argv) {
   }
   if (lb_state != nullptr) {
     reactor.add_request_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(
-        gateway_config.groups(), std::move(lb_state)));
+        gateway_config.groups(), std::move(lb_state), health_table));
   }
   int error = 0;
   if (!reactor.start_listen(&error)) {
@@ -550,6 +601,15 @@ int serve(int argc, char** argv) {
     std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu default_target=%u\n",
                 config_path.c_str(), gateway_config.groups().size(),
                 gateway_config.routes().size(), config.default_target);
+    if (health_table != nullptr) {
+      const l7gate::route::HealthPolicy& hp = gateway_config.health().policy;
+      std::printf("[serve] health=on max_fails=%u fail_timeout_ms=%lld probe_interval_ms=%lld "
+                  "probe_timeout_ms=%lld max_ejection_percent=%u targets=%zu\n",
+                  hp.max_fails, static_cast<long long>(hp.fail_timeout_ms),
+                  static_cast<long long>(hp.probe_interval_ms),
+                  static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
+                  health_table->target_count());
+    }
   }
   std::fflush(stdout);
 
@@ -564,7 +624,8 @@ int serve(int argc, char** argv) {
   // 循环已经不再处理事件，剩下的每一个都是没人管的。
   report_stats(reactor.stats(), reactor.epoll_registrations(), reactor.epoll_unregistrations(),
                reactor.epoll_modifications(), reactor.connections_with_read_disarmed(), fd_start,
-               rss_start, static_cast<long long>(elapsed_ms));
+               rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
+               health_target_names);
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   return 0;
 }

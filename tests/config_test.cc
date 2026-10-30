@@ -408,3 +408,120 @@ TEST(S3_02_ConfigFile, TheShippedExampleConfigAssembles) {
   EXPECT_EQ(config.routes().size(), 3u);
   EXPECT_TRUE(config.has_routes);
 }
+
+// --- S3-03（ADR-19 追加第四条）：health 段与 health_path -----------------------------
+// 严格性原样适用：段可选、字段可选，但**认的字段每一个都要类型与取值域对**，
+// 不认的字段一个都不进。每条拒绝用例仍然同时断「话里点到了那个字段」。
+namespace {
+
+std::string with_health(std::string_view health_body) {
+  return std::string(R"({"upstreams":[{"name":"api","balance":"round_robin",)"
+                     R"("targets":[{"address":"127.0.0.1","port":18081}]}],"health":)") +
+         std::string(health_body) + "}";
+}
+
+// 两个组共用一台后端（health_path 一致/冲突的对就建在这上面）。
+std::string two_groups_on(std::string_view path_a, std::string_view path_b) {
+  auto group = [](std::string_view name, std::string_view path) {
+    std::string g = std::string("{\"name\":\"") + std::string(name) +
+                    R"(","balance":"round_robin","targets":[{"address":"127.0.0.1","port":18081)";
+    if (!path.empty()) g += std::string(",\"health_path\":\"") + std::string(path) + "\"";
+    g += "}]}";
+    return g;
+  };
+  return "{\"upstreams\":[" + group("a", path_a) + "," + group("b", path_b) + "]}";
+}
+
+}  // namespace
+
+TEST(S3_03_ConfigHealth, SectionAbsentMeansHealthDisabled) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(groups_only(kApi), &config, &error)) << error;
+  EXPECT_FALSE(config.health().present) << "没有 health 段却不许凭空装配健康检查";
+}
+
+TEST(S3_03_ConfigHealth, EmptySectionAssemblesWithPolicyDefaults) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(with_health("{}"), &config, &error)) << error;
+  ASSERT_TRUE(config.health().present);
+  const l7gate::route::HealthPolicy& policy = config.health().policy;
+  EXPECT_EQ(policy.max_fails, 3u);
+  EXPECT_EQ(policy.fail_timeout_ms, 10000);
+  EXPECT_EQ(policy.probe_interval_ms, 1000);
+  EXPECT_EQ(policy.probe_timeout_ms, 500);
+  EXPECT_EQ(policy.max_ejection_percent, 10u);
+}
+
+TEST(S3_03_ConfigHealth, EveryFieldOverridesAndIntervalZeroDisablesProbes) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(with_health(
+                R"({"max_fails":5,"fail_timeout_ms":2000,"probe_interval_ms":0,)"
+                R"("probe_timeout_ms":100,"max_ejection_percent":25})"),
+                &config, &error))
+      << error;
+  const l7gate::route::HealthPolicy& policy = config.health().policy;
+  EXPECT_EQ(policy.max_fails, 5u);
+  EXPECT_EQ(policy.fail_timeout_ms, 2000);
+  EXPECT_EQ(policy.probe_interval_ms, 0) << "0 = 不主动探活，这一格是格式不是缺省";
+  EXPECT_EQ(policy.probe_timeout_ms, 100);
+  EXPECT_EQ(policy.max_ejection_percent, 25u);
+}
+
+TEST(S3_03_ConfigHealth, RejectsUnknownFieldAndOutOfRangeValues) {
+  expect_rejected(with_health(R"({"probe_jitter_ms":1})"), "probe_jitter_ms");
+  expect_rejected(with_health(R"({"max_fails":0})"), "max_fails");
+  expect_rejected(with_health(R"({"max_fails":-1})"), "max_fails");
+  expect_rejected(with_health(R"({"fail_timeout_ms":0})"), "fail_timeout_ms");
+  expect_rejected(with_health(R"({"probe_interval_ms":-5})"), "probe_interval_ms");
+  expect_rejected(with_health(R"({"probe_timeout_ms":0})"), "probe_timeout_ms");
+  expect_rejected(with_health(R"({"max_ejection_percent":101})"), "max_ejection_percent");
+  expect_rejected(with_health(R"({"max_ejection_percent":"10"})"), "max_ejection_percent");
+  expect_rejected(with_health("[]"), "health");
+}
+
+TEST(S3_03_ConfigHealth, HealthPathReadBackDefaultsAndRejectsBadShape) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(groups_only(kApi), &config, &error)) << error;
+  ASSERT_EQ(config.endpoints().size(), 1u);
+  EXPECT_EQ(config.endpoints()[0].health_path, "/") << "缺省路径是 /（已裁第 3 条①）";
+
+  GatewayConfig with_path;
+  ASSERT_TRUE(build_from(
+      groups_only(R"({"name":"api","balance":"round_robin","targets":[{"address":"127.0.0.1",)"
+                  R"("port":18081,"health_path":"/healthz"}]})"),
+      &with_path, &error))
+      << error;
+  EXPECT_EQ(with_path.endpoints()[0].health_path, "/healthz");
+
+  expect_rejected(
+      groups_only(R"({"name":"api","balance":"round_robin","targets":[{"address":"127.0.0.1",)"
+                  R"("port":18081,"health_path":""}]})"),
+      "health_path");
+  expect_rejected(
+      groups_only(R"({"name":"api","balance":"round_robin","targets":[{"address":"127.0.0.1",)"
+                  R"("port":18081,"health_path":"healthz"}]})"),
+      "health_path");
+  expect_rejected(
+      groups_only(R"({"name":"api","balance":"round_robin","targets":[{"address":"127.0.0.1",)"
+                  R"("port":18081,"health_path":3}]})"),
+      "health_path");
+}
+
+TEST(S3_03_ConfigHealth, SameBackendDifferentHealthPathIsRejectedSamePathDedups) {
+  // 同一台机器两个"活着"的定义 → 拒绝。
+  expect_rejected(two_groups_on("/healthz", "/livez"), "health_path");
+  // 一致的路径照常去重成一条目标。
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(two_groups_on("/healthz", "/healthz"), &config, &error)) << error;
+  EXPECT_EQ(config.endpoints().size(), 1u);
+  EXPECT_EQ(config.endpoints()[0].health_path, "/healthz");
+  // 双方都不写（都用缺省 /）也照常去重。
+  GatewayConfig both_default;
+  ASSERT_TRUE(build_from(two_groups_on("", ""), &both_default, &error)) << error;
+  EXPECT_EQ(both_default.endpoints().size(), 1u);
+}
