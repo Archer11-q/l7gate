@@ -4707,5 +4707,145 @@ TEST(S3_04_NodesE2E, ReloadAddsRemovesAndReAddsMembersWithoutRestart) {
 }
 
 
+
+// ======================= S3-05：故障注入矩阵——ctest 里能跑的两格 =======================
+//
+// 五类故障里，"connect refused / 5xx / 探活失败"的机制已由 S3_03_HealthE2E 三条钉过
+// （connect 失败、被动 5xx、404 活）；这里补 S3-05 矩阵缺的两格：
+//   半开（连上不回字节）——探活超时判死的路径 + 解除后恢复；
+//   慢响应但在探活超时内——**不摘**（"慢"与"死"的分界线就是 probe_timeout）。
+// 每类的真进程摘除/恢复耗时实测在 scripts/fault/s3-05-matrix.sh 与 FAULT-INJECTION §12。
+
+TEST(S3_05_FaultMatrix, HalfOpenStallTimesOutProbesAndRecoversOnStallExpiry) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend0.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend1.port())});
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 50;
+  policy.probe_timeout_ms = 200;
+  policy.max_fails = 2;
+  policy.fail_timeout_ms = 60000;  // 恢复只能靠探活成功：耗时测的就是这条链
+  policy.max_ejection_percent = 50;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend0.port()),
+               "127.0.0.1:" + std::to_string(backend1.port())},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  // 半开：accept 照旧、一个字节都不读不回——探活 connect 成功但等不到响应，
+  // 每次探活吃满 probe_timeout 再判死。max_fails=2 → 约 2×(200+50)ms 后摘除。
+  backend1.set_stall_reads(true);
+  const auto stalled_at = std::chrono::steady_clock::now();
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).ejections_total >= 1; }, 5000))
+      << "半开的后端没有被摘除：探活超时判死这条路断了";
+  const auto eject_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - stalled_at)
+                            .count();
+  EXPECT_LT(eject_ms, 5000);
+  // 摘除后流量只去 0 号：连发四条全部 64 B。
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 4; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/after-eject")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(body.size(), 64u) << "半开后端还在接流量";
+    c.close();
+  }
+
+  // 解除 stall：下一次探活成功立即恢复（不等 60s 的 fail_timeout）。
+  backend1.set_stall_reads(false);
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).recoveries_total >= 1; }, 5000))
+      << "解除后探活成功没有恢复：恢复链路断了";
+  bool resumed = false;
+  for (int i = 0; i < 50 && !resumed; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/after-recover")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    resumed = body.size() == 128u;
+    c.close();
+  }
+  EXPECT_TRUE(resumed) << "恢复的成员接不到流量";
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
+}
+
+TEST(S3_05_FaultMatrix, SlowWithinProbeTimeoutStaysAlive) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+  // 慢 100ms：探活等得起（probe_timeout 500ms），业务请求也等得起。
+  backend1.set_delay_before_response_ms(100);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend0.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(backend1.port())});
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 50;
+  policy.probe_timeout_ms = 500;
+  policy.max_fails = 2;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 50;
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend0.port()),
+               "127.0.0.1:" + std::to_string(backend1.port())},
+              policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  // 跑 ≥10 轮探活（500ms 以上），慢后端一次都不该被摘——"慢"与"死"的分界线就是
+  // probe_timeout，这条线之内网关不表态（判断留给 S4 的请求超时格子）。
+  ASSERT_TRUE(wait_until([&] {
+    return health.snapshot(1).probe_ok_total >= 10;
+  }, 5000)) << "探活对慢后端没有成功过：delay 100ms 不该撞 500ms 的超时";
+  EXPECT_EQ(health.snapshot(1).ejections_total, 0u) << "超时线之内的慢被当成死了";
+  EXPECT_EQ(health.ejected_now(), 0u);
+  // 业务照样通：轮询两条都拿到响应。
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 4; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(c.write_all(get_request("/slow-but-alive")));
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK");
+    c.close();
+  }
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  backend0.stop_and_join();
+  backend1.stop_and_join();
+}
+
 }  // namespace l7gate::net
 
