@@ -139,6 +139,7 @@ add_library(l7gate_core STATIC
   src/core/build_info.cc
   src/filter/chain.cc
   src/filter/lb_filter.cc
+  src/filter/rate_limit.cc
   src/filter/route_filter.cc
   src/net/buffer.cc
   src/net/connection.cc

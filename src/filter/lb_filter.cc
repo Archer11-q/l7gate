@@ -24,24 +24,8 @@ std::int64_t now_ms() noexcept {
       .count();
 }
 
-// 大小写不敏感找第一个命中的头（HTTP 字段名的语义），口径与 `ParsedRequest::find_header` 一致。
-std::optional<std::string_view> find_header(std::span<const l7gate::http::HeaderEntry> headers,
-                                           std::string_view name) noexcept {
-  for (const l7gate::http::HeaderEntry& entry : headers) {
-    if (entry.name.size() != name.size()) continue;
-    bool same = true;
-    for (std::size_t i = 0; i < name.size(); ++i) {
-      const char a = static_cast<char>(::tolower(static_cast<unsigned char>(entry.name[i])));
-      const char b = static_cast<char>(::tolower(static_cast<unsigned char>(name[i])));
-      if (a != b) {
-        same = false;
-        break;
-      }
-    }
-    if (same) return entry.value;
-  }
-  return std::nullopt;
-}
+// 大小写不敏感找第一个命中的头（HTTP 字段名的语义）在 `chain.cc` 的
+// `find_header_value` 里——S4-03 起限流的 header 键也用它，两处共用一份。
 
 }  // namespace
 
@@ -142,7 +126,8 @@ Decision LoadBalanceFilter::on_request(RequestInfo& info) {
 std::string_view LoadBalanceFilter::hash_key_of(const RequestInfo& info,
                                                 const route::HashKey& key) const noexcept {
   if (key.source == route::HashKey::Source::kHeaderName && !key.header_name.empty()) {
-    const std::optional<std::string_view> value = find_header(info.headers, key.header_name);
+    const std::optional<std::string_view> value =
+        find_header_value(info.headers, key.header_name);
     if (value.has_value() && !value->empty()) return *value;
     // 头缺失或值为空 → 退回整条 target（理由写在头文件：空串会把所有没带头的请求钉在同一后端）。
   }

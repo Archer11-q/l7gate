@@ -23,6 +23,7 @@
 #include "config/nodes_store.h"
 #include "core/build_info.h"
 #include "filter/lb_filter.h"
+#include "filter/rate_limit.h"
 #include "filter/route_filter.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
@@ -357,6 +358,22 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   }
 }
 
+// S4-03（ADR-21）：限流的启动横幅与退出账。**共用一份桶表**的两种装配路径
+// （单 Reactor / ReactorGroup）都要打同一组键，冒烟/报告只认这一份口径。
+std::string rate_limit_key_text(const l7gate::config::RateLimitSection& section) {
+  return section.by_header ? "header:" + section.header_name : "path";
+}
+
+void report_rate_limit(const std::shared_ptr<l7gate::filter::RateLimiter>& limiter) {
+  if (limiter == nullptr) return;
+  std::printf("[serve] rate_limit_allowed=%llu rate_limit_rejected=%llu "
+              "rate_limit_overflow_keys=%llu rate_limit_keys=%zu\n",
+              static_cast<unsigned long long>(limiter->allowed_total()),
+              static_cast<unsigned long long>(limiter->rejected_total()),
+              static_cast<unsigned long long>(limiter->overflow_keys()),
+              limiter->key_count());
+}
+
 int serve(int argc, char** argv) {
   l7gate::net::Reactor::Config config;
   std::size_t stop_after_requests = 0;
@@ -660,6 +677,19 @@ int serve(int argc, char** argv) {
     health_target_names.push_back(endpoint.address + "_" + std::to_string(endpoint.port));
   }
 
+  // S4-03（ADR-21）：限流桶表只建一次，两条装配路径拿同一个 `shared_ptr`。
+  // per-worker 桶会把限额放大 N 倍——"这个网关每秒最多放行 N 条"是共享桶表的语义。
+  std::shared_ptr<l7gate::filter::RateLimiter> rate_limiter;
+  l7gate::filter::RateLimitKeySpec rate_key;
+  if (gateway_config.rate_limit().present) {
+    const l7gate::config::RateLimitSection& section = gateway_config.rate_limit();
+    rate_limiter =
+        std::make_shared<l7gate::filter::RateLimiter>(section.rate_per_sec, section.burst);
+    rate_key.source = section.by_header ? l7gate::filter::RateLimitKeySpec::Source::kHeader
+                                        : l7gate::filter::RateLimitKeySpec::Source::kPath;
+    rate_key.header_name = section.header_name;
+  }
+
   // S3-04（ADR-20 第四节）：reload 线程。MySQL 查询是阻塞 IO，不进 worker 事件循环；
   // 它与 worker 的唯一接触面是 NodesPublisher 那根原子快照指针。成员没变就不发布：
   // 查了一遍不等于发布了一次，观测面不把两者混成同一个数。
@@ -718,6 +748,8 @@ int serve(int argc, char** argv) {
     gconfig.groups = has_groups ? &gateway_config.groups() : nullptr;
     gconfig.health = health_table;
     gconfig.nodes = nodes_publisher;
+    gconfig.rate_limiter = rate_limiter;
+    gconfig.rate_key = rate_key;
     gconfig.listen_backlog = config.listen_backlog;
     gconfig.worker_count = workers;
     gconfig.max_connections_per_worker = config.max_connections;
@@ -753,7 +785,15 @@ int serve(int argc, char** argv) {
                 gconfig.connection.inbound.high_water_mark, drain_timeout_ms);
     std::printf("[serve] upstream_timeouts=on connect_ms=%lld head_ms=%lld body_idle_ms=%lld\n",
                 upstream_connect_timeout_ms, upstream_head_timeout_ms,
-                upstream_body_idle_timeout_ms);    if (has_routes || has_groups) {
+                upstream_body_idle_timeout_ms);
+    if (rate_limiter != nullptr) {
+      const l7gate::config::RateLimitSection& rl = gateway_config.rate_limit();
+      std::printf("[serve] rate_limit=on rate_per_sec=%llu burst=%llu key=%s\n",
+                  static_cast<unsigned long long>(rl.rate_per_sec),
+                  static_cast<unsigned long long>(rl.burst),
+                  rate_limit_key_text(rl).c_str());
+    }
+    if (has_routes || has_groups) {
       // **单独一行，不动上面那条横幅**：`scripts/bench/s1-p99.sh` 是靠横幅里的键名
       // （多 Reactor 有 `workers=`、单 Reactor 有 `max_connections=`）当场判"这一臂到底是
       // 哪条路径"的，改那些键等于让历史脚本对不上路。策略的信息量新起一行给。
@@ -793,6 +833,7 @@ int serve(int argc, char** argv) {
                  group.epoll_modifications(), group.connections_with_read_disarmed(), fd_start,
                  rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                  health_target_names, nodes_publisher.get());
+    report_rate_limit(rate_limiter);
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
     return 0;
@@ -812,6 +853,13 @@ int serve(int argc, char** argv) {
   config.nodes = nodes_publisher;
   l7gate::net::Reactor reactor(config);
   // 链只能在 run() 之前改（S1-08 那条时序纪律：链在循环线程里被逐条读、没有锁）。
+  // **S4-03 起链首是限流**（ADR-21 第二节第 3 条：限的是"进门"，路由决定"去哪"）；
+  // 顺序 = 限流 → 路由 → 均衡——路由读的是本 worker 的默认目标外唯一能写组下标的一环，
+  // 限流不写任何字段，放最前不会遮蔽后面任何人的写回。
+  if (rate_limiter != nullptr) {
+    reactor.add_request_filter(
+        std::make_unique<l7gate::filter::RateLimitFilter>(rate_limiter, rate_key));
+  }
   // 顺序 = 路由在前、均衡在后——均衡读的那个组下标正是路由这一环写下的。
   if (has_routes) {
     reactor.add_request_filter(
@@ -847,6 +895,13 @@ int serve(int argc, char** argv) {
   std::printf("[serve] upstream_timeouts=on connect_ms=%lld head_ms=%lld body_idle_ms=%lld\n",
               upstream_connect_timeout_ms, upstream_head_timeout_ms,
               upstream_body_idle_timeout_ms);
+  if (rate_limiter != nullptr) {
+    const l7gate::config::RateLimitSection& rl = gateway_config.rate_limit();
+    std::printf("[serve] rate_limit=on rate_per_sec=%llu burst=%llu key=%s\n",
+                static_cast<unsigned long long>(rl.rate_per_sec),
+                static_cast<unsigned long long>(rl.burst),
+                rate_limit_key_text(rl).c_str());
+  }
   if (has_routes || has_groups) {
     // 同多 Reactor 那一臂：新起一行，不碰上面那条签名行。
     std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu default_target=%u\n",
@@ -885,6 +940,7 @@ int serve(int argc, char** argv) {
                reactor.epoll_modifications(), reactor.connections_with_read_disarmed(), fd_start,
                rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                health_target_names, nodes_publisher.get());
+  report_rate_limit(rate_limiter);
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   return 0;
 }

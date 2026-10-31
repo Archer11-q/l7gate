@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include "filter/lb_filter.h"    // S3-02：链上的第二环（组 → 目标）
+#include "filter/rate_limit.h"   // S4-03：链首的限流（ADR-21）
 #include "filter/route_filter.h"  // S3-01：端到端那组用例装的就是它
 #include "lb_fixture.h"           // S3-02：测试侧的组装配（含建环）
 #include "net/reactor.h"
@@ -5419,6 +5420,94 @@ TEST(S4_02_SelfReplies, EveryDeadUpstreamRequestGetsIts502WithinFiveSeconds) {
   EXPECT_EQ(stats.load(stats.gateway_replies_sent), static_cast<std::uint64_t>(kClients));
 
   for (auto& c : clients) c->close();
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// --- S4-03：限流端到端（ADR-21 第二/四节） -------------------------------------
+//
+// 两条：单 Reactor 断"429 不回源 + 计数走既有口径"；4 worker 断"桶是共享的、
+// 不是每 worker 一只"——后者是本任务最容易被写错的一格（写错了会跑、会均衡，
+// 只是限额是配置的 N 倍）。
+
+TEST(S4_03_RateLimit, Returns429WithoutOpeningUpstream) {
+  std::string why;
+  Harness harness;
+  auto limiter = std::make_shared<l7gate::filter::RateLimiter>(1, 2);
+  harness.add_filter(std::make_unique<l7gate::filter::RateLimitFilter>(
+      limiter, l7gate::filter::RateLimitKeySpec{}));
+  ASSERT_TRUE(harness.start(default_options(), &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 前两条各占一只配对上游（c1/c2 不关，上游不会被回收进池），第三条撞 429。
+  Client c1;
+  Client c2;
+  ASSERT_TRUE(c1.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c1.write_all(get_request("/limited")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c1.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  ASSERT_TRUE(c2.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c2.write_all(get_request("/limited")));
+  ASSERT_TRUE(c2.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+
+  Client c3;
+  ASSERT_TRUE(c3.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c3.write_all(get_request("/limited")));
+  ASSERT_TRUE(c3.read_response(&status, &body, &why)) << "超速率的请求没有拿到 429";
+  EXPECT_EQ(status, "HTTP/1.1 429 Too Many Requests");
+  EXPECT_EQ(limiter->allowed_total(), 2u);
+  EXPECT_EQ(limiter->rejected_total(), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 2u) << "429 不许回源";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 3u)
+      << "429 是解析成功之后的表态：这条请求本身数在 requests_parsed 里（ADR-21 第四节第 6 条）";
+  c1.close();
+  c2.close();
+  c3.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+TEST(S4_03_RateLimit, FourWorkersShareOneBucketNotFour) {
+  std::string why;
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(4);
+  auto limiter = std::make_shared<l7gate::filter::RateLimiter>(1, 20);
+  options.config.rate_limiter = limiter;  // 4 条 worker 的 filter 拿同一份桶表
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  int ok = 0;
+  int limited = 0;
+  for (int i = 0; i < 40; ++i) {
+    Client c;
+    ASSERT_TRUE(c.connect_to(harness.port(), &why)) << i << ": " << why;
+    ASSERT_TRUE(c.write_all(get_request("/shared")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << i << ": " << why;
+    if (status == "HTTP/1.1 200 OK") {
+      ++ok;
+    } else if (status == "HTTP/1.1 429 Too Many Requests") {
+      ++limited;
+    } else {
+      ADD_FAILURE() << i << "：意料外的状态行 " << status;
+    }
+  }
+  // 40 条本机请求在 rate=1/s 下远不到 1 秒，补货补不出第 21 个令牌。
+  EXPECT_EQ(ok, 20) << "4 个 worker 各有一只桶：限额被放大到 " << ok << "（应当是 20）";
+  EXPECT_EQ(limited, 20);
+  EXPECT_EQ(limiter->key_count(), 1u) << "同一个 path 键应当只占一只桶";
+  ReactorStats& stats = harness.group()->stats();
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 20u);
+  // "429 不回源"的直接证据是**上游自己服务的条数**，不是 upstream_opened：池会把
+  // 前一条下游的上游复用给下一条，所以"开了几条连接"与"服务了几条请求"不是同一个数。
+  EXPECT_EQ(harness.upstream().requests_served(), 20u) << "被限的请求到达了上游";
+
   harness.stop_loop();
   harness.shutdown_all();
 }

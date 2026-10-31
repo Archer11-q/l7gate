@@ -1,6 +1,26 @@
 #include "filter/chain.h"
 
+#include <cctype>
+
 namespace l7gate::filter {
+
+std::optional<std::string_view> find_header_value(std::span<const http::HeaderEntry> headers,
+                                                  std::string_view name) noexcept {
+  for (const http::HeaderEntry& entry : headers) {
+    if (entry.name.size() != name.size()) continue;
+    bool same = true;
+    for (std::size_t i = 0; i < name.size(); ++i) {
+      const char a = static_cast<char>(::tolower(static_cast<unsigned char>(entry.name[i])));
+      const char b = static_cast<char>(::tolower(static_cast<unsigned char>(name[i])));
+      if (a != b) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return entry.value;
+  }
+  return std::nullopt;
+}
 
 void FilterChain::add(std::unique_ptr<RequestFilter> filter) noexcept {
   if (filter == nullptr) return;  // 空 unique_ptr 不进链：一条链里有 nullptr，

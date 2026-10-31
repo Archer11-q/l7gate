@@ -126,6 +126,12 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     }
     auto worker = std::make_unique<Reactor>(wc, *stats_);
     // 两个 filter 都只能在 run() 之前挂（链在循环线程里被逐条读、无锁，S1-08 那条时序纪律）。
+    // **S4-03 起链首多一环限流**（ADR-21 第二节第 3 条：限的是"进门"，路由决定"去哪"）。
+    // 全部 worker 的 filter 拿同一个 `RateLimiter`——共享的是桶表，不是状态的所有权。
+    if (config_.rate_limiter != nullptr) {
+      worker->add_request_filter(std::make_unique<filter::RateLimitFilter>(
+          config_.rate_limiter, config_.rate_key));
+    }
     // **顺序 = 路由在前、均衡在后**：均衡读的那个组下标就是路由这一环写下的，
     // 反过来的话链短路时没人决定过组，均衡只能退回默认目标。
     if (config_.route_table != nullptr && !config_.route_table->empty()) {

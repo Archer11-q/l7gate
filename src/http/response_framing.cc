@@ -440,6 +440,13 @@ std::string_view gateway_error_reply(std::uint16_t status) noexcept {
              "Connection: close\r\n"
              "\r\n"
              "Not Found\n";
+    case 429:
+      // S4-03（ADR-21 第二节第 3 条）：限流表态。被限的请求不出网关、不回源。
+      return "HTTP/1.1 429 Too Many Requests\r\n"
+             "Content-Length: 18\r\n"
+             "Connection: close\r\n"
+             "\r\n"
+             "Too Many Requests\n";
     case 501:
       return "HTTP/1.1 501 Not Implemented\r\n"
              "Content-Length: 16\r\n"

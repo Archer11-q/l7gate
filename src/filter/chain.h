@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -111,5 +112,11 @@ class FilterChain {
  private:
   std::vector<std::unique_ptr<RequestFilter>> filters_;
 };
+
+// 大小写不敏感找第一个命中的头值（HTTP 字段名语义）。
+// S4-03 起两个 filter 共用这一份：`LoadBalanceFilter` 的 `hash_key: header:<名字>` 与
+// `RateLimitFilter` 的 `key: header:<名字>`。两处各写一份的话，"头名怎么比"迟早一边改一边没改。
+std::optional<std::string_view> find_header_value(std::span<const http::HeaderEntry> headers,
+                                                  std::string_view name) noexcept;
 
 }  // namespace l7gate::filter

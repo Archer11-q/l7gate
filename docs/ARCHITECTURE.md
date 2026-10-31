@@ -946,6 +946,53 @@ mallinfo2）。**S4-02 对这三条落地做了一处修正与一处补课，记
 established=72268、27,732 条 handshake-timeout、not_101=0），那一轮连同它暴露的
 隧道超时缺陷一起作废、原样留在 `build/bench/replay-b006-s402/`。
 
+### 1.29 本地令牌桶限流（S4-03，ADR-21 第二/四节）：链上第一句"不"
+
+**这一节在问什么**：S3 的网关会选人、会摘人，S4-01/02 会给上游加限期、会在拿不到上游时表态，
+但它还不会因为"流量太多"拒绝——429 这一格此前不存在。S4-03 是链上**第一条会主动拒绝**的环，
+也是 `filter` 链接口"能装下限流"那句验收第一次真正兑现。
+
+**一、桶的数学与状态。** 一个 `TokenBucket` 的余额与上次补货时刻打包在**一个 64 位原子**里：
+高 32 = 单调毫秒的低 32 位、低 32 = 毫 token（1 token = 1000 单位）。CAS 循环里做
+"按 `elapsed` 补货 → 夹到 burst → 够就扣一个"。两个原子（余额一个、时刻一个）做 CAS
+有一个已知的过补窗口：赢家在两次写之间被输家读到"新余额 + 旧时刻"，输家按旧时刻多补一截；
+打包成一个字之后 CAS 是单点。`rate` 是整数（配置 JSON 只认整数），所以每毫秒补
+`rate` 个毫 token，没有取整误差。**拒绝不写回状态**：补货是懒的，下一次按同一个 last 重算。
+
+**二、per-key 桶与键数上界（ADR-21 第四节）。** 键取自请求：`path`（缺省，原始
+origin-form 含 query）或 `header:<名字>`（大小写不敏感取第一个值；缺失/为空退回 target）。
+键 → 桶是一张 `std::mutex` 保护的哈希表（临界区只有一次异构查找，桶的 CAS 在锁外）；
+**桶的准入是共享原子，表是结构**——正文那条"全原子"约束的是前者，per-worker 桶才是它
+拒绝的形态。键数硬上界 **16384**：满了之后新键共用一只溢出桶（限流仍生效、粒度退化为
+"溢出键共享额度"），计 `rate_limit_overflow_keys`。不回收旧桶——`header:` 键的基数由
+客户端控制，没有上界就是内存 DoS；代价是冷掉的键占位到进程重启，照记。
+
+**三、链位置与表态。** 限流 filter 在**链首**（路由之前）：它不写 `upstream_group` /
+`upstream_target`，拒绝 = `kStop + reject_status=429`，走 S3-01 的写回通道与 reactor 的
+`fail_pair_with_reply`（`ReplyCause::kNone`）→ `gateway_replies_sent`；被限的请求
+`upstream_opened` 不动。`requests_parsed` 仍数这条请求本身——它是**解析成功**的请求，
+限流器自己的 `allowed`/`rejected` 另成两格，不往 `requests_parsed` 里加任何东西
+（ADR-21 第二节第 4 条）。
+
+**四、配置与装配。** `rate_limit` 段（可选）：`{ "rate": 令牌/秒, "burst": 桶容量,
+"key": "path" | "header:<名字>" }`。`rate`/`burst` **必填**、正整数（1..1,000,000）——
+给限流编一个缺省值等于替流量改行为；`key` 缺省 path。`"ip"` 是**具名拒绝**：`RequestInfo`
+没有对端地址，加它要动 `sizeof(Connection)` 的 528，而按用户/IP 的维限不在 S4 范围
+（ADR-21 第四节第 1 条）。桶表由 `main.cc` 建一次，以 `shared_ptr` 进
+`ReactorGroup::Config`，每个 worker 的 filter 拿同一份——4 worker × burst=20 的用例断
+"总放行恰好 20，不是 80"。启动横幅 `rate_limit=on rate_per_sec=… burst=… key=…`、
+退出账 `rate_limit_allowed/rejected/overflow_keys/keys` 两条路径（单 Reactor / 多 worker）
+同一组键名。
+
+**实测**：三 preset 各 **280/280**、非 gtest 警告 **0 条**、tsan 日志 `ThreadSanitizer` 0 次、
+六条冒烟全绿。进程侧（`build/debug` + 真 curl，同 path 打 6 条、burst=3、rate=1/s）：
+`codes: 200 200 200 429 429 429`，退出账 `allowed=3 rejected=3 overflow_keys=0 keys=1`。
+**阳性验证两处真红**：① 每个 worker 一只桶 → `FourWorkersShareOneBucketNotFour` 当场红
+（放行 80 而非 20）；② 补货速率写成 1000 倍 → 桶数学、单 Reactor 429 两条同时红。
+**边界**：token 不退、不排队（ADR-21 第三节）；`header:` 键的基数上界与溢出桶的代价见上；
+mutex 查表 + 一次 CAS 的每请求成本在 S4-08 对 B-008 的 8.7 µs 报——限流默认不装配，
+既有基线不受影响；跨进程精确性归 S4-04 的 Redis。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 

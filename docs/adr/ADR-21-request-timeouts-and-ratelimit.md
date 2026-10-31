@@ -45,3 +45,4 @@
 6. **链位置与表态**：限流 filter 在链首（路由之前），拒绝 = `kStop + reject_status=429`，走 S3-01 的写回通道与 `fail_pair_with_reply`（cause=kNone）→ `gateway_replies_sent`；被限的请求 `upstream_opened` 不动。`requests_parsed` 仍数这条请求本身（它是解析成功的请求），限流器自己的 `allowed`/`rejected` 另成两格，**不**往 `requests_parsed` 里加任何东西。
 7. **多 worker 共用一份桶表**：桶表由装配方建一次、以 `shared_ptr` 进 `ReactorGroup::Config`，每个 worker 的 filter 拿同一份——per-worker 桶把限额放大 N 倍，正是正文第二条拒绝的形态。4 worker × burst=20 的用例断"总放行恰好 20，不是 80"。
 8. **成本**：限流默认不装配，B-008/B-016 的基线不受影响；开启后的每请求成本（mutex 查表 + 一次 CAS）在 S4-08 对 B-008 的 8.7 µs 报。
+9. **落地实测（2026-10-31）**：三 preset 各 **280/280**、非 gtest 警告 0、tsan 0 race、六条冒烟全绿；进程侧真 curl 同 path 打 6 条（burst=3、rate=1/s）→ **`200 200 200 429 429 429`**，退出账 `allowed=3 rejected=3 overflow_keys=0 keys=1`。阳性验证两处真红：每个 worker 一只桶 → 4 worker 用例放行 80（应为 20）；补货速率写成 1000 倍 → 桶数学与单 Reactor 429 两条同时红。

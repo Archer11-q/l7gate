@@ -23,5 +23,6 @@
     { "match": "regex", "pattern": "/v[0-9]+/orders", "upstream": "shard" },
     { "match": "prefix", "pattern": "/api", "upstream": "api" },
     { "match": "prefix", "pattern": "", "upstream": "api" }
-  ]
+  ],
+  "rate_limit": { "rate": 1000, "burst": 1000, "key": "path" }
 }

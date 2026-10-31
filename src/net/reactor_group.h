@@ -13,6 +13,7 @@
 #include "net/fd.h"
 #include "net/reactor.h"
 #include "net/stats.h"
+#include "filter/rate_limit.h"
 #include "route/router.h"  // Config::route_table 的指向类型（本文件直接用它，就直接 include）
 
 namespace l7gate::net {
@@ -81,6 +82,13 @@ class ReactorGroup {
     // 每一个 worker 拿**同一张表**但**各有一份 LbState**——这是 ADR-19「per-worker 均衡」的实现处：
     // 表是只读数据，状态才是私有的，所以共享表不违反 ADR-14。
     const l7gate::route::GroupTable* groups = nullptr;
+
+    // S4-03（ADR-21 第二/四节）：本地限流。**nullptr = 不装限流 filter**。
+    // 与均衡状态**刻意相反**：桶表由装配方建一次、全部 worker 共用同一份——
+    // per-worker 桶会把限额放大 N 倍，那不是限流是装饰。filter 自身无状态，
+    // 每个 worker 只是持有同一个 `shared_ptr`。
+    std::shared_ptr<filter::RateLimiter> rate_limiter;
+    filter::RateLimitKeySpec rate_key;
 
     // S3-03（ADR-12 落地 + ADR-19 追加第四条）：健康状态表。**nullptr = 健康检查整套
     // 不装配**（不摘除、不探活，行为与 S3-02 逐字节同形）。全原子、全 worker 共享一份

@@ -407,6 +407,12 @@ TEST(S3_02_ConfigFile, TheShippedExampleConfigAssembles) {
   EXPECT_FALSE(config.groups().group_at(1)->ring.empty()) << "哈希组没有环：示例配置一跑就 502";
   EXPECT_EQ(config.routes().size(), 3u);
   EXPECT_TRUE(config.has_routes);
+  // S4-03：示例配置里那一格也要被 ctest 真的装配一遍（字段变了而示例没变，
+  // "示例能直接跑通"这句就没有人验）。
+  EXPECT_TRUE(config.rate_limit().present);
+  EXPECT_EQ(config.rate_limit().rate_per_sec, 1000u);
+  EXPECT_EQ(config.rate_limit().burst, 1000u);
+  EXPECT_FALSE(config.rate_limit().by_header);
 }
 
 // --- S3-03（ADR-19 追加第四条）：health 段与 health_path -----------------------------
@@ -561,4 +567,68 @@ TEST(S3_04_ConfigNodes, MysqlGroupAssemblesEmptyUntilMembersArrive) {
   EXPECT_TRUE(group->ring.empty()) << "环随第一份有成员的快照发布，装配期不建";
   // 哈希组缺环的 502 语义由 S3_02_LoadBalanceFilter.HashGroupWithoutRingRejectsFiveOhTwo 钉着，
   // mysql 组到岗前的行为与它同一条路。
+}
+
+// --- S4-03（ADR-21 第二/四节）：rate_limit 段 ---------------------------------------
+// 段可选；段存在时 rate/burst **必填**（不给限流编缺省值）；key 可选、缺省 path。
+// `ip` 是**具名推迟**（ADR-21 第四节第 1 条），不是未知字段——话里必须点到它，
+// 免得读的人以为"配了 ip 却没生效"。
+
+namespace {
+
+std::string with_rate_limit(std::string_view limit_body) {
+  return std::string(R"({"upstreams":[{"name":"api","balance":"round_robin",)"
+                     R"("targets":[{"address":"127.0.0.1","port":18081}]}],"rate_limit":)") +
+         std::string(limit_body) + "}";
+}
+
+}  // namespace
+
+TEST(S4_03_ConfigRateLimit, ParsesRateBurstAndKey) {
+  {
+    GatewayConfig config;
+    std::string error;
+    ASSERT_TRUE(build_from(with_rate_limit(R"({"rate":10,"burst":20})"), &config, &error))
+        << error;
+    EXPECT_TRUE(config.rate_limit().present);
+    EXPECT_EQ(config.rate_limit().rate_per_sec, 10u);
+    EXPECT_EQ(config.rate_limit().burst, 20u);
+    EXPECT_FALSE(config.rate_limit().by_header) << "key 缺省是 path";
+  }
+  {
+    GatewayConfig config;  // 每次装一份新的：组表在对象里累积，复用会把 name 判成重复
+    std::string error;
+    ASSERT_TRUE(build_from(with_rate_limit(R"({"rate":5,"burst":7,"key":"header:X-Api-Key"})"),
+                           &config, &error))
+        << error;
+    EXPECT_TRUE(config.rate_limit().by_header);
+    EXPECT_EQ(config.rate_limit().header_name, "X-Api-Key");
+  }
+  {
+    // 段不存在 = 不装限流（与 health 同形）。
+    GatewayConfig config;
+    std::string error;
+    ASSERT_TRUE(build_from(groups_only(R"({"name":"api","balance":"round_robin",)"
+                                       R"("targets":[{"address":"127.0.0.1","port":18081}]})"),
+                           &config, &error))
+        << error;
+    EXPECT_FALSE(config.rate_limit().present);
+  }
+}
+
+TEST(S4_03_ConfigRateLimit, RejectsBadSectionsAndParameters) {
+  expect_rejected(with_rate_limit(R"({"burst":20})"), "rate");
+  expect_rejected(with_rate_limit(R"({"rate":10})"), "burst");
+  expect_rejected(with_rate_limit(R"({"rate":0,"burst":20})"), "rate");
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":0})"), "burst");
+  expect_rejected(with_rate_limit(R"({"rate":1000001,"burst":1})"), "rate");
+  expect_rejected(with_rate_limit(R"({"rate":1,"burst":1000001})"), "burst");
+  expect_rejected(with_rate_limit(R"({"rate":"10","burst":1})"), "rate");
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"keys":"path"})"), "keys");
+  expect_rejected(with_rate_limit("[]"), "rate_limit");
+  // `ip` 具名推迟：话里点到 ip（并指向 ADR-21 第四节），不是当未知字段糊掉。
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"ip"})"), "ip");
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"target"})"), "key");
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"header:"})"), "key");
+  expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"header:a b"})"), "key");
 }

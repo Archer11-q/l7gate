@@ -94,7 +94,10 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     *error = "配置顶层必须是对象（有 upstreams 与 routes 两个键）";
     return false;
   }
-  if (!forbid_unknown(document, {"upstreams", "routes", "health"}, error, "配置顶层")) return false;
+  if (!forbid_unknown(document, {"upstreams", "routes", "health", "rate_limit"}, error,
+                      "配置顶层")) {
+    return false;
+  }
 
   const JsonValue* upstreams = nullptr;
   if (!need(document, "upstreams", JsonValue::Kind::kArray, &upstreams, error, "配置顶层")) {
@@ -349,6 +352,66 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     if (!need_int("max_ejection_percent", 0, 100, &v)) return false;
     if (health->find("max_ejection_percent") != nullptr) {
       policy.max_ejection_percent = static_cast<std::uint32_t>(v);
+    }
+  }
+
+  // rate_limit 段可选（S4-03，ADR-21 第二/四节）：段不存在 = 不装限流，存在则
+  // rate / burst **必填**（没有缺省值——替流量编一个限速等于偷偷改行为），key 可选。
+  out->rate_limit_.present = document.find("rate_limit") != nullptr;
+  if (const JsonValue* limit = document.find("rate_limit"); limit != nullptr) {
+    if (!limit->is_object()) {
+      *error = std::string("rate_limit 必须是对象，读到的是") + limit->kind_name();
+      return false;
+    }
+    if (!forbid_unknown(*limit, {"rate", "burst", "key"}, error, "rate_limit")) return false;
+    const JsonValue* rate = nullptr;
+    const JsonValue* burst = nullptr;
+    if (!need(*limit, "rate", JsonValue::Kind::kInt, &rate, error, "rate_limit")) return false;
+    if (!need(*limit, "burst", JsonValue::Kind::kInt, &burst, error, "rate_limit")) return false;
+    if (rate->number < 1 || rate->number > 1000000) {
+      *error = "rate_limit 的 rate 要落在 1..1000000（令牌/秒），读到的是 " +
+               std::to_string(rate->number);
+      return false;
+    }
+    if (burst->number < 1 || burst->number > 1000000) {
+      *error = "rate_limit 的 burst 要落在 1..1000000（桶容量），读到的是 " +
+               std::to_string(burst->number);
+      return false;
+    }
+    out->rate_limit_.rate_per_sec = static_cast<std::uint64_t>(rate->number);
+    out->rate_limit_.burst = static_cast<std::uint64_t>(burst->number);
+    if (const JsonValue* key = limit->find("key"); key != nullptr) {
+      if (key->kind != JsonValue::Kind::kString) {
+        *error = std::string("rate_limit 的 key 必须是字符串，读到的是") + key->kind_name();
+        return false;
+      }
+      constexpr std::string_view kHeaderPrefix = "header:";
+      if (key->text == "path") {
+        out->rate_limit_.by_header = false;
+      } else if (key->text == "ip") {
+        // ADR-21 第四节第 1 条：不是"忘了实现"，是具名推迟——写清楚，免得读的人
+        // 以为配了 ip 却没生效。
+        *error =
+            "rate_limit 的 key=\"ip\" 在本阶段不接受：按用户/IP 的维限不在 S4 范围"
+            "（RequestInfo 没有对端地址，加它要动 sizeof(Connection) 的 528；见 ADR-21 第四节）。"
+            "用 \"path\" 或 \"header:<名字>\"";
+        return false;
+      } else if (key->text.rfind(kHeaderPrefix, 0) == 0 && key->text.size() > kHeaderPrefix.size()) {
+        const std::string_view name = std::string_view(key->text).substr(kHeaderPrefix.size());
+        for (const char c : name) {
+          if (static_cast<unsigned char>(c) <= 0x20 || c == ':') {
+            *error = "rate_limit 的 key 里 header:<名字> 的名字不能含空白、控制符或冒号：\"" +
+                     key->text + "\"";
+            return false;
+          }
+        }
+        out->rate_limit_.by_header = true;
+        out->rate_limit_.header_name = std::string(name);
+      } else {
+        *error = "rate_limit 的 key 只认 \"path\" 或 \"header:<名字>\"，读到的是 \"" +
+                 key->text + "\"";
+        return false;
+      }
     }
   }
 

@@ -37,6 +37,17 @@ struct HealthSection {
   route::HealthPolicy policy{};  // 缺省值即 ADR-19 追加第四条定下的那五个
 };
 
+// S4-03（ADR-21 第二节 + 第四节）：`rate_limit` 段（可选）。段不存在 = 不装限流。
+// **rate / burst 没有缺省值**：给限流一个静默默认值等于替流量改行为，段存在而缺字段
+// 一律整体拒绝。`ip` 键在本阶段不接受（ADR-21 第四节第 1 条），配置层会具名拒绝。
+struct RateLimitSection {
+  bool present = false;
+  std::uint64_t rate_per_sec = 0;
+  std::uint64_t burst = 0;
+  bool by_header = false;      // false = path（缺省）
+  std::string header_name;     // by_header 时非空
+};
+
 class GatewayConfig {
  public:
   // 去重后的目标表。**下标就是 `RequestInfo::upstream_target` 的值域**，也和
@@ -56,6 +67,9 @@ class GatewayConfig {
   // 文件里的 `health` 段（可选；`present=false` 时 main.cc 不建 HealthTable）。
   const HealthSection& health() const noexcept { return health_; }
 
+  // 文件里的 `rate_limit` 段（可选；`present=false` 时 main.cc 不装限流 filter）。
+  const RateLimitSection& rate_limit() const noexcept { return rate_limit_; }
+
  private:
   // 两个装配入口都要写私有成员，所以两个都得是 friend。只 friend 一个的话，
   // 另一个（用例直接喂文本的那条）会编不过——而这两条**必须走同一段校验代码**，
@@ -66,6 +80,7 @@ class GatewayConfig {
   route::GroupTable groups_;
   route::RouteTable routes_;
   HealthSection health_;
+  RateLimitSection rate_limit_;
 };
 
 // 读文件 + 解析 + 校验 + 建环，一次做完。任何一步失败都返回 false。
