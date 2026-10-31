@@ -686,7 +686,7 @@ void Reactor::retry_peer_after_room(const std::shared_ptr<Connection>& conn) {
   }
 }
 
-std::shared_ptr<Connection> Reactor::ensure_upstream(
+Reactor::UpstreamPick Reactor::ensure_upstream(
     const std::shared_ptr<Connection>& downstream, std::uint16_t upstream_target) {
   // 索引目标表之前先认这条下标。`upstream_target` 是 filter 写回来的值（见链调用点），
   // 而这里的失败形态不是"回错一个后端"而是越界读，所以检查必须在索引它的那一处。
@@ -696,15 +696,15 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
     sync_nodes_snapshot();
   }
   if (upstream_target >= config_.upstream_targets.size()) {
-    return nullptr;  // 装配漏检：当作"这一轮拿不到上游"，请求留在下游缓冲里，
-                     // 不猜一个目标把请求发出去（猜 = 把配置错误读成后端脾气）。
+    return {};  // 装配漏检：当作"这一轮拿不到上游"，请求留在下游缓冲里，
+                // 不猜一个目标把请求发出去（猜 = 把配置错误读成后端脾气）。
   }
   const int existing = downstream->peer_fd();
   if (existing != kInvalidFd) {
     auto it = connections_.find(existing);
     if (it != connections_.end()) {
       std::shared_ptr<Connection> paired = it->second;
-      if (paired->upstream_target() == upstream_target) return paired;
+      if (paired->upstream_target() == upstream_target) return UpstreamPick{paired};
       // **目标变了。** 只有在干净边界上才换：在飞归零 + 出向空 + `upstream_reusable()`。
       // 这三个条件就是 ADR-15 那条"能不能归还进池"的判据本身（我刻意不另写一套——
       // "能进池却换不了目标"那种状态没人能解释）。换不动就返回**旧的那条**，由
@@ -722,7 +722,7 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
         note_upstream_unpaired(upstream_target);
         recycle_upstream(paired);
       } else {
-        return paired;  // 压住，不是失败
+        return UpstreamPick{paired};  // 压住，不是失败
       }
     }
     // 查不到就是那个 fd 已经关了（注册表反查认人，与批内事件同一条纪律）：
@@ -736,11 +736,14 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
     downstream->set_peer_fd(pooled->fd());
     // 借出时它已注册、只挂着 EPOLLIN（空闲监控态）。请求字节随后由 forward_request
     // 排进它的出向缓冲并 arm_write 补上 EPOLLOUT，所以这里不必再 apply_events。
-    return pooled;
+    return UpstreamPick{pooled};
   }
   if (connections_.size() >= config_.max_connections) {
     stats_.downstream_rejected_over_capacity.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
+    // S4-02（ADR-22）：本地 fd 预算耗尽。这是一条**确定性**的"拿不到"，不是
+    // "以后再来试"——回 503 并关配对，不让请求挂在下游缓冲里。
+    // 容量分支不查健康状态：没尝试过网络，归因就是本地资源。
+    return UpstreamPick{nullptr, 503, ReplyCause::kCapacity};
   }
 
   const Config::Target& target = config_.upstream_targets[upstream_target];
@@ -749,8 +752,15 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
     stats_.upstream_connect_failed.fetch_add(1, std::memory_order_relaxed);
     // 被动健康检查的失败记账点之一（S3-03）：连不上就是后端的事，与本地 fd 预算
     // 无关——下面 max_connections / register_connection 那两条失败分支**不**记账。
+    //
+    // S4-02（ADR-22）：归属必须读在 note_health_failure **之前**——这次失败自己
+    // 可能刚好把目标推进摘除，反过来读会把普通过 connect 失败误归成 all_ejected。
+    // 被选目标在失败揭晓时已被摘 = 这条请求走的是 S3-03 的全员回退，503 是最后防线。
+    const bool was_ejected = config_.health != nullptr &&
+                             config_.health->is_ejected(upstream_target, monotonic_ms());
     note_health_failure(upstream_target);
-    return nullptr;
+    return UpstreamPick{nullptr, static_cast<std::uint16_t>(was_ejected ? 503 : 502),
+                        was_ejected ? ReplyCause::kAllEjected : ReplyCause::kConnectFailed};
   }
 
   auto upstream = std::make_shared<Connection>(std::move(outcome.fd), Role::kUpstream,
@@ -759,9 +769,6 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   // 目标标签必须在这里就写：它决定这条上游将来归还进**哪一个**桶。写在 stats 之后、
   // 注册之前，是为了让任何一条"借出去又还回来"的路径都不可能碰到一条没标签的上游。
   upstream->set_upstream_target(upstream_target);
-  // 新建即配对。这一行与上面那行都必须存在：`ensure_upstream` 有两条拿到上游的路，
-  // 只在一处记账的话，另一个后端的配对数永远是个位数，least_conn 就会一直挑它。
-  note_upstream_paired(upstream_target);
   upstream->set_state(outcome.status == ConnectStatus::kConnected ? State::kOpen
                                                                   : State::kConnecting);
   // S4-01（ADR-21）：连接超时的登记点。回环上立刻完成的 connect（kConnected）不设——
@@ -781,12 +788,23 @@ std::shared_ptr<Connection> Reactor::ensure_upstream(
   // EPOLLOUT；回环上 connect 立刻完成的那条分支此刻出向还是空的，于是只订阅读——
   // 请求是下一步才排进来的，届时 arm_write 会补上 EPOLLOUT。
   if (!register_connection(*upstream, desired_events(*upstream))) {
+    // S4-02（ADR-22）：注册失败 = 本地 epoll/fd 资源耗尽，与 max_connections 同一格。
+    // 先把两侧解链再关（不能只清下游那一边：那样 close_connection 会顺着 upstream 的
+    // peer_fd 把下游一起级联关掉，客户端的 503 就没地方发）。配对账在这里还没 +1，
+    // 因为 `note_upstream_paired` 已经挪到注册成功之后——见下面那条注释。
+    upstream->set_peer_fd(kInvalidFd);
     downstream->set_peer_fd(kInvalidFd);
     close_connection(upstream);
-    return nullptr;
+    return UpstreamPick{nullptr, 503, ReplyCause::kCapacity};
   }
+  // 新建即配对。这一行与上面"借出即配对"那行都必须存在：`ensure_upstream` 有两条
+  // 拿到上游的路，只在一处记账的话，另一个后端的配对数永远是个位数，least_conn 就
+  // 会一直挑它。**S4-02 把它挪到注册成功之后**：原来写在注册之前，注册失败分支
+  // 先清了 peer_fd 再关，close_connection 的"进来时配没配对"判据读到 false，
+  // 于是 +1 没有对应的 −1——least_conn 会慢慢把这条后端读成"永远最忙"。
+  note_upstream_paired(upstream_target);
   connections_.emplace(upstream->fd(), upstream);
-  return upstream;
+  return UpstreamPick{upstream};
 }
 
 // --- 上游连接池（S2-02，ADR-15；S3-01 按目标分桶，见 ADR-15 追加节）--------------
@@ -1496,9 +1514,15 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
         fail_pair_with_reply(downstream, 502);
         return ForwardOutcome::kFailed;
       }
-      if (!forward_request(downstream, pending->consumed, upgrade, close_after,
-                           upstream_target)) {
-        return ForwardOutcome::kBlocked;  // 上游没连上、出向满了，或目标要换但手上还有在飞
+      const ForwardStep step = forward_request(downstream, pending->consumed, upgrade,
+                                               close_after, upstream_target);
+      if (step == ForwardStep::kBlocked) {
+        return ForwardOutcome::kBlocked;  // 上游还没连上、出向满了，或目标要换但手上还有在飞
+      }
+      if (step == ForwardStep::kReplied) {
+        // S4-02（ADR-22）：自产 502/503 已排进下游出向并解链关闭——和解析错误那两条
+        // 出口同一个形状（连接已被本函数关掉，不能再泵）。
+        return ForwardOutcome::kFailed;
       }
       continue;
     }
@@ -1549,13 +1573,21 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
   }
 }
 
-bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
-                              std::size_t request_bytes, bool upgrade, bool close_after,
-                              std::uint16_t upstream_target) {
-  std::shared_ptr<Connection> upstream = ensure_upstream(downstream, upstream_target);
-  if (upstream == nullptr) {
-    return false;  // 正在 connect、超出 fd 预算，或目标下标越界；请求还留在下游缓冲里，没丢
+Reactor::ForwardStep Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
+                                              std::size_t request_bytes, bool upgrade,
+                                              bool close_after,
+                                              std::uint16_t upstream_target) {
+  UpstreamPick pick = ensure_upstream(downstream, upstream_target);
+  if (pick.conn == nullptr) {
+    if (pick.reject_status != 0) {
+      // S4-02（ADR-22）：拿不到上游已经**确定**（connect 失败 / 被摘尽 / 本地预算耗尽）。
+      // 自产一条 502/503 并解链关闭——不再让请求挂在下游缓冲里等一个不会来的事件。
+      fail_pair_with_reply(downstream, pick.reject_status, pick.reject_cause);
+      return ForwardStep::kReplied;
+    }
+    return ForwardStep::kBlocked;  // 正在 connect 或目标下标越界；请求还留在下游缓冲里，没丢
   }
+  const std::shared_ptr<Connection>& upstream = pick.conn;
   if (upstream->upstream_target() != upstream_target) {
     // S3-01（ADR-18 第五节）：**目标要换，但手上还有在飞的请求（或这条配对不干净）**。
     // ensure_upstream 把这个情况表达成"给我的还是旧目标那条"，而不是新造一个返回值——
@@ -1563,17 +1595,17 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
     // 这里返回 false 的语义和"上游出向满了"完全一致：**一个字节都没排、状态没动、
     // 这条请求留在原地下一次再试**。真正让它不会永远睡死的，是 pump_response 在
     // 在飞归零那一刻补的那一次重驱动（少它这条就是挂死，不是慢）。
-    return false;
+    return ForwardStep::kBlocked;
   }
   if (request_bytes > downstream->inbound().readable_bytes()) {
-    return false;  // 调用方给的长度不可信，不动状态
+    return ForwardStep::kBlocked;  // 调用方给的长度不可信，不动状态
   }
 
   // 排进上游出向缓冲的是**原始字节**，长度取 parsed.consumed（含框架，不解码）。
   // 上游出向满了就整块不转、下游也不消费：背压的正确方向是"让对端慢下来"，
   // 而不是"把我没地方放的数据扔掉"。
   if (!upstream->queue_bytes(downstream->inbound().readable_data(), request_bytes)) {
-    return false;
+    return ForwardStep::kBlocked;
   }
   // S2-04（ADR-16）：字节成功排队 = 这条请求已转发、开始占用上游一个在飞位。
   // 与 pump_response 的 note_response_completed 配平；close 兑现时机靠它判"归零没"。
@@ -1602,7 +1634,7 @@ bool Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
                                           std::memory_order_relaxed);
 
   arm_write(upstream);
-  return true;
+  return ForwardStep::kForwarded;
 }
 
 // 外壳干的同一件事：泵每消费掉一段上游入向的字节，都可能让可读区回落到恢复线以下。
@@ -1839,7 +1871,7 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
 }
 
 void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
-                                   std::uint16_t status) {
+                                   std::uint16_t status, ReplyCause cause) {
   // 对端已经不在了：没有谁接收这条表态。不排队、**不计数**——
   // gateway_replies_sent 的口径是"进了下游出向缓冲"，写在这个口径上的计数
   // 才是验收能引用的数。入向字节随下面这条 close 一起消失，没有谁欠它响应：
@@ -1877,6 +1909,21 @@ void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream
     return;
   }
   stats_.gateway_replies_sent.fetch_add(1, std::memory_order_relaxed);
+  // S4-02（ADR-22）：三条回源失败来源各自一格，与上面那行**同口径**（真的进了出向
+  // 缓冲才计）且互斥。kNone 是既有来源（4xx / 404 / 504），不进这三格。
+  switch (cause) {
+    case ReplyCause::kNone:
+      break;
+    case ReplyCause::kConnectFailed:
+      stats_.gateway_replies_connect_failed.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case ReplyCause::kAllEjected:
+      stats_.gateway_replies_all_ejected.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case ReplyCause::kCapacity:
+      stats_.gateway_replies_over_capacity.fetch_add(1, std::memory_order_relaxed);
+      break;
+  }
 
   if (upstream) close_connection(upstream, CloseWhy::kDiscardOutbound);
   close_connection(downstream, CloseWhy::kFlushThenClose);
@@ -1934,6 +1981,14 @@ bool Reactor::maybe_enter_tunnel(const std::shared_ptr<Connection>& upstream) {
   downstream->take_upgrade_pending();  // 意图已被消费：这条配对连接的握手到此完成
   upstream->enter_tunnel();
   downstream->enter_tunnel();
+  // S4-02（ADR-22 门禁抓到 S4-01 的缺陷）：**101 是这条请求的最终响应头**，进入隧道
+  // 之后没有"等响应头"可言——响应头限期必须在这里撤销。不撤销的话，每条空闲隧道都会
+  // 在 head 限期到点时被 enforce_upstream_timeouts 当成"头没回来"判 504 杀掉：
+  // E=1 的 100k 重跑实测 `upstream_head_timeout=100000`、`gateway_replies_sent=100000`，
+  // 上游夹具的 peak_clients 只有 8,390——隧道一直在被 10s 的限期清掉重开，
+  // 容量读数与 SLO #2 的 idle 口径全都失去意义。隧道里的"流死没死"归 body 空闲格
+  // （ADR-21 明确不设总时长），不归请求级超时。
+  erase_upstream_deadline(upstream->fd());
   // release_scratch() 自 S1-04 落地以来的**唯一**调用点。触发点就是这里
   // （101 之后），不是"请求结束"——交接段点名的那条禁止路径在结构上不成立：
   // Connection 里没有任何自动调用它的地方。
@@ -1950,10 +2005,28 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
     if (!get_so_error(conn->fd(), &so_error) || so_error != 0) {
       stats_.upstream_connect_failed.fetch_add(1, std::memory_order_relaxed);
       // 被动健康检查的失败记账点之一：异步 connect 的结果在这里揭晓。
-      note_health_failure(conn->upstream_target());
-      // 握手都没成的上游，它出向缓冲里排着的请求永远发不出去：丢弃，别等刷完。
-      // 对端（下游）用默认的 flush 意图关闭 —— 那边可能正有一个响应要发给客户端。
-      close_connection(conn, CloseWhy::kDiscardOutbound);
+      // S4-02（ADR-22）：归属读在 note_health_failure **之前**（同 ensure_upstream 那条）——
+      // 这次失败自己可能刚好把目标推进摘除，反过来读会把普通失败误归成 all_ejected。
+      const std::uint16_t target = conn->upstream_target();
+      const bool was_ejected = config_.health != nullptr &&
+                               config_.health->is_ejected(target, monotonic_ms());
+      note_health_failure(target);
+      std::shared_ptr<Connection> downstream;
+      if (conn->peer_fd() != kInvalidFd) {
+        auto pit = connections_.find(conn->peer_fd());
+        if (pit != connections_.end()) downstream = pit->second;
+      }
+      if (downstream != nullptr) {
+        // 握手都没成 = 没有任何上游字节到过下游 → 502/503 是这条请求的第一条响应，
+        // 不伪造。fail_pair 按丢弃关上游（排着的请求字节永远发不出去）、按 flush
+        // 关下游（表态还躺在它的出向里）。
+        fail_pair_with_reply(downstream, static_cast<std::uint16_t>(was_ejected ? 503 : 502),
+                             was_ejected ? ReplyCause::kAllEjected
+                                         : ReplyCause::kConnectFailed);
+      } else {
+        // 没有下游可表态（它先关了）：只收这条上游，不朝不存在的对端造响应。
+        close_connection(conn, CloseWhy::kDiscardOutbound);
+      }
       return;
     }
     conn->set_state(State::kOpen);

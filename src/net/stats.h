@@ -113,6 +113,17 @@ struct ReactorStats {
   // 网关自产并排进下游出向的错误响应条数（4xx 对畸形请求 / 502 对坏上游）。
   // "回 400 而不是只关连接"这条验收要有可断言的来源，而不能靠 curl 的退出码猜。
   std::atomic<std::uint64_t> gateway_replies_sent{0};
+  // S4-02（ADR-22）：回源拿不到上游时那三类自产响应的**分格账**，与上一行同口径
+  // （只有真的进了下游出向缓冲才计）且互斥——一次表态只进一格。三格之和 ≤
+  // gateway_replies_sent（后者还含着 4xx/404/504 那些来源）。
+  //   connect_failed —— connect 同步失败或 SO_ERROR 揭晓失败 → 502（上游不可达）；
+  //   all_ejected    —— 同上，但被选目标在失败揭晓时已被策略摘除 → 503
+  //                     （全员被摘回退后的最后防线，见 ADR-22 第二节）；
+  //   over_capacity  —— 本地连接/fd 预算耗尽（max_connections / epoll 注册失败）→ 503。
+  // 归类顺序：容量分支不查健康状态（它没尝试过网络），connect 失败才按"是否已被摘"分格。
+  std::atomic<std::uint64_t> gateway_replies_connect_failed{0};
+  std::atomic<std::uint64_t> gateway_replies_all_ejected{0};
+  std::atomic<std::uint64_t> gateway_replies_over_capacity{0};
   // 上游在**最终响应头之前**断开/坏头 → 网关回 502 的次数。与下一条互斥可断言：
   // 头已经出去之后只能以 EOF 表态，那记在下面那条，不会重复计入这一条。
   std::atomic<std::uint64_t> upstream_truncated_before_head{0};

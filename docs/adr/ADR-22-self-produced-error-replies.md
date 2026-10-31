@@ -54,3 +54,12 @@ S3-03 的行为原样保留：候选集为空时 `LoadBalanceFilter` **回退全
 - **`all_ejected` 的归类在"无组、只有 default_target 且健康表已装配"的退化配置里也会触发**：那种配置下请求不经过候选集，被摘的目标照样被选。此时这一格仍然诚实地回答"我们试了一个策略已经写死的成员"。
 - **表态不等于恢复**：503 不改变摘除状态；探活/到期恢复照旧（S3-03）。
 - **S2-06 旧债的结账位置**：E=1 名义档重跑（100k 下游、回源容量 28,232）进 `FAULT-INJECTION.md` §13；那里记客户端拿到的表态计数与零 handshake-timeout，而不是把 502 冒充成"容量问题解决了"——容量口径那件事归 ADR-17。
+
+## 六、落地追加（2026-10-31：实现与门禁的实测，不回头改上面的决策）
+
+1. **三格计数按计划落地**：`gateway_replies_connect_failed` / `gateway_replies_all_ejected` / `gateway_replies_over_capacity`，与 `gateway_replies_sent` 同口径（真的进了下游出向才计）、互斥；同步 connect 失败走 `ensure_upstream` 的三态返回（`ForwardStep::kReplied`），异步 `SO_ERROR` 走同一套 `fail_pair_with_reply`。归属读在 `note_health_failure` 之前（否则本次失败自己触发的摘除会误归成 all_ejected）。顺带修掉 `register_connection` 失败分支的配对账 +1/−1 漏洞（`note_upstream_paired` 挪到注册成功之后）。
+2. **旧债重跑（E=1 名义档，慢 ramp）**：客户端 `established=28231 / not_101=71769 / 零 handshake-timeout`；网关 `upstream_connect_failed=gateway_replies_connect_failed=71769`、三种超时计数 0、`upgrades_101=upstream_opened=28231`、生命周期 128,231==128,231、`live=0`、fd 41→41；上游夹具 `accepted=peak_clients=28231`。同一容量墙，旧形状是 71,769 条等到客户端放弃，新形状是同数目的完整 502。细节与作废档在 FAULT-INJECTION §13。
+3. **重跑逼出的三处既有缺陷（都不是本 ADR 的代码）**：① S4-01 的 **101 之后响应头限期未撤销**——100k 空闲隧道 10 秒后被 504 清掉重开（`upstream_head_timeout=100000`、上游 `peak_clients=8390`），修在 `maybe_enter_tunnel` + 回归用例；② S4-01 的 **504 `Content-Length` 15 vs body 16**，把 504 补进逐条字节核对后抓到；③ 默认 `--drain-timeout-ms 5000` 违反 S4-01 自己的 `drain ≥ head(10000)` 启动校验，导致六条冒烟全部拒绝启动（S4-01 行的"五冒烟全绿"因此不成立）——按 S2-05 裁定"要么调大"把默认抬到 10000。三处的记录在 ARCHITECTURE 1.27/1.28 与 FAULT-INJECTION §13.2。
+4. **门禁工具**：`verify-all-presets.sh` 原来把 ctest 失败吞进管道（tsan 全量 1 条失败仍 rc=0）且 build 失败仍跑 ctest；已改为任一 configure/build/ctest 失败 → rc=1、build 失败跳过该 preset 的 ctest（原 TASKS 待裁⑥）。
+5. **没变的**：候选集回退保留、入口不拒绝、上游 5xx 不改写、重试不做（S4-06/ADR-23）、body 已透传后不自产响应。
+

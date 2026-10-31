@@ -283,7 +283,9 @@ check_lifecycle 阶段二
 echo
 echo "== 阶段三：半条请求走超时兜底（--drain-timeout-ms 800）"
 start_upstream backstop --fixed-body "S205-BACKSTOP" || exit 1
-start_gateway backstop --drain-timeout-ms 800 || exit 1
+# 该阶段只测排水兜底，不测请求超时：头超时显式关掉（0），否则 S4-01 的
+# "drain ≥ head" 启动校验会拒绝 800 < 10000 这组合——而这一阶段要的正是 800 的窗口。
+start_gateway backstop --drain-timeout-ms 800 --upstream-head-timeout-ms 0 || exit 1
 C3=""; open_conn C3 || exit 1
 printf 'GET /x HTTP/1.1\r\nHost: smoke.test\r\nX: half' >&"$C3"   # 故意不写空行收尾
 sleep 0.5

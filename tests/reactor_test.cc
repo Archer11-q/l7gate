@@ -5062,5 +5062,365 @@ TEST(S4_01_Timeouts, ConnectTimeoutOnBlackHoleReplies504) {
   harness.stop_loop();
   harness.shutdown_all();
 }
+
+// --- S4-02：回源失败的自产错误响应（ADR-22） ---------------------------------
+//
+// 旧的失效形态是"请求留在下游缓冲里一言不发"（S2-06 的 71,769 条客户端 timeout），
+// 所以每一条用例都同时断两件事：客户端拿到一条**完整**的 502/503，而且它来得不慢。
+// 只断状态码会让"10 秒后才回"也过——那仍然是挂死，只是挂了十秒。
+//
+// 三条形态各占一格计数，互斥；口径与 gateway_replies_sent 相同（真的进了下游出向才计）。
+
+// 一、**异步 connect 失败**：回环上"端口已关"的形态是 EINPROGRESS → SO_ERROR=ECONNREFUSED，
+// 走 on_upstream_event 的揭晓分支。上游进程先停掉，端口就是死的一份真实样本。
+TEST(S4_02_SelfReplies, RefusedUpstreamReplies502AndCountsIt) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 64, &why)) << why;
+  const int dead_port = backend.port();
+  backend.stop_and_join();  // 端口关掉：connect 必然被拒
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "127.0.0.1";
+  target.port = static_cast<std::uint16_t>(dead_port);
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  const auto sent_at = std::chrono::steady_clock::now();
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/dead")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why))
+      << "connect 被拒后客户端挂死（S2-06 的旧形状）";
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - sent_at)
+                        .count();
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+  EXPECT_LE(took, 2000) << "502 来得太慢：表态本身不挂在事件循环上";
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "异步失败先造了对象再揭晓，这条不冤";
+  // 三格互斥：这一条只进 connect_failed。
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_all_ejected), 0u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_over_capacity), 0u);
+  c.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 二、**同步 connect 失败**：这是 S2-06 那 71,769 条的直接形状——端口耗尽时
+// connect() 当场返回 EADDRNOTAVAIL，连连接对象都不会被造出来。用一个当场失败的
+// 目的地址把它钉住：255.255.255.255（受限广播）在 Linux 上给 ENETUNREACH。
+// 环境预探针：如果本机给它 EINPROGRESS 或连上了，那是环境不产生同步失败 → Skipped＝不判。
+TEST(S4_02_SelfReplies, SyncConnectFailureAlsoReplies502) {
+  int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(9);
+  addr.sin_addr.s_addr = htonl(0xFFFFFFFFu);  // 255.255.255.255
+  const int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  const int probe_errno = errno;
+  ::close(probe);
+  if (rc == 0 || (rc < 0 && probe_errno == EINPROGRESS)) {
+    GTEST_SKIP() << "255.255.255.255 没有当场失败（rc=" << rc << " errno=" << probe_errno
+                 << "）：环境不产生同步失败，不判";
+  }
+
+  std::string why;
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "255.255.255.255";
+  target.port = 9;
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/sync-dead")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << "同步 connect 失败后客户端挂死";
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 0u) << "同步失败不该造出连接对象";
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  c.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 三、**本地 fd 预算耗尽**：max_connections 调小到 3，A 的连接与它的配对上游占满
+// 预算（下游 1 + 上游 1 = 2），B 被 accept 进来（2 < 3）之后才在 ensure_upstream
+// 那里撞线。503 走的是"我这边给不出后端"，与 connect 失败的 502 分格记。
+// 注：epoll 注册失败与它共用同一条表态语句，但没有可控注入手段，端到端不可断言（ADR-22 第五节）。
+TEST(S4_02_SelfReplies, FdBudgetExhaustedReplies503) {
+  std::string why;
+  Harness harness;
+  Harness::Options options = default_options();  // with_upstream=true：一条健康上游
+  options.config.max_connections = 3;
+  options.config.pool_max_idle = 0;  // 不让 A 的上游在收尾后以池的形式留下第二份账
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client a;
+  ASSERT_TRUE(a.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(a.write_all(get_request("/first")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(a.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(status, "HTTP/1.1 200 OK");
+
+  // A 不关：它配对的 upstream 留在注册表里（size=2）。B 再进来就撞上 3 的预算。
+  Client b;
+  ASSERT_TRUE(b.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(b.write_all(get_request("/second")));
+  ASSERT_TRUE(b.read_response(&status, &body, &why)) << "本地 fd 预算耗尽时客户端挂死";
+  EXPECT_EQ(status, "HTTP/1.1 503 Service Unavailable");
+  EXPECT_EQ(stats.load(stats.gateway_replies_over_capacity), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 0u)
+      << "容量问题不是 connect 失败：两格混在一起就分不清该扩容还是该修后端";
+  EXPECT_EQ(stats.load(stats.gateway_replies_all_ejected), 0u);
+  // 同一个计数器在 accept 侧也有读者（超容量就 accept 掉再关）：这里的 1 来自
+  // ensure_upstream 的容量分支，B 是被 accept 进来的。
+  EXPECT_EQ(stats.load(stats.downstream_rejected_over_capacity), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "B 没有任何一次新建上游";
+  a.close();
+  b.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 四、**全员被摘 → 回退 → 最后防线**：S3-03 的候选集回退保留（ADR-12 的"故意保留
+// 一段错误"），本用例把回退之后仍然连不上的那一格钉住。两台后端先被摘、再停掉端口，
+// 请求走回退选到一个已知死成员，connect 失败时的表态必须是 503 且进 all_ejected 格。
+TEST(S4_02_SelfReplies, AllEjectedLastLineReplies503) {
+  std::string why;
+  TestUpstream backend0;
+  TestUpstream backend1;
+  ASSERT_TRUE(start_sized_upstream(&backend0, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&backend1, 128, &why)) << why;
+  const int port0 = backend0.port();
+  const int port1 = backend1.port();
+  backend0.stop_and_join();  // 先摘、后死：回退选到的是一条连不上的成员
+  backend1.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target t0;
+  t0.address = "127.0.0.1";
+  t0.port = static_cast<std::uint16_t>(port0);
+  Reactor::Config::Target t1;
+  t1.address = "127.0.0.1";
+  t1.port = static_cast<std::uint16_t>(port1);
+  options.config.upstream_targets.push_back(t0);
+  options.config.upstream_targets.push_back(t1);
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;  // 被动专场：摘除由下面手工触发
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 100;  // N=2 时允许两台全摘
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(port0), "127.0.0.1:" + std::to_string(port1)},
+              policy);
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+  rig.health->note_failure(0, now, 0);
+  rig.health->note_failure(1, now, 0);
+  ASSERT_EQ(rig.health->ejected_now(), 2u) << "用例前提不成立：两台没有都被摘";
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/all-dead")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << "全员被摘回退后客户端挂死";
+  EXPECT_EQ(status, "HTTP/1.1 503 Service Unavailable");
+  EXPECT_EQ(stats.load(stats.gateway_replies_all_ejected), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 0u)
+      << "已知被摘的成员连不上，不是一次普通的 connect 失败";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_EQ(rig.health->ejected_now(), 2u) << "表态不等于恢复：摘除状态不该被 503 改掉";
+  c.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 五、**阀满时被挡的成员继续接流量、错误如实透传**（ADR-12 的语义，S4-02 不碰）。
+// N=1、10% → floor(1×10%)=0，一个都摘不了：两次 5xx 全部被安全阀挡住，成员仍在
+// 候选集里接流量，客户端看到的是**上游自己的** 503（不是网关伪造的那条），
+// gateway_replies_* 三格一条都不许动。
+TEST(S4_02_SelfReplies, ValveBlockedMemberKeepsServingAndErrorsPassThrough) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 64, &why)) << why;
+  backend.set_path_status("/boom", 503);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "127.0.0.1";
+  target.port = static_cast<std::uint16_t>(backend.port());
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60000;
+  policy.max_ejection_percent = 10;
+  HealthRig rig;
+  rig.install(&options, &harness, 1, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(backend.port())}, policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(c.write_all(get_request("/boom"))) << i;
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(c.read_response(&status, &body, &why)) << i;
+    EXPECT_EQ(status, "HTTP/1.1 503 Probe") << i << "：上游的错误必须原样透传";
+  }
+  // 夹具的路径状态码分支不记 requests_served（那个数只数默认响应形态），所以
+  // "成员继续接流量"用网关侧的两个量证：两条响应都经框架完结、上游连接没有被重开。
+  EXPECT_EQ(stats.load(stats.responses_completed), 2u)
+      << "两条上游 5xx 没有完整走完框架——成员被阀挡下之后流量断了";
+  EXPECT_EQ(backend.connections_accepted(), 1u)
+      << "上游被重开了连接：成员没有持续服务（keep-alive 复用断了）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u)
+      << "上游自己回的 5xx 不是网关自产响应：记进去就把两件事说成一件";
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 0u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_all_ejected), 0u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_over_capacity), 0u);
+  EXPECT_GE(rig.health->ejections_blocked_by_valve(), 2u);
+  EXPECT_EQ(rig.health->ejected_now(), 0u);
+  c.close();
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 六、**响应头限期在 101 之后撤销**（S4-02 门禁抓到的 S4-01 缺陷的钉子）。
+// 101 是这条请求的最终响应头；不撤销限期时，每条空闲隧道都会在 head 到期时被判 504
+// 杀掉，而客户端什么错都看不到——它在隧道里不读 HTTP。E=1 的 100k 重跑实测
+// `upstream_head_timeout=100000`、上游夹具 `peak_clients` 只有 8,390：隧道一直在被
+// 10 秒的限期清掉重开，B-007/B-010 那种"空闲 100k 隧道"的口径根本不成立。
+TEST(S4_02_SelfReplies, HeadTimeoutIsCancelledWhenTheTunnelStarts) {
+  std::string why;
+  Harness harness;
+  Harness::Options options = default_options();
+  options.config.upstream_head_timeout_ms = 300;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(upgrade_request_text()));
+  std::string head;
+  ASSERT_TRUE(client.read_head(&head, &why)) << "101 没有回来：" << why;
+  ASSERT_EQ(head.find("HTTP/1.1 101"), 0u) << head;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upgrades_101) == 1u; }, 3000));
+
+  // 静置超过 head 限期：没撤销的话这一觉醒来隧道已经被杀、账上多一条 504。
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 0u)
+      << "空闲隧道被响应头超时误杀（101 之后还在等响应头）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u)
+      << "101 之后又伪造了一条 504：客户端在隧道里根本读不到它";
+
+  // 隧道仍然活着：发一帧、逐字节读回显。
+  const std::string frame("\x81\x83\x37\xfa\x76", 5);
+  ASSERT_TRUE(client.write_all(frame));
+  std::string echoed;
+  ASSERT_TRUE(client.read_exact(&echoed, frame.size(), &why)) << "隧道被超时关掉了：" << why;
+  EXPECT_EQ(echoed, frame);
+
+  client.shutdown_write();
+  ASSERT_TRUE(client.wait_for_eof(&why)) << why;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 5000));
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 七、验收句「客户端 5s 内全部拿到表态」的可执行形式：**一批**下游（64 条）打一条
+// 已关端口的上游，每一条都必须在 5 秒内拿到完整 502。单条的上限（≤2s）由第一条用例
+// 钉着，这条钉的是"一批"——它防的是"第一批回了、后面的挂在队列里"。
+TEST(S4_02_SelfReplies, EveryDeadUpstreamRequestGetsIts502WithinFiveSeconds) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 64, &why)) << why;
+  const int dead_port = backend.port();
+  backend.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  Reactor::Config::Target target;
+  target.address = "127.0.0.1";
+  target.port = static_cast<std::uint16_t>(dead_port);
+  options.config.upstream_targets.push_back(target);
+  options.config.default_target = 0;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  constexpr int kClients = 64;
+  std::vector<std::unique_ptr<Client>> clients;
+  const auto began = std::chrono::steady_clock::now();
+  for (int i = 0; i < kClients; ++i) {
+    auto c = std::make_unique<Client>();
+    ASSERT_TRUE(c->connect_to(harness.port(), &why)) << i << ": " << why;
+    ASSERT_TRUE(c->write_all(get_request("/dead-batch"))) << i;
+    clients.push_back(std::move(c));
+  }
+  for (int i = 0; i < kClients; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(clients[static_cast<std::size_t>(i)]->read_response(&status, &body, &why))
+        << "第 " << i << " 条挂死：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway") << i;
+  }
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - began)
+                        .count();
+  EXPECT_LT(took, 5000) << "一批 " << kClients << " 条没有在 5s 内全部拿到表态（实测 "
+                        << took << "ms）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed),
+            static_cast<std::uint64_t>(kClients));
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), static_cast<std::uint64_t>(kClients));
+
+  for (auto& c : clients) c->close();
+  harness.stop_loop();
+  harness.shutdown_all();
+}
 }  // namespace l7gate::net
 

@@ -57,9 +57,10 @@ void usage(std::FILE* out) {
       "它是 S1-07 的取证旋钮，不是调优入口：转发的最小单位是「整条请求 / 整个响应头」，\n"
       "线压得比一条请求还小，那条请求就永远转不出去——它会停在停读线上等人来处理，\n"
       "不是被丢弃，也不是被报错。S1 的「整块才转」边界见 ARCHITECTURE 1.15。\n"
-      "--drain-timeout-ms 是优雅停止的**兜底**窗口（0..600000，默认 5000）：到点就把还没\n"
+      "--drain-timeout-ms 是优雅停止的**兜底**窗口（0..600000，默认 10000）：到点就把还没\n"
       "收尾的连接强关，代价是那条连接的出向字节被丢弃、客户端看到截断。它是兜底不是承诺\n"
-      "（一条卡死的客户端不该能无限拖住一次下线），且按 ARCHITECTURE 1.20 必须 ≥ S4 的请求超时。\n"
+      "（一条卡死的客户端不该能无限拖住一次下线），且必须 ≥ 响应头超时（默认 10000，\n"
+      "违反退出码 2；S4-02 把默认值对齐到这条校验上）。\n"
       "--config <path>（S3-02，ADR-19）读一份 JSON 子集配置：upstreams（组名、balance、成员后端）与\n"
       "routes（prefix/regex → 组名）。**只有策略进文件**：监听地址、监听端口、--workers 这些进程形态\n"
       "仍然只走命令行，两边之间没有「谁覆盖谁」这回事。给了 --config 就不必给 --upstream，两个都给会被\n"
@@ -138,7 +139,10 @@ std::atomic<l7gate::net::Reactor*> g_reactor_for_signal{nullptr};
 std::atomic<l7gate::net::ReactorGroup*> g_group_for_signal{nullptr};
 // 兜底窗口由命令行决定，但 handler 不能读普通变量（那是跨信号边界的非原子共享）。
 // 原子 relaxed load 是信号安全的，且这个值在装 handler 之前就已经写定。
-std::atomic<std::int64_t> g_drain_timeout_ms{5000};
+// S4-02（ADR-22 门禁顺带修）：默认从 5000 抬到 10000——S4-01 的启动校验要求
+// drain ≥ 响应头超时（默认 10000），而 5000 的旧默认让**无参数启动**直接退出码 2；
+// 六条冒烟全撞在这里。S2-05 的裁定原文允许"要么调大"。
+std::atomic<std::int64_t> g_drain_timeout_ms{10000};
 
 void on_stop_signal(int) {
   const std::int64_t timeout_ms = g_drain_timeout_ms.load(std::memory_order_relaxed);
@@ -280,6 +284,13 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   put("close_headers_honored", static_cast<long long>(stats.load(stats.close_headers_honored)));
   // S1-06 的四条观测线：自产错误响应、截断的两个互斥类别、框架判定的完结数。
   put("gateway_replies_sent", static_cast<long long>(stats.load(stats.gateway_replies_sent)));
+  // S4-02（ADR-22）：回源拿不到上游时的三格表态账（与上一行同口径、互斥）。
+  put("gateway_replies_connect_failed",
+      static_cast<long long>(stats.load(stats.gateway_replies_connect_failed)));
+  put("gateway_replies_all_ejected",
+      static_cast<long long>(stats.load(stats.gateway_replies_all_ejected)));
+  put("gateway_replies_over_capacity",
+      static_cast<long long>(stats.load(stats.gateway_replies_over_capacity)));
   put("upstream_truncated_before_head",
       static_cast<long long>(stats.load(stats.upstream_truncated_before_head)));
   put("upstream_truncated_in_body",
@@ -352,9 +363,10 @@ int serve(int argc, char** argv) {
   // S2-01：worker 线程数。缺省 1 = 单 Reactor（S1 路径逐字节不变，冒烟脚本断言的
   // epoll_registrations=4 等精确计数因此不作废）；≥2 走 ReactorGroup（ADR-14 后果段）。
   int workers = 1;
-  // S2-05：排水兜底窗口（毫秒）。默认 5000，与 ARCHITECTURE 1.20 里那条"兜底不是承诺"
-  // 一起看；它必须 ≥ S4 的请求超时，S4 没定义之前这是占位中值。
-  long long drain_timeout_ms = 5000;
+  // S2-05：排水兜底窗口（毫秒）。默认 10000，与 ARCHITECTURE 1.20 里那条"兜底不是承诺"
+  // 一起看；它必须 ≥ S4 的响应头超时（默认 10000），S4-01 的启动校验兑现这条约定，
+  // S4-02 把默认值从 5000 对齐到 10000（S2-05 裁定原文允许"要么调大"）。
+  long long drain_timeout_ms = 10000;
   bool have_listen = false;
   bool have_upstream = false;
   std::vector<UpstreamEndpoint> upstream_endpoints;

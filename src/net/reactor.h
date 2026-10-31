@@ -292,16 +292,28 @@ class Reactor {
   // 转发策略（S1-04 的部分）：请求头+body 一旦完整，就把它的**原始字节**排进上游
   // 的出向缓冲，然后消费掉下游的这些字节。不改写、不重新分帧——逐字节透传的前提
   // 是"我碰过的字节和我没碰过的字节长得一样"，这条归 S1-06 的验收负责证明。
-  // 返回 false 表示这一条没转出去（上游还没连上 / 上游出向满了 / **目标要换但手上还有
-  // 在飞的请求**——第三种是 S3-01 新增的，见 `ensure_upstream` 那段"干净边界"）。
+  // 三态返回（S4-02，ADR-22）：
+  //   kForwarded —— 字节已排进上游、下游已消费；
+  //   kBlocked   —— 这一条没转出去，而且**以后还会再来试**（上游正在 connect /
+  //                 上游出向满了 / 目标要换但手上还有在飞，ADR-18 第五节）。
+  //                 请求留在下游缓冲里，由事件或 pump_response 的重驱动接手；
+  //   kReplied   —— 拿不到上游，而且已经给下游发了一条自产错误并解链关闭
+  //                 （ADR-22 的三形态）。调用方必须按"连接已被关掉"收尾，不能再泵。
+  // 把 kReplied 混进 kBlocked 的后果是：调用方会以为"以后再来试"，对一个正在
+  // kClosing 的连接继续泵。
   // upgrade / close_after 是 S1-05 的两条连接级意图：从**这条请求自己的**已解析
   // view 判出（调用方必须在 finish_request 之前取用 view，这里是唯一的取用点），
   // 由本函数决定落到哪条连接、何时置 kClosing。判定不碰字节：转发出去的仍是原始请求。
   // `upstream_target` 是链调用点读回来的那个下标（S3-01，ADR-18）：filter 没表态时
   // 它已经被换成 `config_.default_target`，所以本函数以下只认"这就是要去的桶"。
-  bool forward_request(const std::shared_ptr<Connection>& downstream,
-                       std::size_t request_bytes, bool upgrade, bool close_after,
-                       std::uint16_t upstream_target);
+  enum class ForwardStep : std::uint8_t {
+    kForwarded,
+    kBlocked,
+    kReplied,
+  };
+  ForwardStep forward_request(const std::shared_ptr<Connection>& downstream,
+                              std::size_t request_bytes, bool upgrade, bool close_after,
+                              std::uint16_t upstream_target);
   // 响应语义泵（S1-06）：上游入向缓冲里的字节按"当前响应的阶段"过一遍框架判定
   // （http/response_framing 的纯函数），然后透传——头整块排（半个头排出去就是把
   // 畸形喂给客户端），body 按框架边界拆散排（截断的权力在框架知识，不在这条泵）。
@@ -318,8 +330,18 @@ class Reactor {
   // 值得发的货），下游 kFlushThenClose（4xx 还躺在它的出向里）。先手工把两侧
   // 的 peer_fd_ 解开，否则 close_connection 的级联会把同一个 why 传染给对端，
   // 下游的 4xx 就跟着被丢掉了。
+  //
+  // S4-02（ADR-22）：`cause` 决定这条表态记进哪一格回源失败账。计数发生在
+  // **响应真的进了下游出向缓冲**之后（与 gateway_replies_sent 同一口径），
+  // 三格互斥；kNone = S1-06/S3-01/S4-01 那些既有来源（4xx / 404 / 504 等）。
+  enum class ReplyCause : std::uint8_t {
+    kNone,
+    kConnectFailed,
+    kAllEjected,
+    kCapacity,
+  };
   void fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
-                            std::uint16_t status);
+                            std::uint16_t status, ReplyCause cause = ReplyCause::kNone);
 
   // 隧道泵（S1-05）：不解析、不改写、不重新分帧，把 src 入向缓冲里的全部可读
   // 字节整块搬进 dst 的出向缓冲。装不下（出向水位）就一个字节都不搬——和请求侧
@@ -360,9 +382,20 @@ class Reactor {
   // 认出"这不是我要的桶"、把这条请求压回下游缓冲（ADR-18 第五节：换了就把 ADR-16 的
   // 响应 FIFO 打乱，那不是我给路由买的单）。被压住的请求由 `pump_response` 的
   // `kComplete` 分支在在飞归零那一刻重新驱动；**少那一次重驱动就是一条挂死的环**。
-  // 返回 nullptr 表示暂时还没有（正在 connect）或已达 fd 预算上限。
-  std::shared_ptr<Connection> ensure_upstream(const std::shared_ptr<Connection>& downstream,
-                                              std::uint16_t upstream_target);
+  //
+  // S4-02（ADR-22）：返回值从裸 `shared_ptr` 改成三态——
+  //   conn 非空            → 拿到了上游；
+  //   conn 空、cause=kNone → 暂时没有（正在 connect）或目标下标越界：请求留原地等重驱动；
+  //   conn 空、cause≠kNone → 拿不到，且调用方应给下游发 `reject_status` 这条自产响应。
+  // 后两者**不能合并**：把它们都当"暂时没有"，一个 connect 已确定失败的请求就永远
+  // 等不到"以后"——那正是 S2-06 那 71,769 条客户端 timeout 的形状。
+  struct UpstreamPick {
+    std::shared_ptr<Connection> conn;
+    std::uint16_t reject_status = 0;  // 非 0 = 自产响应状态码（502/503）
+    ReplyCause reject_cause = ReplyCause::kNone;
+  };
+  UpstreamPick ensure_upstream(const std::shared_ptr<Connection>& downstream,
+                               std::uint16_t upstream_target);
 
   // --- 上游连接池（S2-02，ADR-15；分桶见 ADR-15 追加节）：借 / 还 / 淘汰 ---------
   // 池是**每 worker 一份**、只被本循环线程碰的按目标分桶的空闲热上游表，所以全程无锁

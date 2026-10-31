@@ -381,3 +381,80 @@ refused/5xx 立即失败、没有在途悬挂。两个读数的诚实表述：**
    最小复现（无网关在场）首次重试即成功——**在途连接越多，重绑窗口越长**。
 3. **`set -u` 下的 `$i` 笔误**（`$try` 写成 `$i`）让重试循环第一次就崩——取证脚本自己也
    要按它要证明的纪律写。
+
+---
+
+## 13. 回源耗尽表态（S4-02，ADR-22）：S2-06 那 71,769 条旧债结账
+
+**这一节在问什么**：S2-06 的 100k 名义档（`UPSTREAM_ENDPOINTS=1`，回源容量 28,232）实测
+`downstream_accepted=100000` 而 `established=28231`，其余 **71,769 条请求在回源 connect
+失败后留在下游缓冲里一言不发**，客户端 30–120 秒后以 `handshake-timeout` 收场。S4-02
+把它们改成"connect 失败 → 自产 502 / 被摘尽 → 503 / 本地预算耗尽 → 503"（ADR-22）。
+这一节记录**同场景重跑**，以及重跑过程中它替 S4-01 抓到的两个产品缺陷。
+
+### 13.1 有效轮：71,769 条全部拿到完整 502（`build/bench/replay-b006-s402b/`）
+
+命令与 `c100k.sh` 的 B-006 重放档同参，只把 ramp 拉到 S2-06a 判别实验用过的慢档
+（833 条/秒那一档撞的是**观察者假墙**，见 13.3）：
+
+```
+CONNECTIONS=100000 TARGETS=4 UPSTREAM_ENDPOINTS=1 RAMP_MS=300000 HANDSHAKE_TIMEOUT_MS=120000 \
+  OUT_DIR=build/bench/replay-b006-s402b bash scripts/bench/c100k.sh
+```
+
+| 观察点 | 旧形状（S2-06 名义档） | 本轮（S4-02 之后） |
+|---|---|---|
+| 客户端 `established` | 28,231 | **28,231**（同一堵容量墙） |
+| 客户端 `not_101` | 0 | **71,769**（每条失败连接都收到完整 502 头） |
+| `failure reason=handshake-timeout` | 71,769 条全部 | **0 条**（终局行之外没有任何 failure reason 行） |
+| 客户端 `failed` | 71,769（全 timeout） | 71,769（**全 not_101**） |
+| 网关 `gateway_replies_sent` | 0 | **71,769** |
+| 网关 `gateway_replies_connect_failed` | —（该格当时不存在） | **71,769** |
+| `gateway_replies_all_ejected` / `_over_capacity` | — | 0 / 0（本轮没有健康表、没撞 fd 预算） |
+| `upstream_connect_failed` | 75,708 | **71,769** |
+| `upstream_connect_timeout` / `head` / `body_idle` | — | **0 / 0 / 0**（没有一条走"等超时"） |
+| `upgrades_101` / `upstream_opened` | 28,231 / 28,231 | 28,231 / 28,231 |
+| 上游夹具 `accepted` / `peak_clients` | 28,231 / — | 28,231 / **28,231**（无 churn，隧道没被误杀） |
+| 生命周期 | — | `constructed==destructed==128231`、`live=0`、fd 41→41 |
+| 客户端观察者 | — | `self_cpu_ticks=19,678` / `elapsed=510,020 ms` ≈ 单核 3.9%——观察者不是瓶颈 |
+
+**判读**：容量墙一个字节没动（28,231 vs 28,231），变的是墙前那 71,769 条的**结局**——
+从"挂到客户端放弃"变成"一条完整 502"。`not_101` 是客户端自己数的"头收齐但不是 101"，
+与网关 `gateway_replies_connect_failed=71769` 逐数相等；三种超时计数全 0 说明这些 502
+不是等出来的。单条的上限由 ctest 钉着（`RefusedUpstreamReplies502AndCountsIt` ≤2s、
+`EveryDeadUpstreamRequestGetsIts502WithinFiveSeconds` 64 条批量 <5s）。
+
+**脚本自己的 ✗ 照记（它们为 E=4 正式档设计）**：前置容量门（"每个回源端点要扛 100000 >
+28232"与"计划 100000 > 本轮容量 28232"）、`upstream_connect_failed≠0` 门、客户端
+`established≠planned` 门全亮——本轮引用的是**表态计数**，不是每连接内存/空闲 CPU；
+那两格本来就 `measurable=0`。`c100k_rc=1` 是这个原因，不是回归。
+
+**首轮作废档（`build/bench/replay-b006-s402/`）为什么留着**：833 条/秒的跑法下客户端
+`established=72268 / failed=27732 全 handshake-timeout / not_101=0`——观察者假墙（S2-06a
+已登记的形状），**同时**它暴露了 13.2 的隧道缺陷：网关侧 `upstream_head_timeout=100000`、
+`gateway_replies_sent=100000`，上游 `peak_clients=8390`。两件事叠在一起，那一轮的容量
+与表态读数都不可解释，作废；留着是为了让"缺陷是怎么被逼出来的"有据可查。
+
+### 13.2 同轮抓到的三个缺陷（都不是 S4-02 新写的代码，是门禁的价值）
+
+| # | 缺陷 | 实测形态 | 处置 |
+|---|---|---|---|
+| 1 | **101 之后响应头限期没有撤销**（S4-01） | E=1 首轮：`upstream_head_timeout=100000`、`gateway_replies_sent=100000`、上游 `peak_clients=8390`——每条空闲隧道 10 秒后被判 504 杀掉、重开，B-007/B-010 那种"空闲 100k 隧道"的口径不成立 | `maybe_enter_tunnel` 里撤销 `erase_upstream_deadline`；回归用例 `HeadTimeoutIsCancelledWhenTheTunnelStarts`（阳性验证：注释掉那行 → 当场红） |
+| 2 | **504 的 `Content-Length` 写成 15、body 是 16 字节**（S4-01） | 把 504 补进 `GatewayRepliesAreCompleteAndSelfConsistent` 的逐条核对循环后当场红（S4-01 的用例只断状态行） | `Content-Length: 16`；504 进那条表 |
+| 3 | **默认 `drain=5000` 违反 `drain ≥ head=10000` 启动校验**（S4-01） | 无参数启动退出码 2，六条冒烟全部拒绝启动；S4-01 行记的"五冒烟全绿"因此不成立 | 按 S2-05 裁定"要么调大"把默认 drain 抬到 10000；`smoke-s2-05.sh` 阶段三（显式 800）同传 `--upstream-head-timeout-ms 0`；S4-01 行就地更正 |
+
+另有一条**门禁工具**缺陷：`verify-all-presets.sh` 的退出码被管道吞掉（tsan 全量 1 条失败
+时脚本仍报 rc=0），且 build 失败仍拿旧二进制跑 ctest（原待裁⑥）。S4-02 已修：任一
+configure/build/ctest 失败 → 脚本 rc=1，build 失败跳过该 preset 的 ctest。
+
+### 13.3 一次瞬态，照记
+
+tsan 全量在 `-j16` 下首次跑红了一条：`S2_03_CrossThreadDestruction.ConnectDisconnectStorm...`
+`ok=478/480`（2 条客户端读超时），单跑 **5/5 绿（60–119 ms）**、随后全量**连跑三遍
+269/269 绿**。归因为并行 ctest 的资源竞争（16 个 tsan 进程 + 本套件新增的 64 客户端/700ms
+用例），不是产品缺陷；不据此改断言，也不据此说"全绿"——按"首红一次、复跑三绿"原样记。
+
+### 13.4 这一轮的门禁面
+
+三 preset 各 **269/269**、非 gtest 警告 **0 条**、tsan 日志 `ThreadSanitizer` 0 次；六条冒烟
+（含需要 Docker 的 `smoke-s3-04`，MySQL 8.0.36 六阶段）`rc=0`、✗ 计数 0。

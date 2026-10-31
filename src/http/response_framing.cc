@@ -452,11 +452,21 @@ std::string_view gateway_error_reply(std::uint16_t status) noexcept {
              "Connection: close\r\n"
              "\r\n"
              "Bad Gateway\n";
+    case 503:
+      // S4-02（ADR-22）：本网关此刻给不出可用上游（全员被摘回退后仍失败）或自身
+      // 连接/fd 预算耗尽。与 502 的分界是"上游不可达" vs "我这边没有可用后端"。
+      return "HTTP/1.1 503 Service Unavailable\r\n"
+             "Content-Length: 20\r\n"
+             "Connection: close\r\n"
+             "\r\n"
+             "Service Unavailable\n";
     case 504:
       // S4-01（ADR-21）：请求级超时的表态格。头前超时（连接/响应头）有自产资格；
       // body 空闲超时头已出去，走连接终止表态、不到这张表。
+      // **S4-02 修**：原来写的是 CL 15，而 "Gateway Timeout\n" 是 16 字节——S4-01
+      // 的用例只断状态行，字节账是这张表的逐条用例（S4-02 把 504 补进那条循环）抓到的。
       return "HTTP/1.1 504 Gateway Timeout\r\n"
-             "Content-Length: 15\r\n"
+             "Content-Length: 16\r\n"
              "Connection: close\r\n"
              "\r\n"
              "Gateway Timeout\n";

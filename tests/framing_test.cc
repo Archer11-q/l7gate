@@ -304,10 +304,12 @@ TEST(S1_06_Framing, MappingTableOwnsEveryErrorCode) {
 TEST(S1_06_Framing, GatewayRepliesAreCompleteAndSelfConsistent) {
   // 每条自产响应都必须**自己就是合法的 CL 响应**：CL 声明的字节数 == body 实际
   // 字节数，状态行和终止串齐。数错 CL 的"错误响应"本身就是需要被 502 的畸形。
-  // S3-01 加进来的是 404（路由无匹配）。它必须和其余每条一样**自己就是合法的 CL 响应**，
-  // 否则"用一条畸形去表态"这件事会由我自己在 S3 第一次落地。
+  // S3-01 加进来的是 404（路由无匹配），S4-01 是 504（头前超时），S4-02 是 503
+  // （被摘尽 / 本地预算耗尽）。它们必须和其余每条一样**自己就是合法的 CL 响应**，
+  // 否则"用一条畸形去表态"这件事会由我自己在落地当天做出来。
   for (std::uint16_t status : {std::uint16_t{400}, std::uint16_t{404}, std::uint16_t{411},
-                               std::uint16_t{413}, std::uint16_t{501}, std::uint16_t{502}}) {
+                               std::uint16_t{413}, std::uint16_t{501}, std::uint16_t{502},
+                               std::uint16_t{503}, std::uint16_t{504}}) {
     const std::string_view reply = gateway_error_reply(status);
     ASSERT_FALSE(reply.empty());
     const auto info = analyze_response_head(reply);
@@ -320,8 +322,9 @@ TEST(S1_06_Framing, GatewayRepliesAreCompleteAndSelfConsistent) {
     const std::string prefix = "HTTP/1.1 " + std::to_string(status) + " ";
     EXPECT_EQ(reply.substr(0, prefix.size()), prefix);
   }
-  // 支持集合之外的状态码：空 view，调用方不许当"发送成功"。
-  EXPECT_TRUE(gateway_error_reply(503).empty());
+  // 支持集合之外的状态码：空 view，调用方不许当"发送成功"。500 刻意不在表里——
+  // 网关不替上游编 5xx（上游自己回的 500 走透传，不到这张表）。
+  EXPECT_TRUE(gateway_error_reply(500).empty());
   EXPECT_TRUE(gateway_error_reply(0).empty());
 }
 
