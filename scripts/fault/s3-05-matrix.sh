@@ -25,7 +25,7 @@ PRESET="${PRESET:-release}"
 BIN="build/$PRESET"
 GATEWAY="$BIN/l7gate"
 UPSTREAM="$BIN/tests/l7gate_test_upstream"
-OUT="build/fault/s3-05"
+OUT="${FAULT_OUT_DIR:-build/fault/s3-05}"
 mkdir -p "$OUT"
 
 FAILED=0
