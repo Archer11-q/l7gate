@@ -26,7 +26,10 @@ set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")/../.." || exit 1
 
 BIN="build/release"
-GATEWAY="$BIN/l7gate"
+# B-018 的跨版本配对臂要换的**只有网关那一个二进制**——观察者（l7gate_c100k）与压测上游必须
+# 两臂同一个，否则"两臂只差一个因子"先被我自己破掉。缺省沿用上面 BIN 里那一个，历史臂逐字不变。
+GATEWAY_BIN="${GATEWAY_BIN:-$BIN/l7gate}"
+GATEWAY="$GATEWAY_BIN"
 UPSTREAM="$BIN/tools/l7gate_bench_upstream"
 CLIENT="$BIN/tools/l7gate_c100k"
 for b in "$GATEWAY" "$UPSTREAM" "$CLIENT"; do
@@ -290,7 +293,26 @@ UP_SERVED=$(uval_sum requests)
 GW_WORKERS=$(gval workers); [[ -n "$GW_WORKERS" ]] || GW_WORKERS=1
 (( GW_RC == 0 )) || die "网关退出码 $GW_RC：优雅停止没生效，这一轮的账不完整"
 [[ "${LIVE:-x}" == "0" ]] || die "live_connections=${LIVE:-?}：排水没收干净"
-[[ -n "$FD0" && "$FD0" == "$FD1" ]] || die "fd 没回基线：${FD0:-?} → ${FD1:-?}"
+# fd 那一格在装了探活的臂上必须按**有界账**读：`fd_end` 是在析构之前采样的（main.cc:879 那条
+# 注释），而在飞的探活 fd 要到 `~Reactor` 才关（reactor.cc:167-173）——所以退出瞬间带着
+# 0..探活槽位数 条探测 fd 是**采样点的性质，不是泄漏**（S4-07 口径⑰）。
+# 本轮撞开这件事的过程本身就是一条记录：B-016（2026-10-30）那两条 BS3 臂的落盘写的就是
+# `fd=9->10`，而这条门从 S2-07 起一直是硬 `die` —— 也就是那两臂其实一直带着这条 ✗，
+# 只是 ✗ 打在 stdout、`s1-p999.summary.txt` 里看不见（汇总行用的就是这一对 FD0/FD1）。
+# HEALTH_PROBES=1 是"这一臂装了探活"的既有旗标（等式自证早就靠它放宽）；缺省 0 时下面第一条
+# 与 S2-07 时代逐字同形，A0/B-013 那些没装探活的臂的判据一点没动。
+PROBE_SLOTS=$(grep -o "\[serve\] health_t[0-9]*_" "$OUT/gateway.log" 2>/dev/null | sort -u | wc -l)
+FD_DELTA=$(( ${FD1:-0} - ${FD0:-0} ))
+if [[ "$HEALTH_PROBES" == "1" ]]; then
+  FD_BUDGET=$(( PROBE_SLOTS * GW_WORKERS ))
+  if [[ -n "$FD0" ]] && (( FD_DELTA >= 0 && FD_DELTA <= FD_BUDGET )); then
+    note "fd ${FD0}->${FD1}（Δ=$FD_DELTA ≤ 探活槽位 $PROBE_SLOTS × worker $GW_WORKERS；采样点在析构之前，这条按有界账判）"
+  else
+    die "fd 增量 Δ=$FD_DELTA 超出探活槽位预算 $FD_BUDGET（或读回空值 ${FD0:-空}）：这一格按泄漏查，不许按采样点算"
+  fi
+else
+  [[ -n "$FD0" && "$FD0" == "$FD1" ]] || die "fd 没回基线：${FD0:-?} → ${FD1:-?}"
+fi
 [[ -n "$CONSTRUCTED" && "$CONSTRUCTED" == "$DESTRUCTED" ]] || die "constructed=${CONSTRUCTED:-?} / destructed=${DESTRUCTED:-?}"
 [[ "${GW_WORKERS}" == "$WORKERS" ]] || die "网关自报 workers=$GW_WORKERS ≠ 请求 $WORKERS：这一臂的线程模型不是我要的那个"
 [[ "${UP_REFUSED:-x}" == "0" && "${UP_ADDFAIL:-x}" == "0" ]] \
@@ -303,6 +325,14 @@ if [[ "${HEALTH_PROBES:-0}" == "1" ]]; then
   # B-016 的探活口径：上游 served 里混着探活打进来的请求，严格等式放宽成有界账。
   # 探活成功一定到上游（1 条请求）；探活失败只有连上了的才到上游——所以差值
   # 落在 [probe_ok, probe_ok+probe_fail]，越界即账本有问题。
+  #
+  # S4-08 把上界再加一格 **在飞探测数（≤ 槽位数 × worker）**，理由与上面 fd 那一格同源：
+  # 两边的计数是在**不同瞬间**取的——网关的退出账打在 `~Reactor` 之前，上游是收到 SIGTERM
+  # 之后才打自己的账。所以退出瞬间那条"已经连上、GET 已发出、响应还没回来"的探测会被上游
+  # 数进去，而网关 `probe_ok`/`probe_fail` 两边都不加。本轮实测到这一格：
+  # `accepted=112 = 直连 20 + 网关上游 20 + 探测 72`，而 `probe_ok=71 / probe_fail=0`，
+  # 差的那 1 就是它。**B-016 当年两臂 690/738 恰好逐数相等，是那一瞬没有探测在飞——
+  # 等式成立是运气，不是性质**，这条要写进 B-016 的追记，不许回头改它已记的数。
   PROBES_OK=0; PROBES_FAIL=0
   while read -r k; do
     [[ -n "$k" ]] || continue
@@ -313,9 +343,14 @@ if [[ "${HEALTH_PROBES:-0}" == "1" ]]; then
     PROBES_FAIL=$(( PROBES_FAIL + $(gval "$k") ))
   done < <(grep -o 'health_t[0-9]*_[^ ]*_probe_fail' "$OUT/gateway.log" | sort -u)
   EXTRA=$(( ${UP_SERVED} - ${D_DONE} - ${P_DONE} ))
-  [[ ${EXTRA} -ge ${PROBES_OK} && ${EXTRA} -le $(( PROBES_OK + PROBES_FAIL )) ]] \
-    || die "探活账不闭合：upstream served ${UP_SERVED} − direct ${D_DONE} − proxy ${P_DONE} = ${EXTRA}，不在 [probe_ok=${PROBES_OK}, +probe_fail=$(( PROBES_OK + PROBES_FAIL ))] 内"
-  ok "等式（探活口径）：direct ${D_DONE} + proxy ${P_DONE} + 探活打进上游 ${EXTRA}（probe_ok=${PROBES_OK} / probe_fail=${PROBES_FAIL}）== upstream ${UP_SERVED}"
+  PROBE_SLACK=$(( ${PROBE_SLOTS:-0} * GW_WORKERS ))
+  [[ ${EXTRA} -ge ${PROBES_OK} && ${EXTRA} -le $(( PROBES_OK + PROBES_FAIL + PROBE_SLACK )) ]] \
+    || die "探活账不闭合：upstream served ${UP_SERVED} − direct ${D_DONE} − proxy ${P_DONE} = ${EXTRA}，不在 [probe_ok=${PROBES_OK}, +probe_fail+在飞预算=${PROBE_SLACK}] 内"
+  if [[ ${EXTRA} -eq ${PROBES_OK} ]]; then
+    ok "等式（探活口径，**逐数相等**）：direct ${D_DONE} + proxy ${P_DONE} + 探活 ${EXTRA}（probe_ok=${PROBES_OK} / probe_fail=${PROBES_FAIL}）== upstream ${UP_SERVED}"
+  else
+    note "等式（探活口径，**有界**）：探活打进上游 ${EXTRA} 比 probe_ok=${PROBES_OK} 多 $(( EXTRA - PROBES_OK )) 条，落在在飞探测预算 ≤${PROBE_SLACK} 内（两边计数取样瞬间不同，见上面的注释）；probe_fail=${PROBES_FAIL}"
+  fi
   [[ "${P_DONE}" == "${GW_PARSED}" && "${GW_PARSED}" == "${GW_COMPLETED}" ]] \
     || die "网关那一侧不闭合：requests_done=${P_DONE} / parsed=${GW_PARSED} / completed=${GW_COMPLETED}"
 else
@@ -325,7 +360,14 @@ else
     || die "网关那一侧不闭合：requests_done=${P_DONE} / parsed=${GW_PARSED} / completed=${GW_COMPLETED}"
 fi
 ok "生命周期与等式：live=0、fd ${FD0}→${FD1}、constructed==destructed==${CONSTRUCTED}、上游 refused=0"
-ok "等式：direct ${D_DONE} + proxy ${P_DONE} == upstream ${UP_SERVED}；proxy 一侧 == 网关 parsed/completed ${GW_PARSED}/${GW_COMPLETED}"
+# 这一行原来无条件打，于是在装了探活的臂上打出一条**算不成立的 ✓**（"direct 4000 + proxy 12000
+# == upstream 16071"——三个数相加根本不等）。装探活时上面那条有界等式已经把这句话说过了，
+# 这里就只补网关那一侧；不装探活的臂逐字不变。
+if [[ "${HEALTH_PROBES:-0}" == "1" ]]; then
+  ok "等式（网关那一侧）：proxy ${P_DONE} == parsed/completed ${GW_PARSED}/${GW_COMPLETED}；上游那一侧由上面那条探活口径覆盖"
+else
+  ok "等式：direct ${D_DONE} + proxy ${P_DONE} == upstream ${UP_SERVED}；proxy 一侧 == 网关 parsed/completed ${GW_PARSED}/${GW_COMPLETED}"
+fi
 
 # 增量：µs 相减再换算成 ms，只在两个读数都取到时才算。取不到就写文字，绝不写 0.000
 # （「一片 0 比一片 ? 危险」是 BENCHMARK 的第一条规矩，s1-p99.sh 里那条die也是）。
