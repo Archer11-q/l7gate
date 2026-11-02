@@ -517,12 +517,24 @@ class Reactor {
   // body idle → 只能以连接终止表态）。扫的是 map 不是注册表——表的大小 = 在飞上游数。
   void enforce_upstream_timeouts(std::int64_t now_ms) noexcept;
 
-  // --- 负载均衡的配对账（S3-02，ADR-19 第四条）--------------------------------------
+  // --- 负载均衡的配对账（S3-02，ADR-19 第四条；S4-06/S4-06a 把入口从 1+2 扩到 2+4）------
   // 尺子是"当前被配给下游的上游连接条数"，不是"这个后端有多少条连接"——池里空闲的那条
   // 不算负载（它闲着的，这正是 least_conn 想看见的事）。
-  // **只有两个 dissolution 入口会调 unpair**（`close_connection` 的两条互斥分支、
-  // `ensure_upstream` 的目标切换），加一个 pair 入口（`ensure_upstream` 借出/新建）。
-  // 记账点少是刻意的：这类计数一旦有三个写入点，就有一个"少减一次"的分支在等着。
+  // 不变式只有一条：**谁把 `peer_fd` 解开，谁就减这笔账**。反过来也成立——`close_connection`
+  // 只在"进来时 `peer_fd` 有效"时才减，所以显式解过链的路径必须自己减，否则那笔 +1 没人减。
+  // S4-06a 修的就是漏掉的那条：`fail_pair_with_reply` 为了不把 close-why 传染给对端而先解链
+  // （ADR-22 第三节第 1 条），却没人替它减账 → `pairings` 只加不减，least_conn 长期把这台
+  // 读成"更忙"且永不自愈（理由与判据在 ADR-19 追加第五条）。
+  // 入口清单（改任何一条都要回来对这张表）：
+  //   pair（+1）  —— `ensure_upstream` 的借出与新建两处，都在"这条上游确实归给这条下游了"
+  //                  之后（S4-02 把注册失败那条挪到成功之后，就是为了让 +1 与"有对象"同事实）。
+  //   unpair（−1）—— ① `close_connection` 的两条互斥分支（被关的是配对中的上游，或对端是上游）；
+  //                  ② `ensure_upstream` 的目标切换（干净边界上换桶）；
+  //                  ③ S4-06 `retry_connect_failure` 的解链处；④ S4-06a `fail_pair_with_reply`
+  //                  的解链处。②③④ 都紧跟在清 `peer_fd` 的那一段里，所以 ① 读不到配对——
+  //                  四条互斥，一次解链最多减一次（`note_unpaired` 夹 0 是最后一道安全网）。
+  // 记账点少是刻意的：这类计数一旦有三个写入点，就有一个"少减一次"的分支在等着——这条本轮
+  // 不是"我说它成立"，是四加两减的退化各红过一次（FAULT-INJECTION §17）。
   // `config_.lb_state` 为空时这两个函数直接返回——所有既有单 Reactor 路径与压测都不为账付费。
   void note_upstream_paired(std::uint16_t target) noexcept;
   void note_upstream_unpaired(std::uint16_t target) noexcept;

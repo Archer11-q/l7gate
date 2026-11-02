@@ -6353,5 +6353,175 @@ TEST(S4_06_Retry, SyncRetryStampsTheSpentBudgetToo) {
   harness.stop_loop();
   harness.shutdown_all();
 }
+
+// ================= S4-06a：自发表态路径上的配对账（ADR-19 追加第五条）=================
+//
+// 四条形状是**成对**的（那把尺的两个方向各钉一半）：
+//   下界——加账入口确实走过（那一笔 +1 与 `upstream_opened` 同源），表态之后账回到该在的
+//           位置；**只断"归零"挡不住"从不加账"的实现**，所以每条都连着读"加过"那一半；
+//   上界——一次表态只放一笔减账（第四条末那种"两条各配一条、减一条还剩一条"的读法）。
+//           双减在夹 0 之后读起来也是"干净的 0"，所以必须有这一条，前三条代替不了它。
+// **这四条在改动之前全是绿的**（既有端到端没有任何一条读 `pairings`）——那正是本任务的
+// 风险面：改动没有回归信号，绿不是证据。
+
+namespace {
+
+// 一个目标 + 一份 `LbState`：只把账交给 reactor，不装 filter（这四条测的是账，不是选择）。
+// `lb_state` 必须在 start() 之前进 config（口径⑦那条"构造期副本"的教训）。
+struct AccountRig {
+  std::shared_ptr<l7gate::route::LbState> state;
+  void install(Harness::Options* options, std::size_t target_count = 1) {
+    state = std::make_shared<l7gate::route::LbState>(target_count, 1);
+    options->config.lb_state = state;
+  }
+};
+
+}  // namespace
+
+// 一、**异步 connect 失败 → 502**。改之前 `pairings` 停在 1，而这条 worker 手上一条连接
+// 都没有（`live_connections=0`、两侧都已关闭）。
+TEST(S4_06a_PairingAccount, RefusedUpstreamReplyReleasesThePairing) {
+  std::string why;
+  TestUpstream backend;
+  ASSERT_TRUE(start_sized_upstream(&backend, 64, &why)) << why;
+  const int dead_port = backend.port();
+  backend.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", dead_port);
+  AccountRig rig;
+  rig.install(&options);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/acct-502")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 502 Bad Gateway");
+  c.close();
+  harness.stop_loop();
+
+  if (stats.load(stats.upstream_opened) == 0u) {
+    GTEST_SKIP() << "本机 connect 被拒走的是同步支（没造上游对象）→ 这一支根本没有那笔 +1，不判";
+  }
+  EXPECT_EQ(rig.state->pairings(0), 0u)
+      << "502 之后配对账没减：least_conn 会长期把这台读成“更忙”，且永不自愈";
+  EXPECT_EQ(stats.load(stats.live_connections), 0u) << "尺说还有配对，注册表说一条都没有";
+  harness.shutdown_all();
+}
+
+// 二、**响应头超时 → 504**：共用同一个出口的第二个形态（连上了、不回字节）。
+TEST(S4_06a_PairingAccount, HeadTimeoutReplyReleasesThePairing) {
+  std::string why;
+  TestUpstream stalled;
+  ASSERT_TRUE(start_sized_upstream(&stalled, 64, &why)) << why;
+  stalled.set_stall_reads(true);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_head_timeout_ms = 300;
+  add_target(&options, "127.0.0.1", stalled.port());
+  AccountRig rig;
+  rig.install(&options);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/acct-504")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << "504 没来：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 504 Gateway Timeout");
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 1u);
+  EXPECT_GE(stats.load(stats.upstream_opened), 1u) << "没有 +1 的“归零”什么也证明不了";
+  c.close();
+  stalled.set_stall_reads(false);
+  harness.stop_loop();
+
+  EXPECT_EQ(rig.state->pairings(0), 0u) << "504 这条表态路径同样漏减配对账";
+  harness.shutdown_all();
+  stalled.stop_and_join();
+}
+
+// 三、**429 打在一条已经配好对的下游上**（同一连接的第二条请求）。限流在链首，可它手上
+// 真的挂着一笔配对账——这条最能说明"六类表态共用一个出口"：最不像"回源失败"的那一类
+// 也走同一句关闭。
+TEST(S4_06a_PairingAccount, RateLimitedReplyOnPairedConnectionReleasesThePairing) {
+  std::string why;
+  Harness harness;
+  auto limiter = std::make_shared<l7gate::filter::RateLimiter>(1, 1);  // rate=1/s、burst=1
+  harness.add_filter(std::make_unique<l7gate::filter::RateLimitFilter>(
+      limiter, l7gate::filter::RateLimitKeySpec{}));
+  Harness::Options options = default_options();  // 自带一台健康上游
+  AccountRig rig;
+  rig.install(&options);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client c;
+  ASSERT_TRUE(c.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(c.write_all(get_request("/acct-429")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  ASSERT_TRUE(c.write_all(get_request("/acct-429")));
+  ASSERT_TRUE(c.read_response(&status, &body, &why)) << "第二条没拿到 429：" << why;
+  EXPECT_EQ(status, "HTTP/1.1 429 Too Many Requests");
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u);
+  EXPECT_GE(stats.load(stats.upstream_opened), 1u) << "这条连接没配过对，那一格就没有内容可测";
+  c.close();
+  harness.stop_loop();
+
+  EXPECT_EQ(rig.state->pairings(0), 0u) << "429 的关闭路径不减配对账";
+  harness.shutdown_all();
+}
+
+// 四、**上界：一次表态只放一笔减账**。a、b 各配一条上游（账 = 2），在 b 上打一条畸形请求
+// （4xx 与 502/504 共用同一个出口）→ 只许放掉 b 那一笔，a 的必须还挂着。
+// 这条代替不了：双减在 `note_unpaired` 夹 0 之后读起来也是"干净的 0"。
+TEST(S4_06a_PairingAccount, OneReplyDebitsExactlyOnePairing) {
+  std::string why;
+  Harness harness;
+  Harness::Options options = default_options();
+  AccountRig rig;
+  rig.install(&options);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client a;
+  ASSERT_TRUE(a.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(a.write_all(get_request("/two-1")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(a.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+
+  Client b;
+  ASSERT_TRUE(b.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(b.write_all(get_request("/two-2")));
+  ASSERT_TRUE(b.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  // a 的那条上游还配着 a（没进池），所以 b 只能新开一条：账应当是 2。
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.upstream_opened) == 2u; }, 3000))
+      << "两条下游各自配了一条上游（a 的那条没进池），upstream_opened 应当是 2";
+  ASSERT_TRUE(b.write_all("NOT-HTTP\r\n\r\n"));
+  ASSERT_TRUE(b.read_response(&status, &body, &why)) << "畸形请求没拿到 4xx：" << why;
+  EXPECT_EQ(status.find("HTTP/1.1 4"), 0u) << status;
+  b.close();
+  // **先停环再读**：`pairings` 是非原子的 per-worker 账本（口径⑤那一类观测）。
+  harness.stop_loop();
+  EXPECT_EQ(rig.state->pairings(0), 1u)
+      << "b 那一次表态放掉了两笔账——a 的配对被提前抹掉了（夹 0 会让它读成 0，所以这条必须单独有）";
+  a.close();
+  harness.shutdown_all();
+}
 }  // namespace l7gate::net
 

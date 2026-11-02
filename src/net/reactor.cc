@@ -2052,7 +2052,21 @@ void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream
     }
   }
   downstream->set_peer_fd(kInvalidFd);
-  if (upstream) upstream->set_peer_fd(kInvalidFd);
+  if (upstream) {
+    // S4-06a（ADR-19 追加第五条）：**解链那一刻就是配对结束那一刻**，配对账在这里减一次。
+    // 为什么必须显式减：下面 `close_connection` 判"该不该减这笔账"用的是"这条连接进来时
+    // `peer_fd` 有没有效"（它自己的注释原话："之后问就永远是『没有』"）——而我们刚刚为了
+    // 不把 close-why 传染给对端，主动把两侧解开了，于是那个判据被抹掉，`note_upstream_paired`
+    // 的 +1 从此没人减（least_conn 会慢慢把这台后端读成"永远更忙"，且永不自愈）。
+    // 三条边界：① 只在 `upstream` 非空时减——同步 connect 失败、下游先关、注册表反查不到
+    //   这三类形态里那笔 +1 本来就不存在（S4-02 把 `note_upstream_paired` 挪到注册成功之后
+    //   就是为了让"有对象"与"有账"是同一件事）；② 只减这一处，`close_connection` 那两条
+    //   互斥分支一字不动（它们管的是没有显式解链的级联/回收路径，两处都减就是双减）；
+    // ③ 减在分岔之前，所以本函数两个提前出口都被覆盖，不在每个出口各抄一遍。
+    const std::uint16_t paired_target = upstream->upstream_target();
+    upstream->set_peer_fd(kInvalidFd);
+    note_upstream_unpaired(paired_target);
+  }
 
   // 排队在解链之前还是之后都一样——queue 不看对端，看的是这块 buffer；
   // 但必须在下游还没被关掉之前：kClosed 之后 fd 已回收，发出去也没人收。
