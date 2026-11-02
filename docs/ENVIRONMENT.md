@@ -169,6 +169,8 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 **抬 `kernel.perf_event_paranoid` 属环境侧决定，我没动**：抬到 1/0/-1 能换来 `-a` 系统级与内核态帧，
 代价是本机任何进程都能读全系统事件。这不是我能替项目所有人决定的事，所以这里只把"今天这个设置下
 能测什么"记全。如果 S5 需要内核态火焰图，那是先写 ADR 再改环境，不是先改了环境再找理由。
+**2026-11-02 项目所有人裁定：不抬，保持 `paranoid=2`**，S5 的火焰图就按上面那一种形态取
+（由 perf 直接拉起被测进程、只有用户态栈，nginx 对照臂同法）——这条不再是待决项。
 
 ## 5. Docker Desktop WSL Integration（当天开过、掉过两次线；#3 基线已能复现）
 
