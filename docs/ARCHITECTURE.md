@@ -1223,9 +1223,9 @@ ctest 15 条（`S4_06_Retry` 10 条真 socket + `S4_06_RetryTarget` 3 条 + `S4_
 `S4_06_ConnectionLayout` 1 条）；同步支与异步支**各有专门的一条**，分支签名用 `upstream_opened`
 （0=同步不造对象 / 1=造了对象），带环境预探针、不成立即 Skipped＝不判。
 基线 **333/333**（318 → 333）、非 gtest 警告各 **0 条**、`tsan` 日志里 `ThreadSanitizer` **0 次**；
-九条冒烟里**七条 rc=0 且 ✗=0**，`smoke-s3-04` / `smoke-s4-04` 本轮因 Docker Desktop 引擎停机
-（`docker-desktop` 发行版 Stopped）**在阶段 0 自己拒跑**、rc=1 而 ✗=0——这一格按"未跑"记，
-不写成通过，恢复后单跑补数（FAULT-INJECTION §16.4）。
+九条冒烟**全部 `rc=0` 且 ✗ 计数 0**——其中 `smoke-s3-04` / `smoke-s4-04` 在门禁批次里因 Docker Desktop 引擎停机
+（`docker-desktop` 发行版 Stopped）在阶段 0 自己拒跑、rc=1 而 ✗=0，引擎恢复后单跑补绿（按时间顺序记在
+TASKS 交接段「已验证」那条里，不写成"一开始就过"）；`smoke-s4-05` 与 `smoke-s4-06` 不需要 Docker。
 **§12 那一格的重测范围更正**：交接段说"在途请求挂在死成员上被 5s 排空"那一格重试落地后要重测——
 那一格的实测成分是 **类 3/4a**（连上不回字节 / 慢），它们握手成功、不是 connect 失败，
 管它们的是 ADR-21 的响应头限期；被本任务真正改变的是 **类 1（connect refused）**：
