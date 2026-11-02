@@ -1133,3 +1133,70 @@ A0-r2 → BS3-r2。落盘 `build/bench/b016-*/`；仪器 `s1-p999.sh` 加了缺�
 B-012 那"无可分辨成本"的落盘自带 7 条 ✗（每连接配额被当总配额用），形式资格不成立——
 但它的**结论**（空链 vs 路由链无可分辨）已被两份定标合格的测量背书：B-013（同参数四臂）
 与本 B-016 的 A0 两轮。**裁：B-012 不复跑，原文照记、结论由 B-013/B-016 维持**；待裁⑤就此结掉。
+
+## B-017 · S4-04 的 CPU 分配（契约 3.3 那条硬约束的落点）+ Redis 计数的行为读数（2026-11-02，真容器 `redis:7.2.5`）
+
+**为什么这条进 BENCHMARK**：契约 3.3 写死「压测时必须用 `cpuset` 把 Redis 绑到固定核，并把 CPU
+分配写进 `BENCHMARK.md`」，ADR-05 正文末节把它列为硬性约束、ENVIRONMENT 第 7 节一直挂着"未定"。
+本条把方案定死并给出**生效证据**（不是"我加了个参数"）。它不是尾延迟读数——每请求成本按 TASKS
+归 S4-08 对 B-008/B-016 两把尺报，见下面"本条不判什么"。
+
+### 一、CPU 分配与组件版本（每次带 Redis 的压测都要按这张表复述）
+
+| 项 | 值 |
+|---|---|
+| 引擎 | Docker Desktop WSL Integration，client `29.4.3`（build 055a478）/ server `29.4.3`，storage `overlayfs` |
+| 引擎侧可见核数 | `docker info` 的 `NCPU = 16`，与发行版 `nproc = 16` **同一视野**（容器 `INFO` 里 `os = Linux 6.18.40.1-microsoft-standard-WSL2`，就是这台 WSL2 内核） |
+| Redis 容器 | `redis:7.2.5`，digest `sha256:3aaec283e6e5…`；`INFO` 自报 `redis_version:7.2.5`、`redis_mode:standalone` |
+| 绑核 | `--cpuset-cpus 15`。生效证据两处：`HostConfig.CpusetCpus = 15` **且**容器内 `/sys/fs/cgroup/cpuset.cpus.effective = 15` |
+| 持久化 | `--save "" --appendonly no`——限流计数是易失状态（Redis 的角色被 ADR-05 定成"只承担分布式计数"），RDB 快照会把 BGSAVE 的 CPU 抖进尾延迟 |
+| 入口 | `127.0.0.1:16379 → 3306`… 端口发布（`-p`）——容器不共享本发行版网络命名空间，`--network host` 与 bridge IP 都不通（ENVIRONMENT 5.1 实测），所以 Redis 侧也只能走端口发布 |
+| 网关与压测工具 | **不绑核**（本条刻意只做一半） |
+
+**取舍与代价，写在不体面的那一侧**：契约要的是"Redis 不许抢走网关正在用的核"，绑 Redis 就够；
+把网关和 wrk 也钉到核上会让新读数与 B-008 / B-012 / B-013 / B-016 这些**未绑核**的历史档不可比
+（取样规程的规矩四）。所以这一轮我得到的是"Redis 只在 15 号核上跑"，**不是**"Redis 与网关各占
+一半机器"——网关仍可被调度到 15 号核上，那条竞争没被消除，只是不再扩散。ENVIRONMENT 第 7 节
+那一格就此定稿。
+
+### 二、连通取证（`tools/l7gate_redis_probe`，七步 rc=0）
+
+`client=hiredis 1.2.0` → `PING`=`PONG` → `INFO server`=`7.2.5` → `SCRIPT LOAD`（产品那份 Lua，
+**678 字节**，sha `27f391e42f3e1edfb9a3636a3f99e8c6c4239b1c`）→ 四格确定性 `EVALSHA`
+（`fresh_full=3000 / after_burst=0 / refill_1s=1000 / clamp_burst=3000`，逐格 ✓，参数
+`rate=1 burst=3`，毫 token 制）→ `HGETALL` 读回 `tokens`/`last` → `DEL` 清场。键口径同批上线：
+探针那一格是 `l7gate:rl:v1:path:cb5a1f0453dfc04a`。契约 9.1 那句"未取证前不算既成事实"在此撤销。
+**镜像身份仍有一条与 B-005 同形的缺口**：本机直连 `registry-1.docker.io` 建不起连接，我无法把这个
+digest 与官方仓库比对——它来自 ENVIRONMENT 5.1 那个 mirror，照记不假装核验过。
+
+### 三、行为读数（`scripts/smoke-s4-04.sh` 六阶段，PRESET=debug，rc=0、✗=0）
+
+| 格 | 不接 Redis | 接 Redis（`settle_ms=200`） |
+|---|---|---|
+| 六连击 `rate=1 burst=3`，同一 path `/same` | `200 200 200 429 429 429` | **逐条相同** |
+| 退出账 `allowed/rejected` | `3/3` | `3/3` |
+| `rate_limit_capped_rejects` | 不适用（夹子不存在） | **0**（单实例下授权从没压过本地桶） |
+| `redis_settles_ok` / `redis_settle_commands` | — | **3 / 1**（六连击只花一条上报命令） |
+| 服务端那一格 | — | `tokens=0 < 满额 3000`（消耗真记在 Redis 账上） |
+
+夹子那一格（`rate=1000 burst=1000`，本地桶在几条请求内不可能空）：冻格前 5 条全 `200` →
+`HSET <key> tokens 0 last=999999999999` → 冻格后**第二批** 5 条全 `429`、`capped_rejects=5`、
+`settle_commands=4` → `HSET <key> last 0` 解冻 → 又 5 条全 `200`。
+降级三段（`rate=1 burst=3`）：`docker stop` 期间六连击仍是 `3×200 + 3×429`（拒绝能力不消失）、
+`redis_settles_failed=7`；`docker start` 后同一进程 `redis_degraded` 回到 0、`redis_settles_ok=9`；
+换新路径再冻一次 → 5 条全 `429`（恢复那臂 `capped_rejects=5`）。生命周期：`live=0`、
+`constructed==destructed==7`、`fd 9→9`。
+
+### 四、本条**不判**什么（别让下一轮拿它当依据）
+
+1. **不判每请求成本**。判据是：分布式默认不装配（`--redis-db` 不给就是 S4-03 的语义，一字不动），
+   而本轮没跑 wrk 对照臂——成本归 **S4-08**，对 B-008 的 ≈8.7 µs/请求与 B-016 的 p99 探活成本
+   两把尺一起报（CAS 循环里多一次 `min` + 结算线程的 Redis RTT 分开算）。
+2. **不判多副本一致性**。TASKS「明确不在 S4 做」点名了它；单机上我能证的是"聚合发生在服务端 +
+   降级不失效"，不是"三副本合计不超配置阈值"。
+3. **"数字一致"的口径带一个周期上界的尾巴**：上报用快照值，快照到命令发出之间放行的条数这一拍
+   不报，服务端余额被暂时高估，上界 = 该键一个周期内的实际放行数（最坏 `burst` 条），下一拍扣回
+   （ADR-05 第二节、ARCHITECTURE 1.30 边界①）。所以这句话的严格形式是"同一批在一个结算窗口内
+   到达的请求，放行序列逐条相等"，不是"任意流量下严格相等"。
+4. **sanitizer 下的 RSS/堆不可判**（口径 ③），本条所有读数来自 debug preset 的行为观测，
+   不是内存或尾延迟测量。

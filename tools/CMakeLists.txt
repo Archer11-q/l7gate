@@ -24,3 +24,10 @@ if(L7GATE_MYSQL_INCLUDE_DIR AND L7GATE_MYSQLCLIENT_LIB)
 else()
   message(WARNING "libmysqlclient-dev 未找到：l7gate_mysql_probe 会编译失败（S3-04 前置缺失）")
 endif()
+
+# S4-04 / ADR-05 追加节：Redis 首次连通取证（hiredis 1.2.0 ↔ `redis:7.2.5`）。
+# 与上面那条相反的取舍：**这条链 l7gate_core**。要取证的不只是"库连得上"，还有"产品里那
+# 份 Lua 脚本与那套键口径在这台服务端上按我算的方式工作"——探针自己抄一份脚本，证的就是
+# 另一份东西了。hiredis 由 l7gate_core 传递带进来（根 CMakeLists 的 find_library REQUIRED）。
+add_executable(l7gate_redis_probe redis_probe_main.cc)
+target_link_libraries(l7gate_redis_probe PRIVATE l7gate_core)

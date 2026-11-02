@@ -13,6 +13,7 @@ add_executable(l7gate_tests
   health_test.cc
   nodes_test.cc
   rate_limit_test.cc
+  redis_rate_limit_test.cc
   reactor_test.cc
   request_parser_test.cc
   route_test.cc

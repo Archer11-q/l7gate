@@ -993,6 +993,67 @@ origin-form 含 query）或 `header:<名字>`（大小写不敏感取第一个�
 mutex 查表 + 一次 CAS 的每请求成本在 S4-08 对 B-008 的 8.7 µs 报——限流默认不装配，
 既有基线不受影响；跨进程精确性归 S4-04 的 Redis。
 
+### 1.30 Redis 分布式计数与降级（S4-04，ADR-05 落地追加节）：授权额度 + 本地桶执行
+
+**这一节在问什么**：S4-03 那只桶在**一个进程内**是全局准确的（共享桶表 + 打包原子）。多副本部署时
+每个副本各有一只桶，配置 1000 QPS 就会实际放行 3000——契约 3.1 说这是 Redis 登场的唯一理由。
+这一节交付的是"跨进程聚合"在我这个单线程事件循环里**怎么落地**，以及 Redis 不在时怎么办。
+
+**一、机制：Redis 授予额度，本地桶执行。** 一句话——**Redis 不重新定义限流数学，它只回答"这一拍
+这个进程最多还能放多少"**。`TokenBucket`（1.29）的语义一字未改，只多了一只**上限夹子**：
+`try_acquire` 的时间补货照旧，补完之后在 CAS 循环里 `usable = min(tokens, cap)`；**写回的是扣减后的
+`tokens`**，所以夹子是透镜不是额度——被夹住的那一次不消耗本地令牌，Redis 授权变宽时本地立刻跟得上。
+`cap` 缺省 = `burst`（不夹）= S4-03 的纯本地语义；`set_cap_milli` 又把它夹在 `burst` 以内，所以
+**一次授权写入永远不会使本地多放**。
+
+**二、结算线程。** 一条 `std::thread`（`RedisSettler`），每 `--redis-settle-ms`（缺省 200）一拍：
+`PING` 探活 → 取桶表快照（mutex 内浅拷贝，**Redis 的往返在锁外做**）→ 只给"有需求"的桶发 `EVALSHA`。
+需求信号两样：这一拍放过东西（`used_total` 的差量，要扣全局额度），或者被夹子按下去过
+（`capped_rejects` 增加，要刷新授权——**否则陈旧的低授权会把这个键永久饿死**，而被饿死本身就产生
+新的需求信号；这条自我修正是 `GrantOfZeroBitesAndTheRejectionItCausesRefreshesIt` 那句断言）。
+Redis 侧那只桶是一段 **Lua**（`kRateLimitBucketLua`，678 字节），毫 token 制、与 C++ 侧同一套数学；
+**时钟由网关提供、脚本不调 `redis.call("TIME")`**（非确定命令之后写会咬人，且两端同一个单调钟）。
+连不上或命令失败：`redis_settles_failed` 递增、`redis_degraded=1`、**`release_all_caps()` 把所有桶
+（含溢出桶）的夹子放开**——降级不是故障域，是退回 1.29 的语义（ADR-05 正文那条"宁可少放"的落点）。
+恢复由下一次成功结算自己完成，不需要任何人重启网关。**半途失败不记账**：上报值只在命令成功后推进，
+所以那一笔消耗下一拍原样重报——先记账后失败等于把消耗丢掉，Redis 于是多授权，那才是不安全的方向。
+
+**三、跨线程接触面（ADR-14 的账）。** 流动的只有两个原子：结算线程写 `cap_milli_`、循环线程读它；
+循环线程写 `used_total_`、结算线程读它。桶表指针的稳定性来自"桶不回收"（1.29 那条决定的正面）。
+键名 `l7gate:rl:v1:<kind>:<fnv1a64 的 16 位十六进制>`——**与本地键同源**（同一个 `RateLimiter`
+算出的那个字符串，`kind` 里的头名取小写：头名大小写不敏感，`ETag` 与 `etag` 必须是同一只全局桶），
+定长、无编码，碰撞方向是"两个键共享一只全局桶"= 更严不是更松（16384 键下 ≈7.3e-12）。
+`--redis-db/--redis-settle-ms/--redis-timeout-ms` 全走命令行、不进配置文件（要不要跨进程聚合是部署
+事实不是流量策略，ADR-19 那条切分，与 `--nodes-schema` 同形）。**给了 `--redis-db` 却没装
+`rate_limit` 段 = 退出码 2 且话里同时点名两个名字**——把这种组合当"多余参数"忽略掉，就是让一次
+拼错在日志里以"什么都没发生"的样子过去。
+
+**实测（2026-11-02，`scripts/smoke-s4-04.sh` 六阶段 rc=0、✗ 计数 0；`tools/l7gate_redis_probe`
+七步全通 hiredis-1.2.0 ↔ redis-7.2.5）**：数字一致——`rate=1 burst=3` 同一个 path 六连击，接与不接
+都是 `200 200 200 429 429 429`、退出账同为 `3/3`、`rate_limit_capped_rejects=0`、`redis_settles_ok=3`
+而 `redis_settle_commands=1`（**六连击只花一条上报命令**——16384 个冷键不换来 16384 次 EVALSHA）、
+服务端那一格 `tokens=0 < 满额 3000`（消耗真记在 Redis 账上）。夹子真的咬人——`rate=1000 burst=1000`
+下把那一格冻成 0，**第二批** 5 条全 `429`、`rate_limit_capped_rejects=5`，解冻后 5 条全放行。
+降级三段——`docker stop` 期间六连击仍是 `3×200 + 3×429`（拒绝能力不消失）、`redis_settles_failed=7`
+（挂着期间每拍有账，不是静默降级）、`docker start` 后 `redis_degraded` 自己回到 0、`settles_ok=9`，
+恢复后再冻一次仍是 5 条 `429`。绑核生效可断言：`HostConfig.CpusetCpus=15` 且容器内
+`cpuset.cpus.effective=15`。生命周期三重：`live_connections=0`、`constructed==destructed`、`fd 9→9`
+（这条漏了就是没关那条 hiredis 连接）。ctest **291/291**（+11：3 条夹子数学 + 2 条键口径 + 6 条
+结算状态机，后者用 `tests/test_redis_server.h` 那个 RESP 夹具跑、**不依赖 Docker**）、三 preset
+各 0 条非 gtest 警告、`tsan` 日志 `ThreadSanitizer` **0 次**（新增并发面 = 一条线程 + 每桶两个原子）。
+四处阳性验证全部真打红（逐条在 ADR-05 落地追加节第四节，还原后 `grep TEMP-POSITIVE` = 0）。
+
+**边界（六条，都是这一节的代价而不是"以后再说"）**：① **上报滞后是反方向的放松**——快照到命令发出
+之间放行的条数这一拍不报，服务端余额被暂时高估，上界 = 该键在一个周期内的实际放行数（最坏 `burst`
+条），下一拍扣回；所以多副本口径是"每个周期内的超额有界"，不是"任意时刻严格相等"（要消掉它只能
+每请求问一次，那两条我已按 ADR-05 第二节否掉）。② **夹子按拍更新** → 冻格后的第一批仍可能放行，
+判据打在第二批上（实测形状见上）。③ **只绑 Redis、不绑网关**：容器与 worker 仍在同一批核上竞争，
+我绑的是"Redis 不许到处跑"，不是"Redis 与网关各占一半机器"。④ 无 AUTH、无 TLS（Redis 只经
+`127.0.0.1` 端口发布可达）。⑤ Redis 侧键不回收——与本地 16384 上界是同一条决定的两面。
+⑥ 时钟来自网关，跨主机部署时"同一个钟"不再成立，归部署形态，本任务不假装解决。
+每请求成本（CAS 循环里多一次 `min`）在 S4-08 对 B-008/B-016 两把尺报；限流与分布式默认都不装配，
+既有基线不受影响。
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 
@@ -1075,6 +1136,8 @@ mutex 查表 + 一次 CAS 的每请求成本在 S4-08 对 B-008 的 8.7 µs 报�
 | 平台期数字恰好等于整个载荷，断言为一个不成立的理由通过 | 写侧没货冒充"网关摘读" | 载荷 256→384 条：`S1_07_Backpressure.RequestDirectionStopsReadingAndRecoversWithoutLoss`（ARCH 1.15） |
 | 为了让水位线成为第一道墙而钉对端接收窗口，结果测的是内核计时器 | 显式设小 `SO_RCVBUF` 后 `window_clamp` 不回涨；"放开"是无效的 | 整段钉窗机器删除，两组同位置的数字留在 `tests/test_upstream.h` 的删除记录里（ARCH 1.15、FAULT-INJECTION 第 5 节） |
 | 循环还在跑时读非原子的 epoll 计数器 | 违反 `stats.h` 的观测纪律——写纪律的人自己犯的 | 先 `stop_loop()` join 再读：`S1_08_FilterReactor.PassThroughFiltersChangeNothingInTheForwardingPath`（FAULT-INJECTION 第 3 节反证） |
+| 冒烟脚本七格里有六格"通过"，实际每一臂测的都是第一臂那个还活着的进程 | `$(start_gateway …)` 起的进程不是本 shell 的孩子，`wait` 当场返回"not a child"→ 脚本在它没退出前就读退出账（空）、再抢同一端口（`EADDRINUSE`），后面每一臂都落到那个残留进程上 | `stop_pid` 轮询 `kill -0` 到真退出 + 每次启动前 `port_busy && die`（`scripts/smoke-s4-04.sh`；FAULT-INJECTION §14.3①） |
+| 退出账里 `capped_rejects=''` 被判成了"0 次被夹住" | 一行多键 + `^\[serve\] key=` 行首锚 → 只有行首那一个键读得到，其余静默返回空串，而空串在判定里长得像 0 | 退出账**一行一个键** + `get_stat` 用 `grep -o "[[:space:]]key="`（口径十四条⑭；FAULT-INJECTION §14.3②） |
 
 ### 取数与脚本：一片 0 比一片 ? 危险
 

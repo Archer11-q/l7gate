@@ -1,7 +1,7 @@
 # ADR-05 · Redis 只承担分布式限流计数，及其失效降级
 
-- 状态：已采纳（降级链三条一字未动；**S4-04 的授权额度机制、键口径与取证状态见文末「落地追加（2026-11-02）」——其中 hiredis 1.2.0 ↔ `redis:7.2.5` 的连通取证未完成，容器就位后实测，未取证前它不是既成事实**）
-- 日期：2026-10-26（追加 2026-11-02）
+- 状态：已采纳（降级链三条一字未动；**S4-04 已落地：机制＝授权额度 + 本地桶执行、键口径、hiredis 引入与 `redis:7.2.5` 的连通取证**——文末「落地追加（2026-11-02）」第一节起。**契约 9.1 那句"未取证前不算既成事实"在 2026-11-02 由探针七步全通撤销**，镜像身份的核验缺口照记在同节）
+- 日期：2026-10-26（追加 2026-11-02 两次：认领时的机制与取证状态、实现时的实测与踩坑）
 - 相关：契约 3.1、3.3、3.4、11.5；ADR-20（阻塞 IO 不进 worker 循环的先例 + 版本取证形状）、ADR-21 第二/四节（令牌桶数学与键口径——本 ADR 只加聚合形态，不重定义它）、ADR-19（策略/进程形态分家：`--redis-*` 全走命令行）、ADR-14（跨线程接触面）、ADR-12（安全阀与 Redis 无关，写明防混）
 
 ## 我选择什么
@@ -55,7 +55,7 @@ hiredis v1.2.0，Ubuntu 26.04 的 apt 候选 `1.2.0-6ubuntu4` 与契约字面命
 - **Lua 桶住在 Redis**：每键一个 hash 存 `tokens_milli` + `last_ms`。结算线程上报自上次结算以来的放行数 `used`、带上 `now_ms`，脚本做与本地逐位同一套数学（补货 `rate×elapsed` 夹到 `burst`、扣 `used`、再夹 `burst`），**返回剩余毫 token**；结算线程把返回值写进该桶的 cap 原子。
 - **本地准入**：`try_acquire` 的时间补货照旧，补完在 CAS 循环内夹一道 `min(tokens, cap)`——夹子在 CAS 里生效，多 worker 之间没有两套答案。`cap` 缺省 = `burst`（= 不夹），降级时也设回它。
 - **时钟由网关提供，Redis 不调 `TIME`**：脚本里 `redis.call("TIME")` 会让"非确定命令之后写"这条限制咬人（EVAL 复制形态下直接报错），客户端给 `now_ms` 顺带让两端用同一个单调钟——单机语境下这是**加强不是妥协**。代价照记：跨主机部署时"同一个钟"不再成立，归部署形态，不在本任务假装解决。
-- **夹子只会咬紧不会放松**：Redis 返回的授权永不使本地多放，最坏是少放。方向是安全的，也是"降级期间宁可少放"那句正文的落点。
+- **夹子的写入只会咬紧不会放松**：授权低于本地补货时少放，`set_cap_milli` 又把它夹在 `burst` 以内，所以一次授权永远不会使本地多放。**但"上报滞后"是反方向的，必须一起写清**：结算上报的是快照那一刻的 `used_total`，从快照到命令发出之间这个键又放行的条数这一拍不会被报到，于是服务端余额**暂时被高估**，上界 = 该键在一个结算周期内的实际放行数（最坏 `burst` 条——本地桶满时一个周期内最多就放这么多），下一拍扣回。这条是本接法的固有代价，不是缺陷未报：要消掉它只能每请求问一次，而那两条我已经否掉。多副本下的聚合口径因此是"**每个周期内的超额有界**"，不是"任意时刻严格相等"。
 - **跨线程流动的东西只有两样**（cap 原子 + `used` 原子读）；连接对象、fd、per-worker 状态一概不流动——ADR-14 一字不动，新增并发面是"一条线程 + 每桶两个原子"，与 S3-04 同一形状，`tsan` 零 data race 照旧是可证伪命题。
 - **Redis 连接只属于结算线程**：单条同步连接（`redisConnectWithTimeout`），命令超时 = `--redis-timeout-ms`；不做重连状态机以外的花样——失败计数 + 下一拍重试就是恢复路径的全部。
 
@@ -90,9 +90,13 @@ Redis 侧键 = `l7gate:rl:v1:<kind>:<hash16>`，`kind ∈ {path, hdr:<头名>}`�
 2. **Redis 回**：下一次成功结算 → `rate_limit_degraded=0`、cap 重新按授权夹住、`redis_settles_ok` 继续增长。恢复不需要人工动作，形状同 ADR-20 的"恢复后第一次成功 reload 换上新表"。
 3. **启动时 Redis 不可用**：`--redis-db` 给了就连不上 → 网关**照常启动**、直接进降级态、后续自动接上。理由与 S3-04 同一条：一个辅助依赖不能变成全局故障域（正文那条立场在启动路径上的落点）。
 
-### 六、观测面（键名两条装配路径一致，承 S4-03 纪律）
+### 六、观测面（键名两条装配路径一致，承 S4-03 纪律；**一行一个键**）
 
-`redis_settles_ok` / `redis_settles_failed` / `redis_degraded`（0|1）/ `redis_grant_last_milli` / `rate_limit_capped_rejects`（本地补货够、但被夹子按下去的那一格——夹子"真的咬过人"的证据）/ `redis_keys_settled`。启动横幅 `redis=on addr=… settle_ms=… timeout_ms=…`，退出账一并打。
+`redis_settles_ok` / `redis_settles_failed` / `redis_degraded`（0|1）/ `redis_settle_commands` / `rate_limit_capped_rejects`。启动横幅 `redis=on addr=… settle_ms=… timeout_ms=… kind=…`，退出账一并打。
+
+- **为什么单独强调"一行一个键"**：这些数只在退出时打，而冒烟脚本用 `^\[serve\] key=` 这种行首锚取数——五个键挤一行时，只有行首那个读得到，其余四格读回来是**空串**，空串在判定里长得像"0"。本轮第一版冒烟脚本就是这样一路"绿"过去的（`capped_rejects=''` 被当成了 0）。这是 CONTRACT 那条"报告里一片 0 比一片 ? 危险"的第 N 次应验，所以口径写进正文：**统计行一律一行一个键**。
+- `redis_grant_last_milli` 从本节草稿里删掉了——**它没有第一个读者**：授权是 per-key 的，一个"最后一次"的标量读数回答不了任何问题，而 Redis 侧那格 `HGET <key> tokens` 才是能核对的东西（冒烟阶段 2 就是拿它当"消耗真记在服务端账上"的证据）。
+- `redis_settle_commands` 是**累计**发出的 EVALSHA 条数，不是"最后一拍的条数"：后者在安静收尾那一拍会报 0，等于一个没有读者的形状。它守的是"结算只遍历有需求的桶"（实测：六连击 + 3 拍 → `settles_ok=3 / settle_commands=1`）。
 
 ### 七、cpuset 绑核（正文最后一条硬性约束的落点，也结掉 ENVIRONMENT 第 7 节那一格）
 
@@ -110,3 +114,72 @@ Redis 侧键 = `l7gate:rl:v1:<kind>:<hash16>`，`kind ∈ {path, hdr:<头名>}`�
 ### 九、不做（禁令一挡住顺手做）
 
 AUTH 与 TLS（Redis 只经 `127.0.0.1` 端口发布可达，契约 1.3 不做 TLS 是同一条立场；要接进真环境必须先补 ADR）；多网关实例的一致性实测（TASKS「明确不在 S4 做」）；Redis 侧键的 LRU 回收（与 ADR-21 第四节"本地不回收"同一条决定）；`CLUSTER`/多分片；fail-closed（Redis 挂就拒全站——正文第三节明确拒绝的那个默认行为）。
+
+## 落地追加（2026-11-02，S4-04 实现与冒烟时）：取证已到位、四处阳性验证、五条新踩的坑
+
+### 一、连通取证完成（第一节那句"不算既成事实"的前提撤销）
+
+`l7gate_redis_probe` 七步全通，`client=hiredis-1.2.0 ↔ server=redis 7.2.5`，`probe_rc=0`：
+connect → `PING`→`PONG` → `INFO server`=`7.2.5` → `SCRIPT LOAD`（产品那份脚本，**678 字节**，
+sha `27f391e42f3e1edfb9a3636a3f99e8c6c4239b1c`）→ 四格确定性 `EVALSHA` 读数
+（`fresh_full 3000 / after_burst 0 / refill_1s 1000 / clamp_burst 3000`，逐格 ✓，且与本地
+`TokenBucket` 在同一组参数下对账：满桶连取 4 次放 3 拒 1）→ `HGETALL` 读回
+`tokens`/`last` → `DEL` 清场。键口径也上了线：探针打的那格是 `l7gate:rl:v1:path:cb5a1f0453dfc04a`。
+镜像 `redis:7.2.5`，digest `sha256:3aaec283e6e5…`；**身份核验有一条与 B-005 同形的缺口**：
+本机直连 `registry-1.docker.io` 建不起连接，我无法把这个 digest 与官方仓库比对，它来自
+ENVIRONMENT 5.1 那个 mirror（照记，不假装核验过）。
+
+绑核生效是可断言的，不是写了个参数：`HostConfig.CpusetCpus=15` 且容器内
+`/sys/fs/cgroup/cpuset.cpus.effective=15`，`docker info` 的引擎侧 `NCPU=16` 与发行版
+`nproc`=16 同一视野（Docker Desktop 的虚拟机就是这台 WSL2 内核，`INFO` 里
+`os=Linux 6.18.40.1-microsoft-standard-WSL2`）。**这条不是完整隔离**，写清边界：网关与压测
+按第七节的取舍保持未绑核，所以它们仍可被调度到 15 号核上——我绑的是"Redis 不许到处跑"，
+不是"Redis 与网关各占一半机器"。
+
+### 二、验收读数（同一次 `scripts/smoke-s4-04.sh`，rc=0、✗=0）
+
+- **数字一致**（`rate=1 burst=3`、同一个 path `/same`）：不接 Redis `200 200 200 429 429 429`
+  / 接 Redis 逐条相同；两臂退出账同为 `allowed/rejected=3/3`；`rate_limit_capped_rejects=0`；
+  `redis_settles_ok=3` 而 `redis_settle_commands=1`（六连击只花一条上报命令，16384 个冷键
+  不该换来 16384 次 EVALSHA 的那条证据）；服务端那格 `tokens=0 < 3000` —— 消耗记在Redis 账上。
+- **夹子真的咬人**（`rate=1000 burst=1000`）：宽裕时 5 条全放行；把那一格冻成
+  `tokens=0 / last=999999999999` 之后，**第二批** 5 条全 `429`、`rate_limit_capped_rejects=5`、
+  `redis_settle_commands=4`；解冻后又 5 条全放行。这一格同时是"分布式不是装饰"的断言——
+  本地桶在 1000 的额度下绝不可能空。
+- **降级三段**：`docker stop` 后同一台网关继续按配置阈值表态（六连击仍是 `3×200 + 3×429`，
+  拒绝能力没消失，也没有一秒钟的 5xx），`redis_settles_failed=7`（挂着期间每拍有账，不是
+  静默降级）；`docker start` 之后 **不需要重启网关**，`redis_degraded` 自己回到 0、
+  `redis_settles_ok=9`；恢复后再冻一次那一格 → 5 条全 `429`，聚合通路是活的。
+- **生命周期**：`live_connections=0`、`connections_constructed==destructed`、`fd 9→9`
+  ——结算线程那条 hiredis 连接没漏 fd（这条如果漏，多出来的正是那个 fd）。
+- **进程侧**：`--redis-db` 没配 `rate_limit` 段 → rc=2 且话里同时点名两个名字；
+  `--redis-settle-ms 50` → rc=2；`--redis-db 127.0.0.1:notaport` → rc=2；参数域内的合法组合
+  （settle=100 timeout=2000）照常启动。
+
+### 三、阳性验证四处（能红才叫绿；还原后 `grep -r TEMP-POSITIVE src/ tests/ tools/` = 0）
+
+| 改坏的那一处 | 红掉的用例 |
+|---|---|
+| 夹子不生效（`usable = tokens`） | 4 条：`CapLensRejectsButDoesNotSpendTheBucket`、`OverflowBucketAndReleaseAreProcessWide`、`GrantOfZeroBitesAndTheRejectionItCausesRefreshesIt`、`FailureOpensTheCapAndRecoversReclampingIt` |
+| **先记账后发命令**（失败时把这笔消耗丢掉） | 恰好 1 条：`FailedReportIsRetriedWithTheSameUsageNextTick`——隔离干净，说明这条断言只守这一件事 |
+| 取消"只结有需求的桶"（每拍全表 EVALSHA） | 3 条：`IdleBucketsCostNoCommands`、`DemandedBucketIsSettled…`、`FailedReportIsRetried…` |
+| `set_cap_milli` 不夹 `burst` | 3 条：`GrantAboveBurstCannotAdmitMore`、`DemandedBucketIsSettled…`、`NoscriptReloadsTheScriptAndAsksOnceMore` |
+
+### 四、本轮新踩的坑（每一条都留下了"防复发的第三条"）
+
+1. **`$(start_gateway …)` 起的进程不是本 shell 的孩子，`wait "$pid"` 当场返回"not a child"**。
+   后果不是报错而是**一路假绿**：脚本在它还没退出时就去读退出账（读回空串）、再拿同一个端口
+   起下一臂（`EADDRINUSE`），于是后面每一臂测的都是第一臂那个还活着的进程。防复发：
+   `stop_pid` 改成轮询 `kill -0` 直到真退出，且**每次启动前断言端口是空的**（`port_busy … && die`）。
+2. **一行多键 + 行首锚 = 四格静默读空**（第六节那条）。防复发：退出账一行一键 + `get_stat`
+   改成 `grep -o "[[:space:]]key="`（不再假设键在行首）。
+3. **`cd X && a` 之后的换行不继承 `cd`**：我那条手测命令的第二行在原 CWD 里找
+   `build/debug/l7gate`，报"No such file or directory"。防复发：复杂/带 `$` 的命令一律写成
+   `/home/archer/*.sh` 再跑（交接段那条口径的同族，本轮又应验一次）。
+4. **脚本里不要硬编码被测方算出来的键名**：`bucket_keys` 扫出来再冻；scan 顺序不保证，所以
+   冻之前先 `FLUSHDB` 让账上只剩一格。
+5. **授权按拍更新 → 冻格后的第一批仍可能放行**，而那批放行正是制造下一次上报的需求。
+   判据打在第二批上——这不是脚本在等运气，这就是第八节"跨窗偏差上界"的实测形状。
+6. 夹具侧一条：Redis 的命令名大小写不敏感，产品发的是 `SCRIPT LOAD`——子命令按字面小写比
+   会把这条回成 `-ERR unknown command`，被测方看到的是"服务端拒绝"而不是"我解析错了"。
+   同理，NOSCRIPT 这类一次性故障必须**只对目标命令生效**，否则会被同拍里的 PING 消化掉。

@@ -6,6 +6,7 @@
 // 它仍然不做 HTTP 语义：不回 4xx、不改写响应、没有路由和 filter（那些分别归
 // S1-06/S1-08），所以它的定位是**冒烟与验收的载体**，不是一个可用的网关。
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -24,6 +25,7 @@
 #include "core/build_info.h"
 #include "filter/lb_filter.h"
 #include "filter/rate_limit.h"
+#include "filter/redis_rate_limit.h"
 #include "filter/route_filter.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
@@ -44,6 +46,7 @@ void usage(std::FILE* out) {
       "               [--nodes-schema DB] [--nodes-reload-ms MS] [--nodes-timeout-ms MS]\n"
       "               [--upstream-connect-timeout-ms MS] [--upstream-head-timeout-ms MS]\n"
       "               [--upstream-body-idle-timeout-ms MS]\n"
+      "               [--redis-db <host:port>] [--redis-settle-ms MS] [--redis-timeout-ms MS]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -81,6 +84,15 @@ void usage(std::FILE* out) {
       "总时长**——idle 管住死了的流，总时长管不住活着的流）。撞线：连接/头超时给配对\n"
       "下游自产 504 并按健康判据记账（被动失败）；body 空闲头已出去、无自产资格，只能\n"
       "以连接终止表态。--drain-timeout-ms 必须 ≥ 响应头超时，违反退出码 2。\n"
+      "--redis-db <host:port>（S4-04，ADR-05 追加节）：Redis 分布式计数的端点。**给了就启用**，\n"
+      "没给就是 S4-03 的纯本地桶——要不要跨进程聚合是部署事实，不是流量策略，所以它走命令行\n"
+      "不进配置文件（与 --nodes-schema 同一条切分，ADR-19）。机制是 Redis 每 --redis-settle-ms\n"
+      "（缺省 200，100..60000）一拍授予额度、本地桶仍是执行器：Lua 桶住在 Redis，网关上报这一拍\n"
+      "放行了几条、取回全局剩余毫 token 写进那只桶的**上限夹子**；夹子只会让放行变少不会变多。\n"
+      "--redis-timeout-ms（缺省 1000，100..60000）是单次连接/命令的预算——挂死的 redis 不能把\n"
+      "结算线程变成僵尸。Redis 挂了不拒绝业务：夹子全放开、语义退回 S4-03 的本地桶（拒绝能力\n"
+      "还在），恢复后下一拍自动夹回来。给了 --redis-db 却没装 rate_limit 段是配置矛盾，退出码 2\n"
+      "——那等于给一个不存在的桶表配了一个外部事实源。\n"
       "SIGINT/SIGTERM 走同一条优雅停止：摘掉监听（新连接从此拿 RST）→ 不再接受新请求 →\n"
       "在飞请求逐条响应完 + 刷完出向 → 空闲连接立即关 → 到点兜底强关 → 退出循环、join worker。\n"
       "带 upgrade 的隧道**只能硬关**：ADR-09 不解析帧就发不出 WS close 握手，刷完已缓冲的\n"
@@ -374,6 +386,33 @@ void report_rate_limit(const std::shared_ptr<l7gate::filter::RateLimiter>& limit
               limiter->key_count());
 }
 
+// S4-04（ADR-05 追加节第六节）：Redis 侧的两行——启动横幅与退出账。**新起一行而不是往
+// rate_limit 那行后面添键**：既有的两条 grep（`rate_limit=on` 的四个键、`rate_limit_allowed=`
+// 的四个键）是冒烟与 BENCHMARK 脚本的锚，动它们的键序等于让历史脚本对不上路（同 S3-02
+// 对 policy=on 那行的处理）。两条装配路径共用这一份，键名一致。
+void banner_redis(const l7gate::filter::RedisSettlerConfig& redis_config) {
+  std::printf("[serve] redis=on addr=%s:%u settle_ms=%lld timeout_ms=%lld kind=%s\n",
+              redis_config.host.c_str(), redis_config.port,
+              static_cast<long long>(redis_config.settle_ms),
+              static_cast<long long>(redis_config.timeout_ms), redis_config.kind_label.c_str());
+}
+
+void report_redis(const l7gate::filter::RedisSettler* settler,
+                  const std::shared_ptr<l7gate::filter::RateLimiter>& limiter) {
+  if (settler == nullptr || limiter == nullptr) return;
+  // **一行一个键**（契约"统计每行一个 [serve] key=value，给脚本读"那条口径）：五个键挤在
+  // 一行里，脚本按 `^\[serve\] key=` 锚就只读得到第一个，其余四格全成空串——而空串在
+  // 判定里长得像"0"。S4-04 的冒烟脚本本轮就是这么一路假绿的。
+  std::printf("[serve] redis_settles_ok=%llu\n", static_cast<unsigned long long>(settler->settles_ok()));
+  std::printf("[serve] redis_settles_failed=%llu\n",
+              static_cast<unsigned long long>(settler->settles_failed()));
+  std::printf("[serve] redis_degraded=%d\n", settler->degraded() ? 1 : 0);
+  std::printf("[serve] redis_settle_commands=%llu\n",
+              static_cast<unsigned long long>(settler->settle_commands()));
+  std::printf("[serve] rate_limit_capped_rejects=%llu\n",
+              static_cast<unsigned long long>(limiter->capped_rejects_total()));
+}
+
 int serve(int argc, char** argv) {
   l7gate::net::Reactor::Config config;
   std::size_t stop_after_requests = 0;
@@ -400,6 +439,10 @@ int serve(int argc, char** argv) {
   long long upstream_connect_timeout_ms = 3000;
   long long upstream_head_timeout_ms = 10000;
   long long upstream_body_idle_timeout_ms = 30000;
+  // S4-04（ADR-05 追加节）：Redis 分布式计数。**--redis-db 给了才启用**——它是部署事实不是
+  // 流量策略，所以不进配置文件（与 --nodes-schema 同一条切分）。
+  bool have_redis = false;
+  l7gate::filter::RedisSettlerConfig redis_config;
 
   for (int i = 2; i < argc; ++i) {
     const std::string_view flag = argv[i];
@@ -483,6 +526,31 @@ int serve(int argc, char** argv) {
         return 2;
       }
       upstream_body_idle_timeout_ms = n;
+      ++i;
+    } else if (flag == "--redis-db" && value != nullptr) {
+      if (!parse_addr_port(value, &redis_config.host, &redis_config.port)) {
+        std::fprintf(stderr, "参数错误: --redis-db 要的是 <host:port>，收到 %s\n", value);
+        return 2;
+      }
+      have_redis = true;
+      ++i;
+    } else if (flag == "--redis-settle-ms" && value != nullptr) {
+      // 下限 100ms：再密就是拿结算线程的往返去追本地桶的时间补货，夹子会先咬人（ADR-05 追加节
+      // 第八节那条"跨窗偏差上界 = rate×settle_ms/1000"就是这么来的），上限 60s 是运维直觉。
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 100 || n > 60000) {
+        std::fprintf(stderr, "参数错误: --redis-settle-ms 要的是 100..60000，收到 %s\n", value);
+        return 2;
+      }
+      redis_config.settle_ms = n;
+      ++i;
+    } else if (flag == "--redis-timeout-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 100 || n > 60000) {
+        std::fprintf(stderr, "参数错误: --redis-timeout-ms 要的是 100..60000，收到 %s\n", value);
+        return 2;
+      }
+      redis_config.timeout_ms = n;
       ++i;
     } else if (flag == "--serve-requests" && value != nullptr) {
       long long n = 0;
@@ -690,6 +758,25 @@ int serve(int argc, char** argv) {
     rate_key.header_name = section.header_name;
   }
 
+  // S4-04（ADR-05 追加节）：Redis 授权额度的结算线程。**给了 --redis-db 却没装限流**是
+  // 配置矛盾，退出码 2 并点名——那等于给一个不存在的桶表配一个外部事实源；把它当"多余的
+  // 参数"忽略掉，就是让 `--redis-db` 的拼错在日志里以"什么都没发生"的样子过去（同 S3-04
+  // 对 `source=mysql` 没给 `--nodes-schema` 的那条立场）。
+  if (have_redis && rate_limiter == nullptr) {
+    std::fprintf(stderr,
+                 "配置错误: 给了 --redis-db 但没有 rate_limit 段（没有桶可聚合，Redis 分布式计数"
+                 "是给限流用的，见 ADR-05）\n");
+    return 2;
+  }
+  std::unique_ptr<l7gate::filter::RedisSettler> redis_settler;
+  if (have_redis) {
+    redis_config.kind_label = l7gate::filter::redis_kind_label(
+        rate_key.source == l7gate::filter::RateLimitKeySpec::Source::kHeader,
+        rate_key.header_name);
+    redis_settler = std::make_unique<l7gate::filter::RedisSettler>(rate_limiter, redis_config);
+    redis_settler->start();
+  }
+
   // S3-04（ADR-20 第四节）：reload 线程。MySQL 查询是阻塞 IO，不进 worker 事件循环；
   // 它与 worker 的唯一接触面是 NodesPublisher 那根原子快照指针。成员没变就不发布：
   // 查了一遍不等于发布了一次，观测面不把两者混成同一个数。
@@ -793,6 +880,7 @@ int serve(int argc, char** argv) {
                   static_cast<unsigned long long>(rl.burst),
                   rate_limit_key_text(rl).c_str());
     }
+    if (redis_settler != nullptr) banner_redis(redis_config);
     if (has_routes || has_groups) {
       // **单独一行，不动上面那条横幅**：`scripts/bench/s1-p99.sh` 是靠横幅里的键名
       // （多 Reactor 有 `workers=`、单 Reactor 有 `max_connections=`）当场判"这一臂到底是
@@ -825,6 +913,9 @@ int serve(int argc, char** argv) {
     g_group_for_signal.store(nullptr, std::memory_order_relaxed);
     nodes_stop.store(true, std::memory_order_relaxed);
     if (nodes_reload_thread.joinable()) nodes_reload_thread.join();
+    // 结算线程先停再打账：否则最后一拍的 `settled_keys` 与业务的 allowed/rejected
+    // 会互相插队，读者看到的是一笔对不上的中间态。
+    if (redis_settler != nullptr) redis_settler->stop();
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
@@ -834,6 +925,7 @@ int serve(int argc, char** argv) {
                  rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                  health_target_names, nodes_publisher.get());
     report_rate_limit(rate_limiter);
+    report_redis(redis_settler.get(), rate_limiter);
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
     return 0;
@@ -902,6 +994,7 @@ int serve(int argc, char** argv) {
                 static_cast<unsigned long long>(rl.burst),
                 rate_limit_key_text(rl).c_str());
   }
+  if (redis_settler != nullptr) banner_redis(redis_config);
   if (has_routes || has_groups) {
     // 同多 Reactor 那一臂：新起一行，不碰上面那条签名行。
     std::printf("[serve] policy=on config=%s upstream_groups=%zu route_rules=%zu default_target=%u\n",
@@ -930,6 +1023,7 @@ int serve(int argc, char** argv) {
   g_reactor_for_signal.store(nullptr, std::memory_order_relaxed);
   nodes_stop.store(true, std::memory_order_relaxed);
   if (nodes_reload_thread.joinable()) nodes_reload_thread.join();
+  if (redis_settler != nullptr) redis_settler->stop();
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - started)
                               .count();
@@ -941,6 +1035,7 @@ int serve(int argc, char** argv) {
                rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                health_target_names, nodes_publisher.get());
   report_rate_limit(rate_limiter);
+  report_redis(redis_settler.get(), rate_limiter);
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   return 0;
 }

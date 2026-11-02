@@ -140,6 +140,7 @@ add_library(l7gate_core STATIC
   src/filter/chain.cc
   src/filter/lb_filter.cc
   src/filter/rate_limit.cc
+  src/filter/redis_rate_limit.cc
   src/filter/route_filter.cc
   src/net/buffer.cc
   src/net/connection.cc
@@ -163,6 +164,13 @@ find_library(L7GATE_MYSQLCLIENT_LIB mysqlclient REQUIRED)
 find_path(L7GATE_MYSQL_INCLUDE_DIR mysql.h PATHS /usr/include/mysql REQUIRED)
 target_include_directories(l7gate_core PRIVATE ${L7GATE_MYSQL_INCLUDE_DIR})
 target_link_libraries(l7gate_core PUBLIC ${L7GATE_MYSQLCLIENT_LIB})
+# S4-04（ADR-05 追加节第一节）：hiredis 是产品依赖（结算线程 redis_rate_limit.cc 链它）。
+# 契约 9.1 锁 v1.2.0、apt 字面命中 `1.2.0-6ubuntu4`，所以这里没有偏离可论证；找不到仍然
+# 直接配置失败——同上面 mysql 那三条一个立场，不"编译时再说"。
+# 头走 `<hiredis/hiredis.h>`（在 /usr/include 上），库按 SONAME `libhiredis.so.1.1.0` 解析
+# ——ABI 号与 API 号不是一回事，契约锁的是后者（取证记录在 ENVIRONMENT 3.1）。
+find_library(L7GATE_HIREDIS_LIB hiredis REQUIRED)
+target_link_libraries(l7gate_core PUBLIC ${L7GATE_HIREDIS_LIB})
 target_link_libraries(l7gate_core PUBLIC l7gate_warnings l7gate_sanitizers Threads::Threads)
 target_compile_definitions(l7gate_core PUBLIC
   L7GATE_VERSION="${PROJECT_VERSION}"

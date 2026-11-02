@@ -458,3 +458,63 @@ tsan 全量在 `-j16` 下首次跑红了一条：`S2_03_CrossThreadDestruction.C
 
 三 preset 各 **269/269**、非 gtest 警告 **0 条**、tsan 日志 `ThreadSanitizer` 0 次；六条冒烟
 （含需要 Docker 的 `smoke-s3-04`，MySQL 8.0.36 六阶段）`rc=0`、✗ 计数 0。
+
+## 14. Redis 分布式计数的故障注入（2026-11-02，S4-04，ADR-05 落地追加节）
+
+这一段注入的对象是**我新引入的那个外部依赖**：`redis:7.2.5` 容器（`127.0.0.1:16379` 端口发布，
+cpuset 绑在 15 号核）。判据的形状与 S3-04 那一轮一致——**辅助依赖不能变成全局故障域**，但它一旦
+参与决策，它不在的时候必须**有可断言的行为**，而不是"看起来还在跑"。
+
+### 14.1 预期 vs 实测（五格，全部应用层注入，ADR-13）
+
+| 注入 | 预期（ADR-05 正文那三条降级链） | 实测 |
+|---|---|---|
+| `docker stop l7gate-redis`（Redis 挂） | 拒绝能力不消失：限流退回 S4-03 的本地桶语义，既不放到无限也不全站 503；降级**有账**、不静默 | 同一台网关六连击仍是 **`200 200 200 429 429 429`**、`rate_limit_allowed/rejected=3/3`、`redis_settles_failed=7`（挂着期间每拍都有账）、终局 `live=0`、`constructed==destructed==7`、`fd 9→9` |
+| 把服务端那一格冻成 0（`HSET <key> tokens 0 last=很远的将来`；脚本里 `elapsed<0` 夹成 0 → 补货恒为 0） | 授权必须**压过**本地补货：本地桶明明还有余粮也要少放，且这一格要单独计数 | `rate=1000 burst=1000` 下：冻格后**第二批** 5 条全 **`429`**、`rate_limit_capped_rejects=5`、`redis_settle_commands=4`；`HSET … last 0` 解冻后又 5 条全 `200`。**这一格同时就是"分布式不是装饰"那条断言** |
+| `docker start l7gate-redis`（Redis 回） | 不需要任何人重启网关：下一次成功结算自己摘掉降级态、夹子重新按授权收紧 | 同一台进程 `redis_degraded` 从 1 回到 **0**、`redis_settles_ok=9`；换新路径再冻一次 → 5 条全 `429`、恢复那臂 `rate_limit_capped_rejects=5`。**"通路活着回来"由行为证明，不由仪器读数证明** |
+| 服务端脚本不在（夹具回一次 `-ERR NOSCRIPT`；ctest 侧 `S4_04_Settler.NoscriptReloadsTheScriptAndAsksOnceMore`） | 重 `SCRIPT LOAD` 一次、**原样重试一次**；整拍不判失败、不进降级计数 | `script` 命令数 ≥2（初次 LOAD + 重 LOAD）、`redis_settles_failed=0`、`degraded=false`、授权照常落进夹子 |
+| 命令半途被掐（夹具持续 refuse EVALSHA） | **上报值只在命令成功后推进**，否则那一笔消耗被丢掉 → Redis 多授权，那才是不安全的方向 | `last_eval_used` 在失败前后都是 **"3"**（同一笔被重报），成功之后不再重复上报（其后 350 ms 内 EVALSHA 条数不增长） |
+
+一处**方向性的自我更正**要留在这里：我在 ADR 草稿里写过"夹子只会咬紧不会放松"。落地时发现这句只对
+**夹子的写入**成立——上报用的是快照那一刻的 `used_total`，从快照到命令发出之间放行的条数这一拍不报，
+于是服务端余额被**暂时高估**，上界 = 该键在一个结算周期内的实际放行数（最坏 `burst` 条），下一拍扣回。
+所以多副本下的口径是"每个周期内的超额有界"，不是"任意时刻严格相等"。ADR-05 第二节与 ARCHITECTURE
+1.30 的边界①已按这条改写，**上面五格的实测一个字不回头改**。
+
+### 14.2 四处阳性验证（能红才叫绿）
+
+| 改坏的那一处 | 红掉的用例 |
+|---|---|
+| 夹子不生效（`usable = tokens`） | 4 条：`CapLensRejectsButDoesNotSpendTheBucket`、`OverflowBucketAndReleaseAreProcessWide`、`GrantOfZeroBitesAndTheRejectionItCausesRefreshesIt`、`FailureOpensTheCapAndRecoversReclampingIt` |
+| 先记账后发命令 | **恰好 1 条**：`FailedReportIsRetriedWithTheSameUsageNextTick`——隔离干净，这条断言只守这一件事 |
+| 取消"只结有需求的桶"（每拍全表 EVALSHA） | 3 条：`IdleBucketsCostNoCommands`、`DemandedBucketIsSettled…`、`FailedReportIsRetried…` |
+| `set_cap_milli` 不夹 `burst` | 3 条：`GrantAboveBurstCannotAdmitMore`、`DemandedBucketIsSettled…`、`Noscript…` |
+
+还原用精确替换（不用 `sed`），还原后 `grep -r TEMP-POSITIVE src/ tests/ tools/` = **0**，再跑全量。
+
+### 14.3 工具侧发现（四条，每条都留了"防复发的第三条"）
+
+1. **`$(start_gateway …)` 起的进程不是本 shell 的孩子，`wait "$pid"` 当场返回"not a child"**。
+   后果不是报错而是**一路假绿**：脚本在它还没退出时就去读退出账（读回空串），再拿同一个端口起下一臂
+   （`EADDRINUSE`），于是后面每一臂测的都是第一臂那个还活着的进程。防复发：`stop_pid` 改成轮询
+   `kill -0` 直到真退出，且每次启动前 `port_busy … && die`——端口不空就不跑，不带着脏状态往下测。
+2. **一行多键 + 行首锚 = 四格静默读空**：`sed -n "s/^\[serve\] key=\(\[^ ]*\).*/\1/p"` 只命得中行首
+   那一个键，其余返回空串，而**空串在判定里长得像"0"**（本轮 `capped_rejects=''` 就差点被判成 0）。
+   防复发：退出账**一行一个键**（本来就是"统计每行一个 [serve] key=value，给脚本读"那条口径），
+   且 `get_stat` 改成 `grep -o "[[:space:]]key="`，不再假设键在行首。
+3. **夹具自己的两个错**：Redis 命令名大小写不敏感，产品发的是 `SCRIPT LOAD`，子命令按字面小写比会
+   回成 `-ERR unknown command`——被测方看到的是"服务端拒绝"而不是我解析错；以及一次性故障标志
+   （NOSCRIPT）必须**只对目标命令生效**，否则被同拍里的 PING 消化掉，故障根本没打到要测的那一格。
+   防复发：夹具两处比较都按小写、且 `cmd == "evalsha"` 才消化标志；`set_refuse_evalsha(bool)` 用
+   **持续**故障而不是"下一条"——降级态的断言要能在稳态下读，只耍赖一次的话下一拍就恢复了，
+   `degraded` 落在哪一侧全看采样时机，那种用例绿了也不说明什么。
+4. **`cd X && a` 之后的换行不继承 `cd`**：我那条手测命令的第二行在原 CWD 里找 `build/debug/l7gate`，
+   报"No such file or directory"。防复发：复杂/带 `$` 的命令一律先写成 `/home/archer/*.sh` 再跑
+   （交接段那条口径的同族，本轮又应验一次）。
+
+### 14.4 这一轮的门禁面
+
+三 preset 各 **291/291**（+11）、非 gtest 警告各 **0 条**、`tsan` 日志 `ThreadSanitizer` **0 次**
+（新增并发面 = 一条结算线程 + 每桶两个原子；六条 settler 用例在 asan/tsan 两个 preset 下都跑）；
+七条冒烟 `rc=0` 且 ✗ 计数 **0**（新增 `scripts/smoke-s4-04.sh` 六阶段，需 Docker；同批的
+`smoke-s3-04` MySQL 也在位）。原始落盘在 `build/smoke-s4-04/`：探针日志、每臂网关日志与退出账。

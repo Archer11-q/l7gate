@@ -22,6 +22,13 @@ TokenBucket::TokenBucket(std::uint64_t rate_per_sec, std::uint64_t burst) noexce
   // 初始满桶：last_ms = 0、tokens = burst。第一次调用时 `elapsed` 会把 tokens
   // 重新夹到 burst——"刚启动就按 burst 放行"是令牌桶的定义，不是补课。
   state_.store(static_cast<std::uint64_t>(burst_milli_), std::memory_order_relaxed);
+  // S4-04：缺省不夹（= burst），也就是 S4-03 的纯本地语义。结算线程成功一拍才收紧它。
+  cap_milli_.store(burst_milli_, std::memory_order_relaxed);
+}
+
+void TokenBucket::set_cap_milli(std::uint64_t cap_milli) noexcept {
+  // 授权永不使本地多放：cap 高于 burst 没有意义（本地自己就夹在 burst），取小。
+  cap_milli_.store(cap_milli < burst_milli_ ? cap_milli : burst_milli_, std::memory_order_relaxed);
 }
 
 bool TokenBucket::try_acquire(std::int64_t now_ms) noexcept {
@@ -37,10 +44,21 @@ bool TokenBucket::try_acquire(std::int64_t now_ms) noexcept {
       tokens += rate_milli_per_ms_ * elapsed;
       if (tokens > burst_milli_) tokens = burst_milli_;
     }
-    if (tokens < kOneTokenMilli) return false;  // 拒绝不写回：懒补货，下次按同一个 last 重算
+    // **夹子是透镜不是额度**：只在这次判定里把可见的 tokens 压低，写回的仍是本地轨迹的
+    // `tokens - 1000`。所以 Redis 授权变高时本地立刻跟得上、变低时只会少放。
+    const std::uint64_t cap = cap_milli_.load(std::memory_order_relaxed);
+    const std::uint64_t usable = tokens < cap ? tokens : cap;
+    if (usable < kOneTokenMilli) {
+      // 拒绝不写回：懒补货，下次按同一个 last 重算。
+      if (tokens >= kOneTokenMilli) capped_rejects_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     const std::uint64_t next =
         (static_cast<std::uint64_t>(now) << 32) | (tokens - kOneTokenMilli);
-    if (state_.compare_exchange_weak(old, next, std::memory_order_relaxed)) return true;
+    if (state_.compare_exchange_weak(old, next, std::memory_order_relaxed)) {
+      used_total_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
   }
 }
 
@@ -78,6 +96,31 @@ bool RateLimiter::try_acquire(std::string_view key, std::int64_t now_ms) noexcep
 std::size_t RateLimiter::key_count() const noexcept {
   std::lock_guard<std::mutex> lock(mu_);
   return buckets_.size();
+}
+
+std::vector<RateLimiter::BucketView> RateLimiter::snapshot_buckets() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<BucketView> views;
+  views.reserve(buckets_.size() + 1);
+  for (const auto& entry : buckets_) {
+    views.push_back(BucketView{entry.first, entry.second.get(),
+                               entry.second->used_total(), false});
+  }
+  views.push_back(BucketView{std::string{}, overflow_.get(), overflow_->used_total(), true});
+  return views;
+}
+
+void RateLimiter::release_all_caps() noexcept {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (auto& entry : buckets_) entry.second->release_cap();
+  overflow_->release_cap();
+}
+
+std::uint64_t RateLimiter::capped_rejects_total() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::uint64_t sum = overflow_->capped_rejects();
+  for (const auto& entry : buckets_) sum += entry.second->capped_rejects();
+  return sum;
 }
 
 RateLimitFilter::RateLimitFilter(std::shared_ptr<RateLimiter> limiter,

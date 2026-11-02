@@ -122,7 +122,18 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 - **SONAME 是 `libhiredis.so.1.1.0`**（`objdump -p` 实测）——ABI 号与 API 号不是一回事，apt 的运行时包名 `libhiredis1.1.0` 就是按前者取的。契约锁的是 API 版本 v1.2.0，命中。
 - **探针（形状同第 3 节 mysql 探针：编译 + 链接 + 运行时符号解析，不建连接）**：`g++ -std=c++20 -Wall -Wextra ... -lhiredis` 编译链接 rc=0，`ldd` 实际解析到 `libhiredis.so.1.1.0 => /usr/lib/x86_64-linux-gnu/libhiredis.so.1.1.0`，`redisFormatCommand("EVAL %s %d %s %d", "return 1", 0, "k", 1)` 产出 **49 字节**、与手写 RESP 逐字节相等（`byte_exact=1`）。
 - **撞出一条实现期的雷（记进 ADR-05 追加节第一节末条）**：那个出参按文档要用 `free()`；我先按 hiredis 里存在的另一个口 `redisFreeSdsCommand()` 去释放，**当场 `free(): invalid pointer` 中止（rc=134）**。两个释放口不通用，看名字猜不出来。
-- **服务端侧仍未取证**：`redis:7.2.5` 镜像在不在本机**判不出来**——Docker Desktop 整机未运行（`wsl -l -v` 里 `docker-desktop`=Stopped、发行版内无 `docker`、无 `/var/run/docker.sock`、2375/2376 关闭、Windows 侧 `docker.exe info` 报 `npipe:////./pipe/dockerDesktopLinuxEngine` 不存在），连 `docker images` 都跑不了。`apt` 的 `redis-server` 候选是 **8.0.5**，且契约 9.3 明写 Redis 一律走 Docker——**不用它顶包**，也不动契约锁定的 `7.2.5` tag。
+- **✅ 服务端连通取证已完成（2026-11-02，S4-04）**：`l7gate_redis_probe` 七步全通
+  （connect → `PING`→`PONG` → `INFO server`=**7.2.5** → `SCRIPT LOAD`（产品那份 Lua，678 字节，
+  sha `27f391e42f3e…`）→ 四格确定性 `EVALSHA` 读数与本地令牌桶逐格对账 → `HGETALL` → `DEL`），
+  `client=hiredis-1.2.0 ↔ server=redis-7.2.5`，`rc=0`。环境：Docker Desktop WSL Integration
+  （client/server 29.4.3）、镜像 `redis:7.2.5`（digest `sha256:3aaec283e6e5…`）、端口发布
+  `127.0.0.1:16379 → 6379`、`--cpuset-cpus 15`（容器内 `cpuset.cpus.effective=15` 实测生效）。
+  复跑：`PRESET=debug bash scripts/smoke-s4-04.sh`（阶段 0/1），或直接
+  `build/debug/tools/l7gate_redis_probe --port 16379`。读数与 CPU 分配写在 `BENCHMARK.md` **B-017**。
+  **镜像身份的核验缺口与 nginx 那次同形**：本机直连 `registry-1.docker.io` 建不起连接，我无法把这个
+  digest 与官方仓库比对——它来自 5.1 那个 mirror，照记，不假装核验过。
+- 本机另有 `redis:8.0` 镜像、`apt` 的 `redis-server` 候选是 **8.0.5**：契约 9.1 锁 `7.2.5`、
+  契约 9.3 明写 Redis 一律走 Docker，所以我**不用它们顶包**，也不动 tag（换 tag 历史断代）。
 
 ## 4. 待验证风险：perf 能否真正采样
 
@@ -172,6 +183,13 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 
 **2026-11-02（S4-04 认领日）第三次不可用，且这次不是集成开关**：Docker Desktop 整机没运行。取证逐条：Ubuntu 发行版内 `docker` 命令不存在、`/var/run/docker.sock` 与 `/run/docker.sock` 都没有、`/mnt/wsl/` 下只剩 `resolv.conf`（没有 `docker-desktop` 共享）、2375/2376 未监听；从 WSL 直接调 Windows 侧的 `docker.exe info` 报 `failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine`；`tasklist` 里 `Docker Desktop.exe` 与 `com.docker.backend.exe` 均无；`wsl -l -v` 显示 `docker-desktop` 发行版 **Stopped**。后果：`redis:7.2.5` 在不在本机**无法判定**（`docker images` 需要引擎），S4-04 的连通取证与降级三段容器侧卡在这一条上——**修它在图形界面侧，属共享环境，报项目所有人，我不自行改动**。
 
+**同日 2026-11-02 恢复**：项目所有人启动 Docker Desktop 之后集成回来了（`docker --version` 29.4.3、
+`docker info` 引擎侧 server 29.4.3 / `NCPU=16`），`redis:7.2.5` 经 5.1 那个 mirror **pull 成功**
+（本机原先只有 `redis:8.0`，我没拿它顶包），S4-04 的取证与冒烟都在这一轮跑出来（B-017、
+FAULT-INJECTION §14）。这一条掉线仍然是**第三次**，所以那句"集成会掉线 = 会出现看起来合理但来自
+退化环境的读数"照旧成立：本轮的代价不是错读数，而是**整整一条任务的前置被卡住半天**——S4-04 的
+认领提交（`7edff8f`）里我明写了"本提交不含任何容器侧结论"，就是这个原因。
+
 ## 6. 文件系统位置（会影响数据的一条）
 
 仓库与全部构建、压测都在 WSL 原生 ext4 内。当前仓库位置是 `/home/archer/workspace/l7gate`（2026-10-26 从 `/home/archer/l7gate` 平移进来，同发行版同文件系统，所以契约 9.4 的条件与全部历史数字继续成立；搬家的代价与复跑记录见 TASKS 交接段的「搬家」一条）。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\workspace\l7gate` 形式）查看和编辑同一批文件。
@@ -184,5 +202,5 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 |---|---|---|
 | **100k 长连接的两个前置条件**（2026-10-27 实测，**推翻了我之前写在四处文档里的说法**） | **① fd 上限不是环境阻塞**：`ulimit -n` soft=**10240**、hard=**1048576**，实测 `bash -c 'ulimit -n 300000'` **当场成功**——抬 soft 不需要 root、不需要改机器配置，脚本里一行或进程自己 `setrlimit` 就够（`fs.file-max` = 9.2e18、systemd `DefaultLimitNOFILE`=1048576，都不卡）。**② 真卡住 100k 的是临时端口**：`ip_local_port_range` = 32768–60999 = **28,232 个源端口**，压测客户端对同一个（目标 IP，目标端口）最多开约 2.8 万条连接，**抬 fd 完全解决不了它**。要到 100k 只有两条路：多目标端口/多地址，或者改测量口径——两条都属测量方案设计。 | 之前四处写的"S2/S3 之前必须由环境侧解决 rlimit"是**错的**（把可自抬的 soft limit 当成了机器配置），已就地改成"①不是问题、②是"；②的方案随 S2 的 `c100k.sh` 定，届时按规矩补一条 ADR |
 | 内存分配器（glibc / jemalloc / tcmalloc） | 目前默认 glibc malloc 2.43；契约 SLO #2 要求必须记录 | S1 首次记录 RSS 时定稿；换分配器属版本/依赖变更，先写 ADR |
-| `cpuset` 绑核方案（Redis 与网关、wrk 的核分配） | **方案已定（2026-11-02，ADR-05 追加节第七节）：只给 Redis 容器绑核 `--cpuset-cpus 15`（本机 `nproc`=16），网关与压测工具保持既有"未绑核"形态**——契约 3.3 那条防的是"Redis 抢 CPU 污染 p99"，绑 Redis 就够；把网关和 wrk 也钉到核上会让新读数与 B-008/B-016 的历史档不可比。**生效证据与读数待容器就位后取**（`docker inspect` 的 `HostConfig.CpusetCpus` + 该核的利用率），一起进 BENCHMARK；Docker Desktop 虚拟机自己的 CPU 数与发行版的 16 是否同一件事，取证时一并核 | S4-04 落地时按 ADR-05 追加节第七节执行 |
+| `cpuset` 绑核方案（Redis 与网关、wrk 的核分配） | **已定稿并实测生效（2026-11-02，ADR-05 追加节第七节 + BENCHMARK B-017）**：只给 Redis 容器绑核 `--cpuset-cpus 15`（引擎侧 `NCPU=16` 与发行版 `nproc=16` 同一视野），证据两处——`HostConfig.CpusetCpus=15` 且容器内 `/sys/fs/cgroup/cpuset.cpus.effective=15`；容器另加 `--save "" --appendonly no`（计数是易失状态，BGSAVE 会把 CPU 抖进尾延迟）。**网关与压测工具刻意保持未绑核**：契约 3.3 要的是"Redis 不许抢走网关正在用的核"，而把网关/wrk 钉到核上会让新读数与 B-008/B-012/B-013/B-016 这些未绑核的历史档不可比。**这条不是完整隔离**（网关仍可被调度到 15 号核），边界写在 B-017 第一节末尾 | S4-08 与 S5 任何带 Redis 的压测都按 B-017 那张表复述 CPU 分配 |
 | tc netem 在 6.18 WSL2 内核可用性 | 未测（契约 9.3 已预期可能不支持） | 仅作交叉验证，不阻塞主路径 |

@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "filter/chain.h"
 
@@ -36,6 +37,23 @@ class TokenBucket {
   // 下一次调用按同一个 last 重算，结果一样，少一次 CAS。
   bool try_acquire(std::int64_t now_ms) noexcept;
 
+  // S4-04（ADR-05 追加节第二节）：**授权上限是一只透镜，不是第二份额度**。
+  // 结算线程把 Redis 返回的"全局剩余毫 token"写进来，准入时在 CAS 循环内
+  // `min(tokens, cap)` 夹一道；本地补货的轨迹不因夹取而改变（写回的仍是扣减后的
+  // `tokens`），所以 cap 只会让放行**变少**、不会变多。缺省 = `burst` = 不夹，
+  // 也就是 S4-03 的纯本地语义——这正是降级兜底的样子：Redis 挂了就没人再写它。
+  void set_cap_milli(std::uint64_t cap_milli) noexcept;
+  void release_cap() noexcept { cap_milli_.store(burst_milli_, std::memory_order_relaxed); }
+  std::uint64_t cap_milli() const noexcept { return cap_milli_.load(std::memory_order_relaxed); }
+
+  // 自进程启动以来这条桶**放行**的条数（单调、不清零）。结算线程按"上次上报值之后的
+  // 差量"报给 Redis，所以清零会把两次结算之间的消耗丢掉——那是过授，方向不安全。
+  std::uint64_t used_total() const noexcept { return used_total_.load(std::memory_order_relaxed); }
+  // "本地补货够、但被夹子按下去"的那一格拒绝——夹子真的咬过人的证据（S4-04 验收）。
+  std::uint64_t capped_rejects() const noexcept {
+    return capped_rejects_.load(std::memory_order_relaxed);
+  }
+
  private:
   static constexpr std::uint64_t kOneTokenMilli = 1000;
   // 打包字：高 32 = last_ms（低 32 位）、低 32 = 毫 token。burst ≤ 1e6 → 1e9 毫单位，
@@ -43,6 +61,9 @@ class TokenBucket {
   std::atomic<std::uint64_t> state_{0};
   std::uint64_t burst_milli_ = 0;
   std::uint64_t rate_milli_per_ms_ = 0;
+  std::atomic<std::uint64_t> cap_milli_{0};
+  std::atomic<std::uint64_t> used_total_{0};
+  std::atomic<std::uint64_t> capped_rejects_{0};
 };
 
 class RateLimiter {
@@ -66,6 +87,25 @@ class RateLimiter {
   std::size_t key_count() const noexcept;
   std::uint64_t rate_per_sec() const noexcept { return rate_per_sec_; }
   std::uint64_t burst() const noexcept { return burst_; }
+
+  // ---- S4-04（ADR-05 追加节）：结算线程用的三面 ------------------------------------
+  // 一条桶的可见快照。`bucket` 的指针稳定性来自"桶不回收"（ADR-21 第四节第 4 条），
+  // 溢出桶也在同一份里（`overflow=true`、`key` 为空串）——它的额度在 Redis 侧也共用一格。
+  struct BucketView {
+    std::string key;
+    TokenBucket* bucket = nullptr;
+    std::uint64_t used_total = 0;
+    bool overflow = false;
+  };
+  // 取快照 = 一次 mutex 内的浅拷贝；**Redis 的往返必须在快照之后、锁之外做**——
+  // 拿着桶表的锁去做阻塞 IO，就把限流的热点路径交给了一个外部依赖。
+  std::vector<BucketView> snapshot_buckets() const;
+  // 降级兜底：把所有桶（含溢出桶）的 cap 放回 `burst`，语义退回 S4-03 的纯本地桶。
+  void release_all_caps() noexcept;
+  // 逐桶求和（只在退出报告与用例里调，它要拿桶表的锁）——不在快路径上加一个 limiter 级
+  // 原子，是因为 `try_acquire` 返回 bool、快路径拿不到"被夹住"这个原因，而加一个没人读的
+  // 枚举返回值等于发空头证明。
+  std::uint64_t capped_rejects_total() const;
 
  private:
   // C++20 的异构查找：请求路径上不为"查表"分配一个 std::string。
