@@ -621,7 +621,7 @@ SLO 写死的并发是 1000，100 只是让同一台机上的仪器离开饱和�
 | 日期 | 2026-10-29 09:13–09:23（本地） |
 | 被测 | 与 B-007/B-008 同一份 binary（`release`，`l7gate` sha256 前缀 `13aa69c86a0449094ef006b0`） |
 | 手段 | `scripts/bench/c100k.sh` 新增 `DRAIN_UNDER_LOAD=1` 档：`established==planned` 且静置窗口已开始后，脚本给网关发 SIGTERM（客户端仍持有全部连接），0.05 s 一轮计时到网关自己退出 |
-| 静置窗口内取数 | 参数 | `DRAIN_TIMEOUT_MS=5000`（**产品默认值本身**，不是为这一档放宽的值）、`DRAIN_SETTLE_IN_WINDOW=10`（100k 档 `HOLD_SECONDS=60`，所以信号落在窗口开始后的第 ~10–20 s） |
+| 静置窗口内取数的参数 | `DRAIN_TIMEOUT_MS=5000`（**产品默认值本身**，不是为这一档放宽的值）、`DRAIN_SETTLE_IN_WINDOW=10`（100k 档 `HOLD_SECONDS=60`，所以信号落在窗口开始后的第 ~10–20 s） |
 | 100k 档参数 | `CONNECTIONS=100000 TARGETS=4 UPSTREAM_ENDPOINTS=4 WORKERS=16 RAMP_MS=300000 HANDSHAKE_TIMEOUT_MS=120000 HOLD_SECONDS=60` → `canonic=1` |
 | 原始输出 | 2k 冒烟 `build/bench/smoke-drain-under-load-2k/` 与复跑 `build/bench/smoke-drain-green-r2/`；25k `build/bench/drain-25k-e4-def5000/`；100k `build/bench/drain-100k-e4-def5000/`；阳性验证 `build/bench/positive-drain-forced-r2/`（`DRAIN_TIMEOUT_MS=1`）；主档回归 `build/bench/smoke-drain-2k/` |
 
