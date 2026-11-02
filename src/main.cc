@@ -351,6 +351,10 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
     put("health_ejected_now", static_cast<long long>(health->ejected_now()));
     put("health_ejections_blocked_by_valve",
         static_cast<long long>(health->ejections_blocked_by_valve()));
+    // S4-05（ADR-12 追加二第四节）：熔断自己的两格。**一行一个键**——S4-04 撞过的
+    // 那一格（一行多键 + 行首锚 = 其余几格静默读成空串，而空串在判定里长得像 0）。
+    put("circuit_half_open_now", static_cast<long long>(health->half_open_now()));
+    put("health_all_denied_fallback", static_cast<long long>(health->all_denied_fallbacks()));
     for (std::uint16_t t = 0; t < health->target_count(); ++t) {
       const l7gate::route::TargetHealthSnapshot s = health->snapshot(t);
       std::string key = "health_t" + std::to_string(t) + "_";
@@ -360,6 +364,14 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
       put(key + "probe_fail", static_cast<long long>(s.probe_fail_total));
       put(key + "recoveries", static_cast<long long>(s.recoveries_total));
       put(key + "last_ejection_epoch_ms", static_cast<long long>(s.last_ejection_epoch_ms));
+      // 判据配对的四条下界就读在这里：`trips_rate` 证"错误率真的摘过"，
+      // `half_open_admitted` 证"半开真的放过"，`half_open_recovered` 证"真的恢复过"，
+      // `half_open_reopened` 证"真的回摘过"（ADR-12 追加二第八节）。
+      put(key + "trips_rate", static_cast<long long>(s.rate_trips_total));
+      put(key + "half_open_admitted", static_cast<long long>(s.half_open_admitted_total));
+      put(key + "half_open_denied", static_cast<long long>(s.half_open_denied_total));
+      put(key + "half_open_recovered", static_cast<long long>(s.half_open_recovered_total));
+      put(key + "half_open_reopened", static_cast<long long>(s.half_open_reopened_total));
     }
   }
   if (nodes != nullptr) {
@@ -898,6 +910,19 @@ int serve(int argc, char** argv) {
                     static_cast<long long>(hp.probe_interval_ms),
                     static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
                     health_table->target_count());
+        if (hp.circuit.enabled) {
+          // S4-05（ADR-12 追加二第四节）：熔断装了什么。恢复时间线的读数要拿这六个数
+          // 对账——半开预算 B 与证据 K 决定"一个周期里该看到几条探测"，窗口三件套决定
+          // "多快该摘"。
+          std::printf("[serve] circuit=on window_ms=%lld minimum_requests=%llu "
+                      "error_rate_percent=%u half_open_requests=%u half_open_successes=%u "
+                      "half_open_timeout_ms=%lld\n",
+                      static_cast<long long>(hp.circuit.window_ms),
+                      static_cast<unsigned long long>(hp.circuit.minimum_requests),
+                      hp.circuit.error_rate_percent, hp.circuit.half_open_requests,
+                      hp.circuit.half_open_successes,
+                      static_cast<long long>(hp.circuit.half_open_timeout_ms));
+        }
       }
       if (nodes_publisher != nullptr) {
         std::printf("[serve] nodes=on schema=%s host=%s:%u reload_ms=%lld timeout_ms=%lld "
@@ -1008,6 +1033,17 @@ int serve(int argc, char** argv) {
                   static_cast<long long>(hp.probe_interval_ms),
                   static_cast<long long>(hp.probe_timeout_ms), hp.max_ejection_percent,
                   health_table->target_count());
+      if (hp.circuit.enabled) {
+        // 与多 Reactor 那一臂同一组键名（两条装配路径一份口径，冒烟只认这一份）。
+        std::printf("[serve] circuit=on window_ms=%lld minimum_requests=%llu "
+                    "error_rate_percent=%u half_open_requests=%u half_open_successes=%u "
+                    "half_open_timeout_ms=%lld\n",
+                    static_cast<long long>(hp.circuit.window_ms),
+                    static_cast<unsigned long long>(hp.circuit.minimum_requests),
+                    hp.circuit.error_rate_percent, hp.circuit.half_open_requests,
+                    hp.circuit.half_open_successes,
+                    static_cast<long long>(hp.circuit.half_open_timeout_ms));
+      }
     }
     if (nodes_publisher != nullptr) {
       std::printf("[serve] nodes=on schema=%s host=%s:%u reload_ms=%lld timeout_ms=%lld "

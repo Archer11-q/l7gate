@@ -25,8 +25,12 @@ namespace l7gate::filter {
 // 所以整条链仍然无锁、`tsan` 仍然零 data race（ADR-14 的红线，ADR-19「为什么」第一条）。
 //
 // S3-03 追加：`health` 表被**同组全部 worker 共享**（全原子，先例 ReactorStats），
-// 本环每请求只读一个问句——"这个成员现在被摘除了吗"。共享表不违反 ADR-14：
-// 它不承载 fd，也不承载连接对象。
+// 本环每请求只读一个问句。S4-05 把那一问问句从"这台现在被摘除了吗"换成
+// `HealthTable::admit`——"这台现在能接这一条请求吗"，因为半开态要在这里限流：
+// **放行的那一条被钉成唯一候选**（ADR-12 追加二第二节第 2 条），不是放回候选集
+// "允许被选中"。共享表不违反 ADR-14：它不承载 fd，也不承载连接对象。
+// 表在这里是**非 const** 的：`admit` 会做半开门的名额 CAS 与"到期未扫顺手进半开"的
+// 状态迁移（S3-03 的 `note_failure` 早就在做同一形状的"读侧顺手迁移"）。
 class LoadBalanceFilter : public RequestFilter {
  public:
   // `health` 可空：空 = 健康检查整套未装配（S3-02 形状，行为逐字节不变）。
@@ -34,7 +38,7 @@ class LoadBalanceFilter : public RequestFilter {
   // 非 null 时**每请求 load 一根快照指针**（一次原子读）：reload 发布的新成员表
   // 从下一条请求开始生效——这是"reload 生效耗时"的请求侧实现位置。
   LoadBalanceFilter(const route::GroupTable& table, std::shared_ptr<route::LbState> state,
-                    std::shared_ptr<const route::HealthTable> health = nullptr,
+                    std::shared_ptr<route::HealthTable> health = nullptr,
                     std::shared_ptr<const route::NodesPublisher> nodes = nullptr) noexcept;
 
   std::string_view name() const noexcept override { return "load-balance"; }
@@ -48,15 +52,15 @@ class LoadBalanceFilter : public RequestFilter {
   // 空串会让所有没带那个头的请求钉在同一个后端上，那是一次谁也不会去查的哈希倾斜。
   std::string_view hash_key_of(const RequestInfo& info, const route::HashKey& key) const noexcept;
 
-  // 本请求的候选集（被摘除的成员不在其中；全员被摘时回退全员——ADR-12 的立场是
-  // "故意保留一段错误"，而请求无去处（不自产错误响应）是 S4 的空格子）。
+  // 本请求的候选集（接不了的成员不在其中；全员接不了时回退全员——ADR-12 的立场是
+  // "故意保留一段错误"，S4-05 把这条最后防线原样留着，理由与代价在 ADR-12 追加二第二节第 6 条）。
   // 复用同一个成员缓冲：本 filter 每 worker 一份、只在 owner 循环线程跑，
   // 所以热路径上不付每次请求一次堆分配的钱。
   const std::vector<std::uint16_t>& candidates_for(const route::UpstreamGroup& group);
 
   const route::GroupTable& table_;
   std::shared_ptr<route::LbState> state_;
-  std::shared_ptr<const route::HealthTable> health_;
+  std::shared_ptr<route::HealthTable> health_;
   std::shared_ptr<const route::NodesPublisher> nodes_;
   std::vector<std::uint16_t> candidates_scratch_;
 };

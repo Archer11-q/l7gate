@@ -4559,6 +4559,291 @@ TEST(S3_02_LoadBalance, ConsistentHashPinsTheSameKeyAcrossConnections) {
   targets.stop();
 }
 
+// ============ S4-05（ADR-12 追加二）：熔断两个输入的端到端 ============
+//
+// 这四条要的是真 socket：错误率窗口在真 5xx 流上判事、半开的预算在**后端自己数的
+// 请求数**上封顶（仪器不进被测方——"只放 B 条"这句的证据是 backend 收到的条数，
+// 不是网关的计数器；网关那几格读数与它对账，两边互相背书而不是互相代替）。
+// 全部跑在 `probe_interval_ms = 0` 的纯被动形状下：ADR-12 追加二第七节写明了
+// 探活仍是一条全量恢复的出口，那条路会把半开绕过，取证必须在没有它的世界里做。
+
+namespace {
+
+// 熔断端到端的策略。`max_fails=99` 让连续失败那条判据够不着，摘除只能来自窗口。
+l7gate::route::HealthPolicy circuit_e2e_policy(std::int64_t fail_timeout_ms,
+                                               std::uint32_t ejection_percent,
+                                               std::uint64_t minimum_requests,
+                                               std::uint32_t half_open_requests,
+                                               std::uint32_t half_open_successes,
+                                               std::int64_t half_open_timeout_ms) {
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;  // 纯被动专场
+  policy.probe_timeout_ms = 500;
+  policy.max_fails = 99;
+  policy.fail_timeout_ms = fail_timeout_ms;
+  policy.max_ejection_percent = ejection_percent;
+  policy.circuit.enabled = true;
+  policy.circuit.window_ms = 10'000;
+  policy.circuit.minimum_requests = minimum_requests;
+  policy.circuit.error_rate_percent = 50;
+  policy.circuit.half_open_requests = half_open_requests;
+  policy.circuit.half_open_successes = half_open_successes;
+  policy.circuit.half_open_timeout_ms = half_open_timeout_ms;
+  return policy;
+}
+
+}  // namespace
+
+// 一、**窗口判住连续计数判不住的那一档**：一台后端 50% 的流量打它、每次都回 503，
+// 而另一台全 200。轮询让每条请求在两台之间交替——失败从不在同一台上连着攒到 99 次，
+// 但它的窗口里全是失败。摘除之后它一条流量也接不到（下界：摘除真的发生了；
+// 上界那条"错误率不够就不摘"在 health_test.cc 的 `FullErrorRateBelowVolumeFloor…`）。
+TEST(S4_05_CircuitE2E, ErrorRateEjectsABackendThatConsecutiveFailuresNeverCatch) {
+  std::string why;
+  TestUpstream good;
+  TestUpstream bad;
+  ASSERT_TRUE(start_sized_upstream(&good, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&bad, 64, &why)) << why;
+  bad.set_path_status("/boom", 503);  // good 不设前缀 → 同样打 /boom 时它回 200
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(good.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(bad.port())});
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(good.port()),
+               "127.0.0.1:" + std::to_string(bad.port())},
+              circuit_e2e_policy(/*fail_timeout_ms=*/60'000, /*percent=*/100,
+                                 /*minimum_requests=*/6, /*B=*/2, /*K=*/2, /*ho=*/3000));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i << " " << why;
+  }
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).ejections_total >= 1u; }, 3000))
+      << "窗口里的错误率没有把这台后端摘掉（连续计数那条在这里够不着，红的就是窗口本身）";
+  EXPECT_EQ(health.snapshot(1).rate_trips_total, 1u) << "摘除没归因到错误率这一格";
+  EXPECT_EQ(health.snapshot(0).ejections_total, 0u) << "全 200 的那台不该被牵连";
+  EXPECT_TRUE(health.is_ejected(1, 0) || health.snapshot(1).ejected_until_ms > 0);
+
+  // 摘除期内它一条都接不到：剩下的 8 条全部由健康的那台接走。
+  // 数的是 `path_status_responses_served()`——`bad` 的流量全走固定状态码那条分支，
+  // 而 `requests_served()` 按老口径不数那条分支（拿它当仪器会恒真）。
+  const std::uint64_t bad_before = bad.path_status_responses_served();
+  const std::uint64_t good_before = good.requests_served();
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << i;
+  }
+  EXPECT_EQ(bad.path_status_responses_served(), bad_before) << "被摘除的后端还在接流量";
+  EXPECT_GE(good.requests_served(), good_before + 8u) << "候选集收缩后健康成员必须接住全部流量";
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  good.stop_and_join();
+  bad.stop_and_join();
+}
+
+// 二、**到期不再全量放行**：摘除期满后只放 B 条探测请求，两条都成功才转全量。
+// 上界打在后端自己数的条数上（前 B 条里健康的那台一条都没接到），下界打在
+// "确实放行了 B 条 + 之后回到全量"上——"半开从不放行"的实现会把恢复锁死，这条就红。
+TEST(S4_05_CircuitE2E, ExpiryReopensThroughTheHalfOpenBudget) {
+  std::string why;
+  TestUpstream good;
+  TestUpstream bad;
+  ASSERT_TRUE(start_sized_upstream(&good, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&bad, 64, &why)) << why;
+  bad.set_path_status("/boom", 503);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(good.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(bad.port())});
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(good.port()),
+               "127.0.0.1:" + std::to_string(bad.port())},
+              circuit_e2e_policy(/*fail_timeout_ms=*/300, /*percent=*/100,
+                                 /*minimum_requests=*/6, /*B=*/2, /*K=*/2, /*ho=*/5000));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+  }
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).rate_trips_total >= 1u; }, 3000))
+      << why;
+  ASSERT_TRUE(wait_until([&] { return health.ejected_now() == 1u; }, 1000)) << why;
+
+  // 后端转好，等摘除到期（fail_timeout=300ms）。到期之后它接到的每一条都必须是门放行的探测。
+  bad.set_path_status_code(200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const std::uint64_t bad_at_expiry = bad.path_status_responses_served();
+  const std::uint64_t good_at_expiry = good.requests_served();
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+    // 两条后端这时候都回 200，只是文案不同：`bad` 走固定状态码分支回 `200 Probe`，
+    // `good` 回 `200 OK`。这里只断"是 200"，流量的归属由两边各自的计数器分开断。
+    EXPECT_EQ(status.rfind("HTTP/1.1 200", 0), 0u) << i << "：" << status;
+  }
+  EXPECT_EQ(bad.path_status_responses_served() - bad_at_expiry, 2u)
+      << "半开期内的前 B 条没被钉给那台后端（探测只是'允许被选中'，被均衡挤光了）";
+  EXPECT_EQ(good.requests_served(), good_at_expiry) << "半开的名额是限流的：健康的那台该一条不接";
+  EXPECT_EQ(health.snapshot(1).half_open_admitted_total, 2u);
+  EXPECT_EQ(health.snapshot(1).half_open_recovered_total, 1u) << "两条业务成功该把它转正";
+  EXPECT_EQ(health.ejected_now(), 0u);
+  EXPECT_EQ(health.half_open_now(), 0u);
+
+  // 转正之后回到全量：6 条里它该接到 3 条（轮询，不再受门管）。
+  const std::uint64_t bad_after_recovery = bad.path_status_responses_served();
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+    EXPECT_EQ(status.rfind("HTTP/1.1 200", 0), 0u) << i << "：" << status;
+  }
+  EXPECT_GE(bad.path_status_responses_served() - bad_after_recovery, 3u)
+      << "恢复了却接不到流量——ADR-19 追加三那条吸附在这一格的重演";
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  good.stop_and_join();
+  bad.stop_and_join();
+}
+
+// 三、半开期内探测失败 → **一次即回摘**（不等 max_fails，这里 max_fails=99 根本够不着）。
+// 第二次摘除之后它重新冷却，所以只放出去一条探测就关门——上界是"每周期不超过 B 条"，
+// 这条断的是"失败的那一个周期只花一条"。
+TEST(S4_05_CircuitE2E, HalfOpenProbeThatFailsReEjectsImmediately) {
+  std::string why;
+  TestUpstream good;
+  TestUpstream bad;
+  ASSERT_TRUE(start_sized_upstream(&good, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&bad, 64, &why)) << why;
+  bad.set_path_status("/boom", 503);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(good.port())});
+  options.config.upstream_targets.push_back(Reactor::Config::Target{
+      std::string("127.0.0.1"), static_cast<std::uint16_t>(bad.port())});
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(good.port()),
+               "127.0.0.1:" + std::to_string(bad.port())},
+              circuit_e2e_policy(/*fail_timeout_ms=*/300, /*percent=*/100,
+                                 /*minimum_requests=*/6, /*B=*/2, /*K=*/2, /*ho=*/5000));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 12; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+  }
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).rate_trips_total >= 1u; }, 3000))
+      << why;
+
+  // 到期，后端仍然回 503 → 放出去的那一条探测失败 → 立刻回摘。
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const std::uint64_t bad_at_expiry = bad.path_status_responses_served();
+  ASSERT_TRUE(client.write_all(get_request("/boom")));
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 503 Probe") << why;
+  ASSERT_TRUE(wait_until([&] { return health.snapshot(1).half_open_reopened_total >= 1u; }, 3000))
+      << "半开期内失败没有立即回摘（它还得重新攒满 max_fails=99 才摘 = 永远不摘）";
+  EXPECT_EQ(health.snapshot(1).ejections_total, 2u);
+  EXPECT_EQ(bad.path_status_responses_served() - bad_at_expiry, 1u) << "回摘之后那一个周期还放了第二条探测";
+
+  // 回摘重新冷却 → 后面的流量全给健康的那台。
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << i;
+  }
+  EXPECT_EQ(bad.path_status_responses_served(), bad_at_expiry + 1u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  good.stop_and_join();
+  bad.stop_and_join();
+}
+
+// 四、**窗口判据同样受安全阀约束**（已裁第一条：S4-05 只加输入，不另起一套判死）。
+// 两台全回 503、上限 50% → floor(2×50/100)=1：只能摘一台，另一台继续接流量并且
+// 错误如实透传（客户端看到的还是 503，不是我伪造的 200）。
+TEST(S4_05_CircuitE2E, ErrorRateEjectionIsStillCappedByTheValve) {
+  std::string why;
+  TestUpstream a;
+  TestUpstream b;
+  ASSERT_TRUE(start_sized_upstream(&a, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&b, 64, &why)) << why;
+  a.set_path_status("/boom", 503);
+  b.set_path_status("/boom", 503);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_targets.push_back(
+      Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(a.port())});
+  options.config.upstream_targets.push_back(
+      Reactor::Config::Target{std::string("127.0.0.1"), static_cast<std::uint16_t>(b.port())});
+  HealthRig rig;
+  rig.install(&options, &harness, 2, l7gate::route::Balance::kRoundRobin,
+              {"127.0.0.1:" + std::to_string(a.port()), "127.0.0.1:" + std::to_string(b.port())},
+              circuit_e2e_policy(/*fail_timeout_ms=*/60'000, /*percent=*/50,
+                                 /*minimum_requests=*/6, /*B=*/2, /*K=*/2, /*ho=*/3000));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  auto& health = *rig.health;
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/boom"))) << i;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i;
+    EXPECT_EQ(status, "HTTP/1.1 503 Probe") << i << " 上游的 5xx 必须原样透传";
+  }
+  ASSERT_TRUE(wait_until([&] { return health.ejections_blocked_by_valve() >= 1u; }, 3000))
+      << "窗口判据绕过了安全阀（两台全挂时把整组判死 = 雪崩放大器）";
+  EXPECT_EQ(health.ejected_now(), 1u) << "最坏只损失 50% 容量，不是'我没摘除'";
+  EXPECT_EQ(health.snapshot(0).ejections_total + health.snapshot(1).ejections_total, 1u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  a.stop_and_join();
+  b.stop_and_join();
+}
+
 // ===========================================================================
 //
 // 这一组只测一件事：**第 i 条 worker 的回源目的地址是第 i mod E 个端点，而且它一辈子只用

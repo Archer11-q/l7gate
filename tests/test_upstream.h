@@ -94,6 +94,11 @@ class TestUpstream {
   std::uint64_t connections_accepted() const noexcept {
     return connections_accepted_.load(std::memory_order_relaxed);
   }
+  // S4-05：`set_path_status` 那条分支回了几条（与 `requests_served()` 分账，两边相加才是
+  // "这台后端收到过多少条请求"）。熔断的端到端用它数"半开期内它真的接到了几条探测"。
+  std::uint64_t path_status_responses_served() const noexcept {
+    return path_status_responses_.load(std::memory_order_relaxed);
+  }
 
   // 三个测试侧旋钮。语义都限定在"对端行为"，不触碰网关内部状态。
   // 响应体的**长度**由 response_body_bytes_ 决定，内容形如 "seq=42....."，
@@ -116,7 +121,13 @@ class TestUpstream {
   // 被动 5xx 的可控版本都靠它）。reason 文案给一个占位——网关的框架判定不读 reason。
   void set_path_status(std::string_view prefix, int status) {
     status_path_prefix_ = std::string(prefix);
-    status_path_code_ = status;
+    status_path_code_.store(status, std::memory_order_relaxed);
+  }
+  // S4-05：熔断的端到端要在**流量跑着的时候**把同一台后端从 5xx 切成 200（半开期
+  // 的成功证据就是这么来的），所以状态码是一个原子写入口。前缀仍然只在 start 之前设——
+  // 它是 `std::string`，运行中改就是 data race，`tsan` preset 会当场把门禁判红。
+  void set_path_status_code(int status) noexcept {
+    status_path_code_.store(status, std::memory_order_relaxed);
   }
 
   // --- S1-07 的慢读上游 ---------------------------------------------------
@@ -308,7 +319,14 @@ class TestUpstream {
       // S3-03 的路径状态码旋钮（放在故障前缀之前：/gone 这类探活路径与故障前缀
       // 互不重叠，先到先判）。
       if (!status_path_prefix_.empty() && target.rfind(status_path_prefix_, 0) == 0) {
-        respond(client, "HTTP/1.1 " + std::to_string(status_path_code_) +
+        // S4-05：这条分支**另外记一笔** `path_status_responses_`，不并进 `requests_served_`。
+        // 理由有两条：① `requests_served_` 的老口径是"默认响应形态服务了几条"，
+        // S4_02 有一条用例的注释就按这个口径写着（`ValveBlockedMemberKeepsServingAndErrors
+        // PassThrough`），改它等于回头改已记的数；② 熔断的端到端要断的是"这台后端到底收到
+        // 几条"——一个看不见事件的仪器会把"被摘除的后端还在接流量"读成 0 条，
+        // 于是断言恒真（口径④"一片 0 比一片 ? 危险"在夹具这一侧的形态）。
+        path_status_responses_.fetch_add(1, std::memory_order_relaxed);
+        respond(client, "HTTP/1.1 " + std::to_string(status_path_code_.load(std::memory_order_relaxed)) +
                             " Probe\r\nContent-Length: 0\r\n\r\n",
                 block_end + body_len);
         if (client.closed_by_close_header) return;
@@ -549,6 +567,7 @@ class TestUpstream {
   std::atomic<bool> stop_{false};
   std::atomic<std::uint64_t> requests_served_{0};
   std::atomic<std::uint64_t> connections_accepted_{0};  // S3-01：见上面 getter 的注释
+  std::atomic<std::uint64_t> path_status_responses_{0};  // S4-05：固定状态码分支单独一笔账
   std::uint16_t port_ = 0;
   std::size_t response_body_bytes_ = 64;
   int delay_ms_ = 0;
@@ -557,7 +576,7 @@ class TestUpstream {
   std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
   std::size_t stall_after_bytes_ = std::numeric_limits<std::size_t>::max();
   std::string status_path_prefix_;
-  int status_path_code_ = 0;
+  std::atomic<int> status_path_code_{0};
   std::atomic<bool> stall_reads_{false};
   int stall_reads_ms_ = 0;
   std::chrono::steady_clock::time_point stalled_until_{};

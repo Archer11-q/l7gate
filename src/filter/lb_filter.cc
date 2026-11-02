@@ -31,7 +31,7 @@ std::int64_t now_ms() noexcept {
 
 LoadBalanceFilter::LoadBalanceFilter(const route::GroupTable& table,
                                      std::shared_ptr<route::LbState> state,
-                                     std::shared_ptr<const route::HealthTable> health,
+                                     std::shared_ptr<route::HealthTable> health,
                                      std::shared_ptr<const route::NodesPublisher> nodes) noexcept
     : table_(table), state_(std::move(state)), health_(std::move(health)),
       nodes_(std::move(nodes)) {}
@@ -42,11 +42,25 @@ const std::vector<std::uint16_t>& LoadBalanceFilter::candidates_for(
   const std::int64_t now = now_ms();
   candidates_scratch_.clear();
   for (const std::uint16_t target : group.targets) {
-    if (!health_->is_ejected(target, now)) candidates_scratch_.push_back(target);
+    const route::Admission admission = health_->admit(target, now);
+    if (admission == route::Admission::kProbeSlot) {
+      // 半开门给了这一台一条名额（S4-05，ADR-12 追加二第二节第 2 条）：这一条请求就是
+      // 那一次探测，**只把它当候选**，本轮策略选择被跳过。放回候选集"允许被选中"没有用——
+      // B-013 实测 98.3% 的流量吸附在成员 0，"能被选中"与"接得到流量"是两件事
+      // （ADR-19 追加三那条教训在这里的复用）。代价照记：被钉住的这一条不参与
+      // 最少连接/一致性哈希的选择，探测优先于均衡。
+      candidates_scratch_.clear();
+      candidates_scratch_.push_back(target);
+      return candidates_scratch_;
+    }
+    if (admission == route::Admission::kAllow) candidates_scratch_.push_back(target);
   }
   if (candidates_scratch_.empty()) {
-    // 全员被摘：回退全员集合。ADR-12 的立场是"故意保留一段错误来换取不自我放大"；
-    // 把请求挂死在下游缓冲里是第二故障（自产错误响应归 S4），我不在这里造它。
+    // 全员接不了（摘除中，或半开预算耗尽）：回退全员。ADR-12 的立场是"故意保留一段错误
+    // 来换取不自我放大"，而把请求挂死在下游缓冲里是第二故障；S4-02 之后回退过去仍然
+    // 连不上的一格由自产 502/503 收场。半开期内失败**一次即回摘**，所以这里放回去的是
+    // 一批请求而不是一个周期——这条取舍与"为什么不新开一条 503"写在 ADR-12 追加二第二节第 6 条。
+    health_->note_all_denied_fallback();
     return group.targets;
   }
   return candidates_scratch_;

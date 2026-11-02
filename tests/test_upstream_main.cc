@@ -176,5 +176,10 @@ int main(int argc, char** argv) {
   upstream.stop_and_join();
   std::printf("[upstream] 已服务请求数=%llu\n",
               static_cast<unsigned long long>(upstream.requests_served()));
+  // S4-05：`--path-status` 那条分支不进上面那个数（老口径，S4_02 的用例注释按它写着）。
+  // 冒烟要数"这台后端一共收到几条"就必须把两笔相加——只打第一行会让回 503 的那台
+  // 读数恒为 0，而 0 在判定里长得像"它一条都没接到"（口径④）。
+  std::printf("[upstream] 固定状态码响应数=%llu\n",
+              static_cast<unsigned long long>(upstream.path_status_responses_served()));
   return 0;
 }

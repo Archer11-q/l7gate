@@ -313,11 +313,14 @@ std::uint64_t Reactor::run() {
 
     // S3-03 健康检查 tick。与排水扫描同一形状：扫描 → 判完成，都只能在循环线程做。
     // sweep 每拍都跑（N 个目标的一次线性扫 + 全是原子的读写，E 是个位数到几十的量）；
-    // 探活只在配置了间隔时跑。到期未扫的摘除在 LB 读侧按健康算（is_ejected 的口径），
-    // 这里的 sweep 只是让状态账（ejected_now / recoveries）尽快对上。
+    // 探活只在配置了间隔时跑。到期未扫的摘除：熔断未装配时 LB 读侧按健康算（S3-03 的
+    // 口径，这里的 sweep 只是让状态账 `ejected_now / recoveries` 尽快对上）；装配了熔断
+    // 时读侧会顺手把它推进半开（S4-05，ADR-12 追加二第五节——不推进就等于放一整批全量
+    // 流量进一个刚到期的成员，那正是半开要挡的事），这里的 sweep 兜的是"没有业务流量"
+    // 与"半开到期未决"两种只能靠时间推进的情形。
     if (config_.health) {
       const std::int64_t now = monotonic_ms();
-      config_.health->sweep_expired(now);
+      config_.health->sweep_expired(now, wall_ms());
       if (config_.health->policy().probe_interval_ms > 0) health_tick(now);
     }
 
@@ -847,7 +850,8 @@ void Reactor::note_health_failure(std::uint16_t target) noexcept {
 
 void Reactor::note_health_success(std::uint16_t target) noexcept {
   if (config_.health == nullptr) return;
-  config_.health->note_success(target);
+  // S4-05：成功样本也要进错误率窗口（分母就是它），所以要给时钟。
+  config_.health->note_success(target, monotonic_ms());
 }
 
 void Reactor::build_probe_slots() noexcept {

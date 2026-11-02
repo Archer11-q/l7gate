@@ -532,6 +532,101 @@ TEST(S3_03_ConfigHealth, SameBackendDifferentHealthPathIsRejectedSamePathDedups)
   EXPECT_EQ(both_default.endpoints().size(), 1u);
 }
 
+// --- S4-05（ADR-12 追加二第三节）：顶层 `circuit` 段 ----------------------------------
+// 段不存在 = 熔断只有 S3-03 那一条判据（今天的行为逐字节不变）；段存在则六字段全可选、
+// 且**要求 health 段同在**（摘除与安全阀都长在健康表上，已裁第一条）。
+
+namespace {
+
+std::string with_circuit(std::string_view health_body, std::string_view circuit_body) {
+  return std::string(R"({"upstreams":[{"name":"api","balance":"round_robin",)"
+                     R"("targets":[{"address":"127.0.0.1","port":18081}]}],"health":)") +
+         std::string(health_body) + R"(,"circuit":)" + std::string(circuit_body) + "}";
+}
+
+}  // namespace
+
+TEST(S4_05_CircuitConfig, SectionAbsentMeansCircuitDisabled) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(with_health("{}"), &config, &error)) << error;
+  ASSERT_TRUE(config.health().present);
+  EXPECT_FALSE(config.health().policy.circuit.enabled)
+      << "没有 circuit 段凭空装配熔断 = 悄悄改掉到期恢复的语义";
+}
+
+TEST(S4_05_CircuitConfig, EmptySectionAssemblesWithPolicyDefaults) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(with_circuit("{}", "{}"), &config, &error)) << error;
+  const l7gate::route::CircuitPolicy& circuit = config.health().policy.circuit;
+  ASSERT_TRUE(circuit.enabled);
+  EXPECT_EQ(circuit.window_ms, 10000);
+  EXPECT_EQ(circuit.minimum_requests, 20u);
+  EXPECT_EQ(circuit.error_rate_percent, 50u);
+  EXPECT_EQ(circuit.half_open_requests, 3u);
+  EXPECT_EQ(circuit.half_open_successes, 2u);
+  EXPECT_EQ(circuit.half_open_timeout_ms, 3000);
+  // health 段那五个缺省没被 circuit 段挤掉。
+  EXPECT_EQ(config.health().policy.max_fails, 3u);
+  EXPECT_EQ(config.health().policy.fail_timeout_ms, 10000);
+}
+
+TEST(S4_05_CircuitConfig, EveryFieldOverrides) {
+  GatewayConfig config;
+  std::string error;
+  ASSERT_TRUE(build_from(with_circuit(R"({"max_fails":1})",
+                                      R"({"window_ms":500,"minimum_requests":7,)"
+                                      R"("error_rate_percent":30,"half_open_requests":5,)"
+                                      R"("half_open_successes":5,"half_open_timeout_ms":150})"),
+                          &config, &error))
+      << error;
+  const l7gate::route::CircuitPolicy& circuit = config.health().policy.circuit;
+  EXPECT_EQ(circuit.window_ms, 500);
+  EXPECT_EQ(circuit.minimum_requests, 7u);
+  EXPECT_EQ(circuit.error_rate_percent, 30u);
+  EXPECT_EQ(circuit.half_open_requests, 5u);
+  EXPECT_EQ(circuit.half_open_successes, 5u) << "K 等于 B 是合法边界（每条探测都必须成功）";
+  EXPECT_EQ(circuit.half_open_timeout_ms, 150);
+}
+
+TEST(S4_05_CircuitConfig, RejectsUnknownFieldTypesAndOutOfRangeNamingTheField) {
+  expect_rejected(with_circuit("{}", R"({"bucket_count":8})"), "bucket_count");
+  expect_rejected(with_circuit("{}", R"({"window_ms":50})"), "window_ms");
+  expect_rejected(with_circuit("{}", R"({"window_ms":0})"), "window_ms");
+  expect_rejected(with_circuit("{}", R"({"window_ms":"1000"})"), "window_ms");
+  expect_rejected(with_circuit("{}", R"({"minimum_requests":0})"), "minimum_requests");
+  // 阈值下限是 1 不是 0：0 = "窗口里有过一条失败就摘"，那句话说的是 max_fails=1。
+  expect_rejected(with_circuit("{}", R"({"error_rate_percent":0})"), "error_rate_percent");
+  expect_rejected(with_circuit("{}", R"({"error_rate_percent":101})"), "error_rate_percent");
+  expect_rejected(with_circuit("{}", R"({"half_open_requests":0})"), "half_open_requests");
+  expect_rejected(with_circuit("{}", R"({"half_open_successes":0})"), "half_open_successes");
+  expect_rejected(with_circuit("{}", R"({"half_open_timeout_ms":99})"), "half_open_timeout_ms");
+  expect_rejected(with_circuit("{}", "[]"), "circuit");
+}
+
+// K > B 是把"恢复"配成不可达：一个半开周期最多放 B 条请求，却要求攒到 B 条以上的成功。
+// 拒绝的话里必须**同时**点到这两个名字，只点一个的话配置的人得自己猜是哪一条越了界
+// （S4-04 那条"同时点名两个名字"的口径）。
+TEST(S4_05_CircuitConfig, RejectsSuccessesAboveRequestsNamingBothFields) {
+  expect_rejected(with_circuit("{}", R"({"half_open_requests":2,"half_open_successes":3})"),
+                  "half_open_successes");
+  expect_rejected(with_circuit("{}", R"({"half_open_requests":2,"half_open_successes":3})"),
+                  "half_open_requests");
+  // 缺省值之间不冲突（B=3、K=2），所以只写一个超界的 successes 也照样拒。
+  expect_rejected(with_circuit("{}", R"({"half_open_successes":4})"), "half_open_successes");
+}
+
+// `circuit` 没有自己的执行机构：没有 health 段就没有健康表，也就没有摘除、没有阀、
+// 没有那条 CAS 状态位可挂。这条同样要同时点名两个段。
+TEST(S4_05_CircuitConfig, CircuitSectionWithoutHealthIsRejectedNamingBoth) {
+  const std::string text =
+      R"({"upstreams":[{"name":"api","balance":"round_robin",)"
+      R"("targets":[{"address":"127.0.0.1","port":18081}]}],"circuit":{}})";
+  expect_rejected(text, "circuit");
+  expect_rejected(text, "health");
+}
+
 // --- S3-04（ADR-20 第二节）：组级 source 字段 -----------------------------------------
 // 与 targets 互斥、只认字面量 "mysql"；mysql 组在成员到岗前就是空组。
 

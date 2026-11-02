@@ -135,14 +135,40 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 - 本机另有 `redis:8.0` 镜像、`apt` 的 `redis-server` 候选是 **8.0.5**：契约 9.1 锁 `7.2.5`、
   契约 9.3 明写 Redis 一律走 Docker，所以我**不用它们顶包**，也不动 tag（换 tag 历史断代）。
 
-## 4. 待验证风险：perf 能否真正采样
+## 4. perf 能否真正采样（**已验证 2026-11-02**：单进程可以，系统级不行）
 
 
 
 `perf 7.0.14` 已安装，但运行内核是 `6.18.40.1-microsoft-standard-WSL2`，两者版本不匹配。WSL2 的定制内核历来对 `perf_event_open` 支持不全，而 SLO 附加产出（「与 Nginx 的差值必须定位到具体原因」）明确要求用 perf 火焰图作证。
 
-- 这项我没有验证——S1/S2 还用不到它，但**绝不能到 S5 才发现用不了**。
-- 计划：S4 期间跑一次 `perf stat -a sleep 1` 与最小火焰图冒烟，结果补进本文件。如果不通，备选是微软官方 WSL 内核的 perf 支持路径，或退到 `async-profiler`/eBPF 之外的用户态统计手段（届时按 8.2 禁令先写 ADR）。
+- ~~这项我没有验证~~ → **已于 2026-11-02（S4-05 期间）验证完，结论在下面的 4.1**：能用，但只有一种形态能用。
+- 当时的计划就是"S4 期间跑一次 `perf stat -a sleep 1` 与最小火焰图冒烟"。跑完了：`-a` 系统级这条路
+  **不通**（没有 PMU、record 直接失败），**单进程这条路通**（硬件事件 5918 样本、软件事件带栈）。
+  所以备选（async-profiler / eBPF）不用启用，也不需要为它写 ADR——但 S5 的火焰图必须按 4.1 那三条约束取。
+
+### 4.1 已验证（2026-11-02，S4-05 期间把上面那条计划执行掉了）
+
+实测基线：`kernel.perf_event_paranoid = 2`（`sysctl` 直读）。结论不是"perf 能用/不能用"一句话，
+而是**三种形态分别成立与否**——S5 的火焰图只能用其中一种：
+
+| 形态 | 命令 | 实测 |
+|---|---|---|
+| 系统级计数 | `perf stat -a sleep 1` | rc=0，但 `cpu-cycles:u` 报 **`<not supported>`**（同行走 `nan GHz  cycles_frequency`）→ 系统级这条路没有 PMU |
+| 系统级记录 | `perf record -g -a sleep 1` | `Adjusting ... >= 2: Disallow CPU event access` → `Failure to open any events for recording`，`perf report` 说落盘文件 **zero-sized** → 系统级采样直接不可用 |
+| 单进程·硬件事件 | `perf record -- <1.4 s 的忙循环>` | **5918 样本**；`perf stat -e cycles,instructions --` 同进程拿到 **6,002,662,598 cycles / 2,400,108,728 instructions（IPC 0.40）** |
+| 单进程·软件事件 | `perf record -e cpu-clock -F 99 -g -- <忙循环>` | **140 样本**、带调用栈（`perf report --stdio`：100% Self 在 `main`，栈底 `_start`）→ **火焰图的最小可用形态就是这一条** |
+| `/proc/schedstat` | 上面每条 record 都伴随 | `Failed to open /proc/schedstat` —— 警告非致命（这台 WSL2 内核没那个文件），不影响样本 |
+
+**对 S5 差值归因的三条硬约束（现在就写死，不要到 S5 才发现）**：① **必须由 perf 直接拉起被测进程**
+（`perf record -g -- ./build/release/l7gate …`），不能事后 `perf record -p <pid>` attach——paranoid=2
+下 ptrace 那条路不通；② `-a` 系统级与内核态符号都拿不到，所以火焰图**只覆盖用户态**，
+网关自引入的增量里"内核时间去哪了"这一格今天没有直接证据，只能从 syscall 计数侧面推（B-013/B-016
+那套每请求 `epoll_ctl` 逐数闭合的读法就是侧面证据）；③ 对照基线 nginx 在容器里跑，同一条约束对它
+同样成立，所以两边的取法必须一样（都是"由 perf 拉起自己的进程"），不能一边 attach、一边拉起。
+
+**抬 `kernel.perf_event_paranoid` 属环境侧决定，我没动**：抬到 1/0/-1 能换来 `-a` 系统级与内核态帧，
+代价是本机任何进程都能读全系统事件。这不是我能替项目所有人决定的事，所以这里只把"今天这个设置下
+能测什么"记全。如果 S5 需要内核态火焰图，那是先写 ADR 再改环境，不是先改了环境再找理由。
 
 ## 5. Docker Desktop WSL Integration（当天开过、掉过两次线；#3 基线已能复现）
 

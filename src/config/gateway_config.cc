@@ -94,7 +94,8 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     *error = "配置顶层必须是对象（有 upstreams 与 routes 两个键）";
     return false;
   }
-  if (!forbid_unknown(document, {"upstreams", "routes", "health", "rate_limit"}, error,
+  // S4-05 起顶层多一个 `circuit`（ADR-12 追加二第三节）：认什么、不认什么全在那一节里。
+  if (!forbid_unknown(document, {"upstreams", "routes", "health", "circuit", "rate_limit"}, error,
                       "配置顶层")) {
     return false;
   }
@@ -353,6 +354,80 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
     if (health->find("max_ejection_percent") != nullptr) {
       policy.max_ejection_percent = static_cast<std::uint32_t>(v);
     }
+  }
+
+  // circuit 段可选（S4-05，ADR-12 追加二第二/三节）：段不存在 = 熔断只有 S3-03 那一条
+  // 判据、摘除到期即全量恢复（今天的语义逐字节不变）。段存在则六个字段全可选、缺省值
+  // 在 CircuitPolicy 里，且**要求 health 段同在**——熔断没有自己的执行机构，它用的就是
+  // 健康表那一条摘除路径与那一只阀（S4 拆解已裁第一条）。
+  if (const JsonValue* circuit = document.find("circuit"); circuit != nullptr) {
+    if (!out->health_.present) {
+      *error = "circuit 段要求同时存在 health 段：摘除与安全阀都长在健康表上"
+               "（ADR-12 追加二第三节），这份文件里有 circuit 而没有 health";
+      return false;
+    }
+    if (!circuit->is_object()) {
+      *error = std::string("circuit 必须是对象，读到的是") + circuit->kind_name();
+      return false;
+    }
+    if (!forbid_unknown(*circuit,
+                        {"window_ms", "minimum_requests", "error_rate_percent",
+                         "half_open_requests", "half_open_successes", "half_open_timeout_ms"},
+                        error, "circuit")) {
+      return false;
+    }
+    auto need_int = [&](std::string_view key, std::int64_t low, std::int64_t high,
+                        std::int64_t* out_value) {
+      const JsonValue* v = circuit->find(key);
+      if (v == nullptr) return true;  // 可选：缺省值留在 CircuitPolicy 里
+      if (v->kind != JsonValue::Kind::kInt) {
+        *error = std::string("circuit 的 ") + std::string(key) + " 必须是整数，读到的是" +
+                 v->kind_name();
+        return false;
+      }
+      if (v->number < low || v->number > static_cast<std::int64_t>(high)) {
+        *error = std::string("circuit 的 ") + std::string(key) + " 要落在 " +
+                 std::to_string(low) + ".." + std::to_string(high) + "，读到的是 " +
+                 std::to_string(v->number);
+        return false;
+      }
+      *out_value = v->number;
+      return true;
+    };
+    route::CircuitPolicy& policy = out->health_.policy.circuit;
+    std::int64_t v = 0;
+    if (!need_int("window_ms", 100, 3600000, &v)) return false;
+    if (circuit->find("window_ms") != nullptr) policy.window_ms = v;
+    if (!need_int("minimum_requests", 1, 1000000, &v)) return false;
+    if (circuit->find("minimum_requests") != nullptr) {
+      policy.minimum_requests = static_cast<std::uint64_t>(v);
+    }
+    // 阈值下限是 1 不是 0：0 意味着"窗口里只要有过一条失败就摘"，那把超时与一次抖动
+    // 都算判据，而 `minimum_requests` 拦不住它——配 0 的人要的是"有失败就摘"，
+    // 那句话该用 max_fails=1 说，不是用错误率说。
+    if (!need_int("error_rate_percent", 1, 100, &v)) return false;
+    if (circuit->find("error_rate_percent") != nullptr) {
+      policy.error_rate_percent = static_cast<std::uint32_t>(v);
+    }
+    if (!need_int("half_open_requests", 1, 1000, &v)) return false;
+    if (circuit->find("half_open_requests") != nullptr) {
+      policy.half_open_requests = static_cast<std::uint32_t>(v);
+    }
+    if (!need_int("half_open_successes", 1, 1000, &v)) return false;
+    if (circuit->find("half_open_successes") != nullptr) {
+      policy.half_open_successes = static_cast<std::uint32_t>(v);
+    }
+    if (!need_int("half_open_timeout_ms", 100, 3600000, &v)) return false;
+    if (circuit->find("half_open_timeout_ms") != nullptr) policy.half_open_timeout_ms = v;
+    // 交叉校验（ADR-12 追加二第二节第 3 条）：出半开要攒的成功证据不能超过放行预算，
+    // 否则那个成员永远攒不够、永远出不来半开——那是把"恢复"配成了不可达。
+    if (policy.half_open_successes > policy.half_open_requests) {
+      *error = "circuit 的 half_open_successes=" + std::to_string(policy.half_open_successes) +
+               " 不能大于 half_open_requests=" + std::to_string(policy.half_open_requests) +
+               "：一个半开周期内最多放 B 条请求，就要攒 B 条以上成功——恢复成了不可达";
+      return false;
+    }
+    policy.enabled = true;
   }
 
   // rate_limit 段可选（S4-03，ADR-21 第二/四节）：段不存在 = 不装限流，存在则

@@ -51,13 +51,14 @@
 - 按配置顺序过 filter 链；**S3-01 起链上有第一个业务 filter：路由**（前缀取最长命中、正则全串锚定且优先于前缀，无匹配回 404 且**不回源**）。决策是纯函数（`src/route/`，不碰 fd），目的地通过 `RequestInfo` 的写回通道交给回源路径
 - **S3-02 起链上是两环**：`RouteFilter` 决定"这条请求属于**哪一组**后端"，`LoadBalanceFilter` 决定"组里这次给**哪一个**"（轮询 / 最少连接 / 一致性哈希）。分成两环不是为了好看：路由是纯函数、均衡天生有状态，合成一环就再也无法在不建 socket 的文件里测规则语义，而 S3-03 的健康检查也没有地方插（ADR-19 第三条）。**均衡状态是每 worker 一份**（游标与配对计数都是普通整数，只被该 worker 的循环线程碰），所以 ADR-14 的跨线程接触面一个字没扩大，`tsan` 零 data race 就是它的可证伪形式
 - 后端表与路由表从**一份 JSON 子集文件**读进来（`--config`）。解析器在本仓库里手写、不引第三方库，为的是"读不出就整体失败"这件事有地方表达：未知字段、重复键、尾逗号、注释、浮点、`balance` 拼错、空 `targets`、vnodes 越界、正则编不过、路由指向不存在的组——**每一条都是拒绝**，退出码 2 且话里点名是哪一项，绝不"退回默认配置继续跑"
-- **S3-03 起组里的成员是"健康"的**：被动记账（连不上 / 头坏 / 5xx 记失败、`<500` 完整头记活着）+ **主动探活**（每目标可配 `health_path`，2xx/3xx/4xx 活、5xx/连接失败/超时死，探活连接归 owner worker 的事件循环、**不进业务计数**）。连续 `max_fails` 次失败摘除 `fail_timeout`，探活成功立即恢复；**最多摘除比例安全阀**（`max_ejection_percent`，默认 10%）保证判据失准时最坏只损失 10% 容量，被阀挡下的每一次都有计数
+- **S3-03 起组里的成员是"健康"的**：被动记账（连不上 / 头坏 / 5xx 记失败、`<500` 完整头记活着）+ **主动探活**（每目标可配 `health_path`，2xx/3xx/4xx 活、5xx/连接失败/超时死，探活连接归 owner worker 的事件循环、**不进业务计数**）。连续 `max_fails` 次失败摘除 `fail_timeout`，探活成功立即恢复；**最多摘除比例安全阀**（`max_ejection_percent`，默认 10%）保证判据失准时最坏只损失 10% 容量，被阀挡下的每一次都有计数。**S4-05 起这条机构多了第二个输入**：配了 `circuit` 段之后，摘除期满**不再一次性全量放行**，而是进**半开**只放 `half_open_requests` 条探测请求（见下一条）；没配 `circuit` 段时本节语义一字未改
 - **S3-04 起成员表可以来自 MySQL**：组声明 `"source": "mysql"`（与 `targets` 互斥），成员从 `l7gate_nodes` 表按 `--nodes-reload-ms` 周期 reload——**策略在文件、成员在数据库**，增删一台后端不重启不热重载；MySQL 挂了按已加载的配置继续服务，恢复后自动接上
 - **S4-01/S4-02 起回源这一跳有"限期"也有"表态"**：三格请求级超时（连接 3000 / 响应头 10000 / body 空闲 30000 ms，0=关）撞线时上游按六步关闭、头前自产 **504**（body 空闲头已出去，只以断流表态）；回源拿不到上游的三种确定性形态——**connect 失败 → 502**、**全员被摘回退后仍连不上 → 503**、**本地连接/fd 预算耗尽 → 503**——各给一条自产响应并关配对，请求不再挂在下游缓冲里。S2-06 那 71,769 条客户端超时的旧债由此结账（ADR-21/ADR-22，证据见下表）
 - **S4-03 起链上有第一句"不"：本地令牌桶限流**。配置文件的 `rate_limit` 段（`{ "rate": 令牌/秒, "burst": 桶容量, "key": "path" | "header:<名字>" }`，段不存在 = 不装限流）在链首装一环：超速率 → 自产 **429**、不回源；令牌桶按**键**分桶、全部 worker 共用同一份桶表（per-worker 桶会把限额放大 N 倍）；键数硬上界 16384，溢出键共用一只桶并计数（ADR-21 第二/四节）
 - **S4-04 起，限流计数可以交给 Redis 聚合了**：`--redis-db` 给了才启用（这是部署事实不是流量策略，所以不进配置文件）。机制是 **Redis 授予额度、本地桶执行**——上面那只桶的语义一字未改，只多一只"上限夹子"（CAS 循环里 `min(tokens, cap)`，**写回的仍是本地轨迹**，所以夹子是透镜不是额度：被夹住那次不消耗本地令牌）；一条独立结算线程每 200ms 一拍把各键的消耗上报给一段住在 Redis 里的 Lua 令牌桶、取回全局剩余写进 `cap`（**Lua 与 C++ 同一套数学**，探针对着 `redis:7.2.5` 逐格对过）。`docker stop` 之后限流照旧表态（六连击仍是 `3×200 + 3×429`——拒绝能力不消失），`docker start` 之后不需要重启网关、`redis_degraded` 自己回到 0（ADR-05 落地追加节 + B-017）
+- **S4-05 起熔断有两个输入、恢复只走半开**：配置文件的 `circuit` 段（要求 `health` 段同在——熔断没有自己的执行机构，用的就是 S3-03 那条摘除路径与那一只阀，[ADR-12 追加二](docs/adr/ADR-12-circuit-breaker-ejection-cap.md)）。① **滑动窗口错误率**：`window_ms` 切 8 个桶、窗口内 `失败×100 ≥ 请求×阈值` **且**样本 ≥ `minimum_requests` 才判摘——它管的是连续计数这把尺看不见的形状（一台 40% 请求回 5xx 的后端每次成功都把连续计数清零，永远不被摘）；主动探活的样本**不进这个窗口**（仪器不进被测方）。② **半开限流恢复**：`fail_timeout` 到期只放 `half_open_requests` 条请求，而且**被放行的那一条被钉给那个成员**（放回候选集"允许被选中"等于摆设——B-013 实测 98.3% 流量吸附在成员 0），攒满 `half_open_successes` 条业务成功才转全量、期内一次失败立即回摘、`half_open_timeout_ms` 内没攒够也回摘。**半开继续占着安全阀的位**（`health_ejected_now` 在装配熔断时 = 摘除 + 半开），否则 10 台 10% 的组可以让 10 台各自半开、全组容量≈0 而账上写着"损失 0 台"
 
-还没有的：熔断、指标暴露、配置热重载。（多 Reactor、上游连接池（**S3-01 起按目标分桶，仍 per-worker**）、配对模型与 pipeline/`close` 语义、优雅停止/排水、路由与三策略负载均衡、**被动+主动健康检查与摘除安全阀、节点表的 MySQL 来源与 reload**、**请求级三格超时、回源失败的自产 502/503、本地令牌桶限流与 429、Redis 分布式计数与三段降级** 都已落地——逐条证据在下面那张表。**`--route` / `--route-regex` 这对 S3-01 的临时开关已在 S3-02 被配置文件取代、不留兼容层**（传了就是"无法识别的选项"）：留兼容层等于同一件事有两种配法，而成本对照与故障注入只会各测一种。**加权不做**（已裁：要做先进 ADR-19，并连带写清它与健康检查摘除的相互作用）。**回源容量公式分岔**：没装路由 filter 时仍是 `min(worker 数, 端点数) × 单元组容量`（本机实测 28,232，所以 B-007 那档要求 `--workers ≥ 4`）；装了路由之后每个 (worker, 目标) 元组各自有 28,232 的余量，`--workers 1` 也能按请求连多个端点。）
+还没有的：重试防放大（S4-06）、指标暴露、配置热重载。（多 Reactor、上游连接池（**S3-01 起按目标分桶，仍 per-worker**）、配对模型与 pipeline/`close` 语义、优雅停止/排水、路由与三策略负载均衡、**被动+主动健康检查与摘除安全阀、节点表的 MySQL 来源与 reload**、**请求级三格超时、回源失败的自产 502/503、本地令牌桶限流与 429、Redis 分布式计数与三段降级、熔断的错误率滑窗与半开限流恢复** 都已落地——逐条证据在下面那张表。**`--route` / `--route-regex` 这对 S3-01 的临时开关已在 S3-02 被配置文件取代、不留兼容层**（传了就是"无法识别的选项"）：留兼容层等于同一件事有两种配法，而成本对照与故障注入只会各测一种。**加权不做**（已裁：要做先进 ADR-19，并连带写清它与健康检查摘除的相互作用）。**回源容量公式分岔**：没装路由 filter 时仍是 `min(worker 数, 端点数) × 单元组容量`（本机实测 28,232，所以 B-007 那档要求 `--workers ≥ 4`）；装了路由之后每个 (worker, 目标) 元组各自有 28,232 的余量，`--workers 1` 也能按请求连多个端点。）
 
 <details>
 <summary><b>逐条验收证据（点开）</b>——每个数字都来自本轮重跑，不是记忆</summary>
@@ -88,6 +89,7 @@
 | 回源失败的自产错误响应（S4-02，ADR-22） | 三种**确定性**失败各一条自产响应：connect 失败（同步 / `SO_ERROR`）→ **502**；被选目标在失败揭晓时已被摘（全员被摘回退后的最后防线）→ **503**；本地 `max_connections` 或 epoll 注册失败 → **503**。三格计数与 `gateway_replies_sent` 同口径、互斥。**回退保留**（判据可能失准，误摘成员仍可能服务），自产响应是回退失败后的表态。**S2-06 旧债结账**：E=1 名义档慢 ramp 重跑，客户端 `established=28231 / not_101=71769 / 零 handshake-timeout`，网关 `gateway_replies_connect_failed=71769`、三种超时计数全 0——同一容量墙（28,231），旧形状是 71,769 条等到超时，新形状是同数目的完整 502。同轮抓到并修掉三处：**101 后撤销响应头限期**（否则 100k 空闲隧道 10 秒后被 504 清掉重开）、504 的 `Content-Length` 15→16、默认 `--drain-timeout-ms` 5000→10000（与 `drain ≥ head` 校验对齐）。三 preset 各 269/269、tsan 0 race、六冒烟全绿 |
 | 本地令牌桶限流（S4-03，ADR-21） | 链首一环：`rate_limit` 段（rate/burst 必填、key 缺省 path，`ip` 具名拒绝）→ 超速率 `kStop + 429`，走既有自产响应通道，**不回源**（429 的 `upstream_opened` 不动）、`requests_parsed` 不替限流器背账。桶状态是**一个打包 64 位原子**（毫 token + 32 位时刻；两原子的 CAS 补货有过补窗口），键 → 桶是 mutex 哈希表、桶的准入在锁外；**全部 worker 共用同一份桶表**（4 worker × burst=20 实测总放行恰好 20，不是 80）。键数硬上界 16384，溢出键共用一只桶并计 `rate_limit_overflow_keys`。进程侧真 curl 同 path 6 条（burst=3、rate=1/s）：`200 200 200 429 429 429`、`allowed=3 rejected=3 keys=1`。阳性验证：每 worker 一只桶 → 用例红（放行 80）；补货快 1000 倍 → 数学与 429 两条红。三 preset 各 280/280、tsan 0 race、六冒烟全绿 |
 | Redis 分布式计数与降级（S4-04，ADR-05 落地追加节 + B-017） | **Redis 授予额度、本地桶执行**：一条独立结算线程（同 ADR-20 的 reload 线程形状——**阻塞 IO 不进 worker 事件循环**）每 `--redis-settle-ms`（缺省 200）一拍，把各键自上次结算以来的放行数报给一段住在 Redis 里的 Lua 令牌桶，取回"全局剩余毫 token"写进该桶的**上限夹子**；`cap` 在 CAS 循环里 `min(tokens, cap)`，写回的仍是本地轨迹 → **夹子只会咬紧、不会使本地多放**（但上报滞后让服务端余额被暂时高估，上界 = 该键一个周期内的放行数，这条代价写在 B-017 第四节）。键 `l7gate:rl:v1:<kind>:<fnv1a64>`（与本地键同源，16384 键下碰撞 ≈7.3e-12，方向是更严）；只结"有需求"的桶。**实测**：探针七步全通 `hiredis-1.2.0 ↔ redis-7.2.5`；同一 path 六连击接与不接**逐条相同** `200 200 200 429 429 429`、`capped_rejects=0`、`settles_ok=3 / settle_commands=1`、服务端那格 `tokens=0 < 3000`；把那一格冻成 0 → `rate=1000/burst=1000` 的本地桶明明有余粮仍第二批 5 条全 `429`（`capped_rejects=5`），解冻自动恢复；`docker stop` 期间六连击仍是 `3+3`（**拒绝能力不消失**）、`settles_failed=7`，`docker start` 后 `redis_degraded` 自己回 0、`settles_ok=9`。cpuset 绑核实测生效（`HostConfig=15` 且容器内 `cpuset.cpus.effective=15`；网关与压测刻意不绑，守住与 B-008/B-016 的可比性）。ctest **291/291**（+11，其中 6 条用 RESP 夹具跑、**不依赖 Docker**）、三 preset 警告 0、tsan 0 race、七条冒烟 rc=0 且 ✗=0。阳性验证四处全部真打红 |
+| 熔断补全：错误率滑窗与半开限流恢复（S4-05，ADR-12 追加二） | **同一台机构加两个输入，不另起一套判死**：① 窗口错误率（`window_ms` 切 8 桶、`失败×100 ≥ 请求×阈值` **且** 样本 ≥ `minimum_requests`）管连续计数看不见的形状——一台 40% 回 5xx 的后端每次成功都把连续计数清零、永远不被摘；**探活样本不进窗口**（仪器不进被测方）。② 半开：`fail_timeout` 到期只放 `half_open_requests` 条，而且**被放行的那条被钉给那个成员**（放回候选集"允许被选中"等于摆设——B-013 实测 98.3% 吸附在成员 0），攒满 `half_open_successes` 条**业务**成功才转全量、期内一次失败立即回摘、`half_open_timeout_ms` 内没攒够也回摘；**半开继续占着安全阀的位**（装配熔断时 `health_ejected_now` = 摘除 + 半开，否则 10 台 10% 的组可以让 10 台各自半开、全组容量≈0 而账上写"损失 0 台"）。状态仍一元：`0` 健康 / `(到期单调毫秒<<1)|位`，三个状态一次 CAS 迁移；`circuit` 段不存在 = S3-03 语义逐字节不变。**实测**：冒烟阶段 1 摘除后坏的那台**自报只收到 6 条**（打了 24 条、健康那台接走 18、`half_open_admitted=0`）；阶段 2 **`自报 6 == 摘除前 4 + 门放行 2`** 逐条对上、`reopened=2`/`ejections=3`；阶段 3 到期后 2 条探测转正、时间线两端钉在同一根墙钟轴（摘除自报 → 首次探测 **+832 ms**）、恢复后自报接到 5 条 200；阶段 5 拿 `deploy/gateway-circuit.json`（生产形状）断"6 条里窗口只攒到 3 样本 → `trips_rate=0`"与"连续计数成立但 `floor(2×10/100)=0` → `ejections=0`、`blocked_by_valve=1`"。ctest **318/318**（+27）、非 gtest 警告各 0、tsan `ThreadSanitizer` 0 次、八条冒烟 `rc=0` 且 ✗=0。**八处阳性验证全部真打红**，其中"摘除时清窗口"那一处**第一版 0 红**——用例的时间线跨了自然滑窗、压不住桶边界，是**用例的失效不是实现的清白**，改用例之后才红（FAULT-INJECTION §15.3） |
 | sanitizer | `debug` / `asan-ubsan` / `tsan` 各 **291/291**（2026-11-02，S4-04），非 gtest 警告 **0 条**（其中 `asan-ubsan` 与 `tsan` 各有 **2 条 Skipped**：构成表的数值判定——sanitizer 换了分配器后 `mallinfo2()` 一律报 0，所以**跳过＝不判，不是通过**，结构那一半照判）；每条"干净"都带反证（[docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) 第 3 节）。多线程的 TSan 反证做过三次：S2-01 摘掉 handoff 锁 → 报 3 处 race，S2-03 的 stop-under-load churn → 报 **14 处**，S2-05 把排水的跨线程标志做成普通 `bool` → 6 条排水用例里 **5 处 data race**，每次都还原后全绿——"TSan 干净"是能红的绿。排水机制另有三次逻辑阳性验证（摘守卫→3 条红、摘隧道分支→1 条红、关 accept 拒绝→1 条红），以及**一次"拆了也不红"的诚实记录**：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条 |
 | 跨线程销毁（S2-03） | per-worker 池让"连接被非 owner 线程持有"的 harder 竞态**没出现**（所有 `shared_ptr` 持有者都在同一 worker 线程内，析构必在 owner 线程，跨线程只流动裸 fd）。红队三条 `S2_03_CrossThreadDestruction`：负载活跃时 stop、handoff 的 fd 注册前被对端关、连接风暴——tsan 零 race、asan/LSan 零 UAF 零泄漏。销毁协议定稿在 ADR-14 |
 
@@ -102,7 +104,7 @@
 | **S1** | 单连接转发 + 第一份 p99 | ✅ 八个任务全 DONE | 四件套：#2/#3/#4 齐，#1 的 #3 半边按裁决**推到 S5 终判**（理由见上表） |
 | **S2** | 多 Reactor + 上游连接池 + 跨线程销毁 | ✅ **八个任务全 DONE（S2-01…S2-07 + S2-06a）**：三 preset 各 **137/137**、非 gtest 警告各 0 条、TSan **零 data race**；#2 达标 + 构成表 0.16% 吻合、#1 未达标但第一次测到多 Reactor 有效（33 ms → 4–6 ms）、p999 那一档记"取不到"、100k 隧道负载下排水 0.947 s。**四件套齐，已按门禁收尾 push（`47bca67..dcccca5`，2026-10-29）**（逐条对账见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「## S2」节） | TSan 干净 |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 摘除安全阀 | ✅ **六个任务全 DONE（S3-01…S3-06）**：三 preset 各 **259/259**、非 gtest 警告各 0 条、TSan **零 data race**；摘除耗时 202 ms、误摘率 0/3480（带分母）、安全阀 10 台全死停 1/10（B-014）；首次连通取证 8.4.11↔8.0.36（契约 9.1 翻案）、reload 生效 406/536 ms、降级零中断（B-015）；五类故障矩阵全过（§12）；每请求成本 B-016 见下。**四件套齐，push 待门禁收尾授权**（逐条对账见 [docs/ROADMAP.md](docs/ROADMAP.md) 的「## S3」节） | 摘除耗时、误摘率、故障注入实测 |
-| **S4** | 限流 + 熔断 + 超时重试防放大 | **进行中：S4-01（三格超时）、S4-02（回源失败自产 502/503）、S4-03（本地令牌桶 + 429）、S4-04（Redis 分布式计数与三段降级）DONE**；熔断补全 / 重试防放大 / S4 故障矩阵 / 门禁收尾未开始 | 429 生效数据、熔断时间线、Redis 降级 |
+| **S4** | 限流 + 熔断 + 超时重试防放大 | **进行中：S4-01（三格超时）、S4-02（回源失败自产 502/503）、S4-03（本地令牌桶 + 429）、S4-04（Redis 分布式计数与三段降级）、S4-05（熔断补全：错误率滑窗 + 半开限流恢复）DONE**；重试防放大（S4-06，ADR-23）/ S4 故障矩阵第二轮（S4-07）/ 门禁收尾与 push（S4-08）未开始。基线三 preset 各 **318/318** | 429 生效数据 ✅、熔断恢复时间线 ✅（S4-05）、Redis 降级 ✅ |
 | **S5** | 热重载 + 指标 + 面板 + vs Nginx 归因 | 未开始 | 三个数字终稿、归因报告、故障注入全表 |
 
 S1 的门禁结论、一键复现命令、以及**实测暴露出来留给 S2 的九条债**（每条都指着具体数字）在 [docs/ROADMAP.md](docs/ROADMAP.md)。S2–S5 只有一句话目标——契约第 4 节要求每个阶段门禁通过时才拆下一阶段，提前拆会写成幻想中的任务表。
@@ -129,7 +131,7 @@ client ──epoll ET──▶ acceptor ──round-robin──▶ N×worker Rea
                        │
         限流（本地桶 + Redis 聚合）与超时/自产表态  ✅ S4-01～S4-04（桶表全 worker 共用一份；Redis 只授予额度，夹子在 CAS 里 min）
                        │
-        熔断补全：错误率滑窗 + 半开              ⏳ S4-05（执行机构复用 S3-03 的摘除，不另起一套）
+        熔断补全：错误率滑窗 + 半开              ✅ S4-05（执行机构复用 S3-03 的摘除，不另起一套）
                        │
         指标 → Grafana 面板 / WS 调试页        ⏳ S5（见「可观测面与调试界面」）
 ```
@@ -147,6 +149,7 @@ client ──epoll ET──▶ acceptor ──round-robin──▶ N×worker Rea
 - Nginx OSS 只有被动的 `max_fails` / `fail_timeout`；**主动健康检查是 Nginx Plus 才有的功能**
 - Nginx **没有内置熔断器**
 - 熔断带**最多摘除比例安全阀**（默认 10%，对齐 Envoy 的 `max_ejection_percent`）——判据失准时最坏只损失 10% 容量，防止熔断本身变成雪崩放大器（[ADR-12](docs/adr/ADR-12-circuit-breaker-ejection-cap.md)）
+- 熔断有**两个输入**（连续失败 + 滑动窗口错误率）与**三态机**（健康 / 摘除 / 半开），摘除期满不是"一次性全量放回来"而是**半开限流**：只放 `half_open_requests` 条、而且被放行的那条**被钉给那个成员**，攒够业务成功才转正。Envoy 的 outlier detection 有摘除比例但没有半开门，Hystrix 有半开但没有"半开继续占阀位"这件事——我这台把两者合在一根 CAS 状态位上，`health_ejected_now` 在装配熔断时数的是"不接全量流量的成员数"（[ADR-12 追加二](docs/adr/ADR-12-circuit-breaker-ejection-cap.md)）
 
 这两件事不能混着说：**我比 Nginx 多的不是速度，是治理策略**；吞吐基线仍然是 Nginx，目标是它的 60%，不是超过它。
 
@@ -190,7 +193,23 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/same   # 超速
 # 退出账里这几格是这条链路的证据：redis_settles_ok / redis_settles_failed / redis_degraded
 # / redis_settle_commands / rate_limit_capped_rejects（一行一个键，给脚本读）
 kill -TERM <网关 pid>
+
+# S4-05：熔断的两个输入（策略文件，不给 --redis-db 那种命令行开关——判据是策略不是部署事实）
+# deploy/gateway-circuit.json 就是这一份：health 段在 + circuit 段在（circuit 要求 health 同在）
+./build/debug/tests/l7gate_test_upstream --listen 127.0.0.1:18081 --body-bytes 64 &
+./build/debug/tests/l7gate_test_upstream --listen 127.0.0.1:18082 --body-bytes 64 --path-status "/boom:503" &
+./build/debug/l7gate --serve --listen 127.0.0.1:18080 --config deploy/gateway-circuit.json
+for i in $(seq 1 40); do curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:18080/boom; done
+#   ↑ 前 minimum_requests 条里坏的那台被窗口判摘；此后它的体长不再是 64
+kill -TERM <网关 pid>
+# 退出账这几格是熔断的证据（**一行一个键**）：health_t<i>_<addr>_<port>_trips_rate /
+# _half_open_admitted / _half_open_denied / _half_open_recovered / _half_open_reopened，
+# 以及全局的 circuit_half_open_now / health_all_denied_fallback / health_ejected_now
+#（装配熔断时 `health_ejected_now` 数的是"摘除 + 半开"，即不接全量流量的成员数）
 ```
+
+完整的一键复现是 `PRESET=debug bash scripts/smoke-s4-05.sh`（六阶段、**不需要 Docker**）：
+错误率摘除、半开限流与回摘、恢复时间线、进程侧矛盾拒绝、示例配置跑通、生命周期。
 
 `deploy/gateway.json` 是**会被 ctest 读的那一份**（`S3_02_ConfigFile.TheShippedExampleConfigAssembles`），不是文档里的示意图；它跑不跑得通用 `PRESET=debug bash scripts/smoke-s3-02.sh` 验，五阶段全绿才作数。
 
