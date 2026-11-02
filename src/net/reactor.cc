@@ -690,7 +690,8 @@ void Reactor::retry_peer_after_room(const std::shared_ptr<Connection>& conn) {
 }
 
 Reactor::UpstreamPick Reactor::ensure_upstream(
-    const std::shared_ptr<Connection>& downstream, std::uint16_t upstream_target) {
+    const std::shared_ptr<Connection>& downstream, std::uint16_t upstream_target,
+    std::uint16_t retry_target) {
   // 索引目标表之前先认这条下标。`upstream_target` 是 filter 写回来的值（见链调用点），
   // 而这里的失败形态不是"回错一个后端"而是越界读，所以检查必须在索引它的那一处。
   if (upstream_target >= config_.upstream_targets.size()) {
@@ -772,6 +773,12 @@ Reactor::UpstreamPick Reactor::ensure_upstream(
   // 目标标签必须在这里就写：它决定这条上游将来归还进**哪一个**桶。写在 stats 之后、
   // 注册之前，是为了让任何一条"借出去又还回来"的路径都不可能碰到一条没标签的上游。
   upstream->set_upstream_target(upstream_target);
+  // S4-06（ADR-23 第四节）：把"握手没成时这批字节该搬去哪儿"盖在这条新建的连接上。
+  // 盖的时机与上面那行 `set_upstream_target` 同一条理由——它决定这条连接一旦在
+  // `SO_ERROR` 上揭晓失败，还能不能换一台。重放那一路传进来的值是
+  // `Connection::kRetrySpentTarget`（预算已用掉），所以级联在结构上不可能发生。
+  // 借来自池的那条不盖（`kOpen`，connect 失败不可能发生在它身上），既有配对也不动它。
+  upstream->set_retry_target(retry_target);
   upstream->set_state(outcome.status == ConnectStatus::kConnected ? State::kOpen
                                                                   : State::kConnecting);
   // S4-01（ADR-21）：连接超时的登记点。回环上立刻完成的 connect（kConnected）不设——
@@ -1519,7 +1526,8 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
         return ForwardOutcome::kFailed;
       }
       const ForwardStep step = forward_request(downstream, pending->consumed, upgrade,
-                                               close_after, upstream_target);
+                                               close_after, upstream_target,
+                                               info.retry_target);
       if (step == ForwardStep::kBlocked) {
         return ForwardOutcome::kBlocked;  // 上游还没连上、出向满了，或目标要换但手上还有在飞
       }
@@ -1580,19 +1588,56 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
 Reactor::ForwardStep Reactor::forward_request(const std::shared_ptr<Connection>& downstream,
                                               std::size_t request_bytes, bool upgrade,
                                               bool close_after,
-                                              std::uint16_t upstream_target) {
-  UpstreamPick pick = ensure_upstream(downstream, upstream_target);
+                                              std::uint16_t upstream_target,
+                                              std::uint16_t retry_target) {
+  // `target` 是可换的落点：首试 connect 失败并重放成功之后，下面那句"这条上游配的是
+  // 哪一个桶"的比较必须读**换过之后**的值——否则刚拿到的 B 会被认成"桶不对"、
+  // 把这条请求压回下游缓冲，那是挂死不是慢。
+  std::uint16_t target = upstream_target;
+  UpstreamPick pick = ensure_upstream(downstream, target, retry_target);
+  bool after_retry = false;
+
+  // --- S4-06（ADR-23 第三节）：connect 失败先换成员，仍失败才自产表态 --------------
+  // 只认 `kConnectFailed` 这一个归因：`kAllEjected` 是回退之后仍然连不上的最后防线
+  // （ADR-22 第二节）、`kCapacity` 是本地资源（换一台不会多出一个 fd），两者都不重试。
+  // 请求字节此刻**还在下游入向缓冲里**（`finish_request` 在下面才跑），所以第二次调用
+  // 就是首趟那条路径本身——upgrade / close 意图的落点一字不动。
+  if (pick.conn == nullptr && pick.reject_cause == ReplyCause::kConnectFailed &&
+      retry_target < Connection::kRetrySpentTarget && retry_target != upstream_target) {
+    // 落点资格是**纯读**（不消费半开名额、不做读侧迁移 CAS）：摘除中的成员绕不过，
+    // 到期还没被推进的那一台归半开门管。不合格 → 不重试，回到原表态（ADR-23 第五节）。
+    if (retry_eligible(retry_target, monotonic_ms())) {
+      UpstreamPick again = ensure_upstream(downstream, retry_target,
+                                           Connection::kRetrySpentTarget);
+      if (again.conn != nullptr) {
+        stats_.upstream_retries.fetch_add(1, std::memory_order_relaxed);  // 第二次 SYN 发出去了
+        pick = std::move(again);
+        target = retry_target;
+        after_retry = true;
+      } else if (again.reject_cause == ReplyCause::kConnectFailed ||
+                 again.reject_cause == ReplyCause::kAllEjected) {
+        stats_.upstream_retries.fetch_add(1, std::memory_order_relaxed);
+        pick = std::move(again);
+        after_retry = true;  // 归因读第二试那一刻的状态（ADR-22 的归属规则原样沿用）
+      }
+      // 剩下两种（`kCapacity` / 下标越界那种"没有结论"）：第二次 SYN 根本没发出去，
+      // 所以**不计重试、不改归因**，用首试那条 502 表态。这里绝不返回 kBlocked——
+      // 那等于让这条请求等一个不会再来的事件，正是 S2-06 那 71,769 条的形状。
+    }
+  }
+
   if (pick.conn == nullptr) {
     if (pick.reject_status != 0) {
       // S4-02（ADR-22）：拿不到上游已经**确定**（connect 失败 / 被摘尽 / 本地预算耗尽）。
       // 自产一条 502/503 并解链关闭——不再让请求挂在下游缓冲里等一个不会来的事件。
-      fail_pair_with_reply(downstream, pick.reject_status, pick.reject_cause);
+      // S4-06：`after_retry` 是子集不是第四格（一次表态仍然只有一条响应）。
+      fail_pair_with_reply(downstream, pick.reject_status, pick.reject_cause, after_retry);
       return ForwardStep::kReplied;
     }
     return ForwardStep::kBlocked;  // 正在 connect 或目标下标越界；请求还留在下游缓冲里，没丢
   }
   const std::shared_ptr<Connection>& upstream = pick.conn;
-  if (upstream->upstream_target() != upstream_target) {
+  if (upstream->upstream_target() != target) {
     // S3-01（ADR-18 第五节）：**目标要换，但手上还有在飞的请求（或这条配对不干净）**。
     // ensure_upstream 把这个情况表达成"给我的还是旧目标那条"，而不是新造一个返回值——
     // 新造一个就违反了"S1-08 之后 ForwardOutcome 只有三个值、Decision 只有两个值"那条。
@@ -1617,9 +1662,9 @@ Reactor::ForwardStep Reactor::forward_request(const std::shared_ptr<Connection>&
   // S4-01（ADR-21）：响应头超时的登记点（连接已完成的那条路径；还在 kConnecting 的
   // 由 connect 超时管，握手完成时在 on_upstream_event 里换格）。pipeline 里后续请求
   // 的转发会刷新它——头超时的口径是"最近一次转发之后多久没见最终头"。
-  if (upstream->state() == State::kOpen && config_.upstream_head_timeout_ms > 0) {
-    set_upstream_deadline(*upstream, config_.upstream_head_timeout_ms);
-  }
+  // S4-06：这句抽成 `arm_forward_deadline`，因为重放那一路要做**同一件事**，
+  // 两处各写一遍迟早一边改一边没改（漏登记的表现是"这条请求永远不超时"）。
+  arm_forward_deadline(*upstream);
 
   // 意图落在连接上，必须赶在 finish_request 作废 view 之前（此刻 pending 还有效，
   // 而上面一次字节都没动过状态——这个顺序是刻意的，转发失败时意图也不会残留）。
@@ -1639,6 +1684,113 @@ Reactor::ForwardStep Reactor::forward_request(const std::shared_ptr<Connection>&
 
   arm_write(upstream);
   return ForwardStep::kForwarded;
+}
+
+// --- S4-06（ADR-23）：connect 失败的重试 ------------------------------------------
+//
+// 两个"没人决定/不再重试"的编码必须是同一个数。`Connection` 不引 `route/` 的头
+// （连接层不该知道路由常量，见 net/connection.h 顶部那段"它不管什么"），所以这条
+// 等式在这里钉死——它是两个命名空间之间唯一那份抄本的校验。
+static_assert(route::kNoUpstreamTarget == Connection::kNoRetryTarget,
+              "链写回的\"没人决定过\"与连接存下的\"不重试\"必须同值，否则一条没人写的请求"
+              "会被当成有备选而真的换一台");
+
+bool Reactor::retry_eligible(std::uint16_t target, std::int64_t now_ms) const noexcept {
+  // 健康表没装配 = 没有"摘除"这个概念，也就没有可被绕过的东西（与 `candidates_for`
+  // 那句 `health_ == nullptr → 全员候选` 同形）。
+  if (config_.health == nullptr) return true;
+  return config_.health->retry_eligible(target, now_ms);
+}
+
+void Reactor::arm_forward_deadline(const Connection& upstream) noexcept {
+  if (upstream.state() != State::kOpen || config_.upstream_head_timeout_ms <= 0) return;
+  set_upstream_deadline(upstream, config_.upstream_head_timeout_ms);
+}
+
+Reactor::RetryStep Reactor::retry_connect_failure(
+    const std::shared_ptr<Connection>& upstream,
+    const std::shared_ptr<Connection>& downstream) {
+  // 五道门都在**动手之前**：搬完字节再反悔就是丢数据，所以每一步都要么把字节送到、
+  // 要么给出一条完整表态（ADR-23 第四节的顺序纪律）。
+  const std::uint16_t fallback = upstream->retry_target();
+  if (fallback >= Connection::kRetrySpentTarget) return RetryStep::kNotRetried;  // 无备选/预算已用掉
+  if (fallback >= config_.upstream_targets.size()) return RetryStep::kNotRetried;  // 越界不猜
+  if (fallback == upstream->upstream_target()) return RetryStep::kNotRetried;      // 不换台就不叫重试
+  if (!retry_eligible(fallback, monotonic_ms())) return RetryStep::kNotRetried;    // 摘除绕不过、半开不抢名额
+  const std::size_t unsent_requests = upstream->in_flight_requests();
+  const std::size_t byte_len = upstream->outbound_pending();
+  if (unsent_requests == 0 || byte_len == 0) return RetryStep::kNotRetried;  // 没东西可搬
+
+  // 第 1 步：交出**从未发出**的那批字节（转移所有权，不是拷贝，也不新分配）。
+  // 上面 `outbound_pending() > 0` 已经保证这块缓冲存在（同一线程、中间没有人能动它，
+  // ADR-14），所以这里不再判空——为一个结构上不可能的状态写兜底，等于给下一个读者
+  // 留下"这个状态是真的"的错觉。
+  std::unique_ptr<Buffer> bytes = upstream->take_outbound();
+  const std::uint16_t failed_target = upstream->upstream_target();
+  const bool one_shot_pairing = upstream->close_after_response();
+
+  // 第 2、3 步：解链 + 六步关闭 A。先解链是因为 `ensure_upstream` 的"在干净边界才换目标"
+  // 那条判据（ADR-18 第五节）会因为在飞 > 0 把 A 原样还给我——那是给"路由改主意"设计的
+  // 保护，用在重试上是错的：重试不是换目标，是换**配对**。
+  // 先关 A 再取 B，是为了不让一条正在废弃的连接虚占一格 `max_connections`，
+  // 那会把后端的毛病读成 `over_capacity`。
+  upstream->set_peer_fd(kInvalidFd);
+  downstream->set_peer_fd(kInvalidFd);
+  // 配对账必须由这里减：清掉 peer_fd 之后 `close_connection` 读到的 `fd_was_paired`
+  // 是 false，它自己那两条互斥分支都不会减（见它末段）。漏减 = least_conn 把这台后端
+  // 永久读成"更忙"——口径⑦那一族"账只加不减"的形状。
+  note_upstream_unpaired(failed_target);
+  close_connection(upstream, CloseWhy::kDiscardOutbound);  // 出向已空 → 一个字节都没丢
+
+  // 第 4 步：向落点要一条上游。它自己盖的备选是 `kRetrySpentTarget`——预算 1 就落在这
+  // 一行参数上（ADR-23 第二节：结构性事实，不是计数器）。
+  UpstreamPick pick = ensure_upstream(downstream, fallback, Connection::kRetrySpentTarget);
+  // 只有真的发起了第二次网络尝试才计 `upstream_retries`（本地容量挡下 = 没发过 SYN）。
+  const bool attempted =
+      pick.conn != nullptr || pick.reject_cause == ReplyCause::kConnectFailed ||
+      pick.reject_cause == ReplyCause::kAllEjected;
+  if (attempted) {
+    stats_.upstream_retries.fetch_add(static_cast<std::uint64_t>(unsent_requests),
+                                      std::memory_order_relaxed);
+  }
+  if (pick.conn == nullptr) {
+    if (attempted) {
+      fail_pair_with_reply(downstream, pick.reject_status, pick.reject_cause,
+                           /*after_retry=*/true);
+      return RetryStep::kReplied;
+    }
+    // 本地预算挡下（或结构上到不了的"没有结论"）：不计重试、不换归因，但**必须给一条
+    // 完整表态**——字节已经在手上、A 已经关了，既不许丢也不许挂死。
+    fail_pair_with_reply(downstream, pick.reject_status != 0 ? pick.reject_status : 503,
+                         pick.reject_cause != ReplyCause::kNone ? pick.reject_cause
+                                                                : ReplyCause::kCapacity);
+    return RetryStep::kReplied;
+  }
+
+  // 第 5 步：整块排进新上游 + 把三条账跟着字节搬过去。
+  const std::shared_ptr<Connection>& next = pick.conn;
+  if (!next->queue_bytes(bytes->readable_data(), byte_len)) {
+    // 装不下：判据是同一条 256 KiB 出向水位，而 A 的出向本来就受它夹着、B 这一刻出向为空
+    // （借来的要求出向空、新建的是空的）→ 端到端不可控注入的边角，照记在 ADR-23 第四节。
+    // 处置只有一条路：不丢字节，按本地资源表态（`over_capacity` 归因此刻是诚实的）。
+    fail_pair_with_reply(downstream, 503, ReplyCause::kCapacity);
+    return RetryStep::kReplied;
+  }
+  // 在飞计数跟着字节走：少这一步，响应完结时的 `note_response_completed` 会把零夹住，
+  // 而"在飞归零才关"的判据（`Connection: close` 的兑现时机、排水、能不能归还进池）全失真。
+  for (std::size_t i = 0; i < unsent_requests; ++i) next->note_request_forwarded();
+  // 一次性配对的意图也跟着搬：不转的话 `Connection: close` 的后端会被归还进池当热连接复用。
+  if (one_shot_pairing) next->mark_close_after_response();
+  stats_.bytes_down_to_upstream.fetch_add(static_cast<std::uint64_t>(byte_len),
+                                          std::memory_order_relaxed);
+
+  // 第 6 步：限期换格。B 是新建的 `kConnecting` → `ensure_upstream` 已经登记了连接超时；
+  // B 是借来的热连接 → 这里登记响应头超时（与转发主路径共用那一句，不留两份抄本）。
+  arm_forward_deadline(*next);
+
+  // 第 7 步：出向有货就要挂 EPOLLOUT，否则这批字节永远发不出去。
+  arm_write(next);
+  return RetryStep::kReplayed;
 }
 
 // 外壳干的同一件事：泵每消费掉一段上游入向的字节，都可能让可读区回落到恢复线以下。
@@ -1875,7 +2027,7 @@ void Reactor::pump_response_body(const std::shared_ptr<Connection>& upstream) {
 }
 
 void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
-                                   std::uint16_t status, ReplyCause cause) {
+                                   std::uint16_t status, ReplyCause cause, bool after_retry) {
   // 对端已经不在了：没有谁接收这条表态。不排队、**不计数**——
   // gateway_replies_sent 的口径是"进了下游出向缓冲"，写在这个口径上的计数
   // 才是验收能引用的数。入向字节随下面这条 close 一起消失，没有谁欠它响应：
@@ -1927,6 +2079,12 @@ void Reactor::fail_pair_with_reply(const std::shared_ptr<Connection>& downstream
     case ReplyCause::kCapacity:
       stats_.gateway_replies_over_capacity.fetch_add(1, std::memory_order_relaxed);
       break;
+  }
+  // S4-06（ADR-23 第八节）：这条表态之前已经换成员试过。计在同一条口径上
+  // （真的进了下游出向缓冲才算，与上面那几格一致），而且它是**子集**不是第四格：
+  // 同一条表态已经进了 `connect_failed` 或（竞态里的）`all_ejected` 那一格。
+  if (after_retry) {
+    stats_.gateway_replies_after_retry.fetch_add(1, std::memory_order_relaxed);
   }
 
   if (upstream) close_connection(upstream, CloseWhy::kDiscardOutbound);
@@ -2021,12 +2179,23 @@ void Reactor::on_upstream_event(const std::shared_ptr<Connection>& conn, std::ui
         if (pit != connections_.end()) downstream = pit->second;
       }
       if (downstream != nullptr) {
+        // S4-06（ADR-23 第三/四节）：先换成员再试一次——这条连接里的字节是**从未发出**的
+        // （握手没成一个字节都写不出去），所以搬运不是重发，客户端也不会拿到两条响应。
+        // 搬不成（无备选 / 预算已用掉 / 落点不合格）才回到下面那句 ADR-22 的表态。
+        const RetryStep step = retry_connect_failure(conn, downstream);
+        if (step != RetryStep::kNotRetried) return;  // kReplayed：接管了；kReplied：已表态并关完
+        // 走到这里说明这一次**没有**换台再试。但这条连接自己可能就是上一轮换成员重放出来的
+        // （它的备选字段被盖成 `kRetrySpentTarget`）——那条表态仍然是"试过另一台之后"的表态，
+        // 归因不能因为揭晓点换到了异步这一支就丢掉。
+        // 口径注意：这是**配对级**的归因（同一条连接上后来排进的 pipeline 请求也算这一格），
+        // 因为"换过成员"这件事发生在配对上，不是发生在某一条请求上。
+        const bool after_retry = conn->retry_target() == Connection::kRetrySpentTarget;
         // 握手都没成 = 没有任何上游字节到过下游 → 502/503 是这条请求的第一条响应，
         // 不伪造。fail_pair 按丢弃关上游（排着的请求字节永远发不出去）、按 flush
         // 关下游（表态还躺在它的出向里）。
         fail_pair_with_reply(downstream, static_cast<std::uint16_t>(was_ejected ? 503 : 502),
-                             was_ejected ? ReplyCause::kAllEjected
-                                         : ReplyCause::kConnectFailed);
+                             was_ejected ? ReplyCause::kAllEjected : ReplyCause::kConnectFailed,
+                             after_retry);
       } else {
         // 没有下游可表态（它先关了）：只收这条上游，不朝不存在的对端造响应。
         close_connection(conn, CloseWhy::kDiscardOutbound);

@@ -88,6 +88,26 @@ class Connection {
   std::uint16_t upstream_target() const noexcept { return upstream_target_; }
   void set_upstream_target(std::uint16_t target) noexcept { upstream_target_ = target; }
 
+  // --- S4-06（ADR-23 第二/五节）：这条配对的**备选目标** ------------------------
+  // 与 `upstream_target_` 同一条分工：**存一个下标不等于做一次决策**。下标是
+  // `LoadBalanceFilter` 在选中主目标那一刻算好的"候选集里被选者之后的那一位"，
+  // 这里只回答"握手没成时这批字节该搬去哪儿"。读写都只在 owner worker 线程（ADR-14），非原子。
+  //
+  // 这个字段同时是**预算本身**：重放出去的那条新连接被登记成 `kRetrySpentTarget`，
+  // 它再失败时无处可去 → "每条请求最多两次尝试"是**只有一条赋值**的结果，
+  // 不是一个需要有人记得去夹的计数器（ADR-23 第二节：写成 `if (retries < kBudget)`
+  // 的话，"忘了 ++"和"忘了判"都能满足上界，而那条上界照样绿）。
+  // `kRetrySpentTarget` 同时充当表态归因的记号：带这个值的连接失败时，那条自产响应
+  // 记进 `gateway_replies_after_retry`。
+  //
+  // 两个记号值都远大于任何真实下标（真实下标受 fd 预算约束在千位级），而唯一读它的人
+  // 在拿它索引目标表**之前**先比这两个值，所以越界读不可能发生。
+  static constexpr std::uint16_t kNoRetryTarget = 0xffffu;     // 不重试（= route::kNoUpstreamTarget）
+  static constexpr std::uint16_t kRetrySpentTarget = 0xfffeu;  // 备选已用掉（这条是重放出来的）
+
+  std::uint16_t retry_target() const noexcept { return retry_target_; }
+  void set_retry_target(std::uint16_t target) noexcept { retry_target_ = target; }
+
   // --- epoll 兴趣掩码的镜像（S1-07）---------------------------------------
   // 这里存的是**上一次成功交给 epoll_ctl 的那个 events 值**，不是"我认为应该是什么"。
   // 唯一写它的人是 Reactor 的 register_connection / modify_events（都只在成功分支里写），
@@ -137,6 +157,19 @@ class Connection {
   // 这类 API 的名字在说谎，所以修的是接口而不是那行测试。
   bool has_outbound() const noexcept { return outbound_ != nullptr; }
   const Buffer* outbound() const noexcept { return outbound_.get(); }
+
+  // 把出向缓冲**整体交出去**（所有权转移，不是拷贝——那块内存本来就在堆上）。
+  // 只允许用在"这条连接即将被丢弃，而这些字节**从未发出过**"的路径上：S4-06 的重放
+  // （ADR-23 第四节第 1 步）。为什么必须是转移而不是读一份再关：
+  //   ① 多拷一份就意味着在失败路径上一次最多 256 KiB 的额外分配与复制；
+  //   ② 更重要的是**顺序**——字节必须先离开 A 才能关掉 A（关早了字节就没了），
+  //      而 A 又必须在向 B 要连接之前关掉（不关就虚占一格 `max_connections`，
+  //      把后端的毛病读成 `over_capacity`）。转移同时满足这两条。
+  // 取走之后 `outbound_pending()` 回 0、`has_outbound()` 回 false，所以
+  // `close_connection(..., kDiscardOutbound)` 不会再考虑刷它——这条连接"没有货要发"
+  // 这件事此刻是真的，而不是我骗过了检查。
+  std::unique_ptr<Buffer> take_outbound() noexcept { return std::move(outbound_); }
+
   bool has_scratch() const noexcept { return scratch_ != nullptr; }
   const http::ParseScratch* scratch() const noexcept { return scratch_.get(); }
 
@@ -350,6 +383,15 @@ class Connection {
   // 那段注释）是同一条请求的第二次解析动作：parse_calls 要记两次，
   // requests_parsed 只能记一次。少这个标志，要么计数虚高，要么重复解析死循环。
   bool request_parsed_counted_ = false;
+  // S4-06（ADR-23 第五节）：重放落点（见上面那组接口的注释）。放在这两个 bool 之后是
+  // **刻意的**：它们跟在 `in_flight_requests_`（8 对齐）后面，而下一个成员
+  // `header_scan_bytes_` 又要 8 对齐，中间正好空着 6 字节 padding——一个 `uint16_t`
+  // 放进去**不改变 sizeof(Connection)**。涨 8 字节的代价是 B-011 构成表整张重写
+  // （100k 对多 1.6 MiB），所以这条由 `static_assert(sizeof(Connection) == 528)` 裁决，
+  // 不由我口头保证；真装不下，退路是 `Reactor` 侧的 fd→下标表（先例 `upstream_deadlines_`）。
+  // 缺省 `kNoRetryTarget`（不重试）而不是 0：默认值必须读作"没登记备选"——
+  // 与 `upstream_target_` 那个"默认 0、与单目标配置同形"的取舍刻意相反，因为这里 0 是一个合法下标。
+  std::uint16_t retry_target_ = kNoRetryTarget;
   std::size_t header_scan_bytes_ = 0;
   std::size_t parse_calls_ = 0;
 

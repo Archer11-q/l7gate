@@ -237,6 +237,19 @@ bool HealthTable::is_ejected(std::uint16_t target, std::int64_t now_ms) const no
   return state != 0 && !is_half_open(state) && deadline_of(state) > now_ms;
 }
 
+bool HealthTable::retry_eligible(std::uint16_t target, std::int64_t now_ms) const noexcept {
+  // 与 `admit` 同一条"没登记过的槽位按健康读"的前置（越界不猜状态，也保证 S3-04
+  // ever-seen 扩容期间读到新成员时不会因为容量与启用数的差而拒掉一次重试）。
+  if (target >= active_.load(std::memory_order_relaxed)) return true;
+  const std::int64_t state = entries_[target].state_ms.load(std::memory_order_relaxed);
+  if (state == 0) return true;                                    // 健康
+  if (is_half_open(state)) return false;                          // 名额归 admit 管，重试不抢
+  if (deadline_of(state) > now_ms) return false;                  // 摘除冷却中：绕不过
+  // 到期未扫：未装配熔断时这就是健康（S3-03 的读侧口径，`admit` 第 215 行同一句）；
+  // 装配了熔断时它已经归半开门管，推进状态是 `admit`/`sweep_expired` 的活，不是判卷的活。
+  return !policy_.circuit.enabled;
+}
+
 std::size_t HealthTable::max_ejected_count() const noexcept {
   // floor 语义："被摘除容量 ≤ 比例%" 的字面读法。N<比例的小组按它就是"一个都不能摘"，
   // 想要摘除能力的配置该把比例调大，而不是我在这里偷偷放宽成 ceil。

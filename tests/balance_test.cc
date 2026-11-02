@@ -534,3 +534,72 @@ TEST(S3_02_LoadBalanceFilter, HeaderKeyIsCaseInsensitiveAndFallsBackToTarget) {
   ASSERT_EQ(filter.on_request(blank), Decision::kContinue);
   EXPECT_EQ(blank.upstream_target, fallback.upstream_target) << "空值没有退回 target";
 }
+
+// ==================== S4-06：备选目标怎么写（ADR-23 第五节）====================
+//
+// 这三条钉的是同一件事的三个面：备选**不是第二次选择**。所以它既不推游标（主序列
+// 必须还是原来那个）、也不换成员空间（还是那张候选表的顺序）、更不在单成员组里凭空
+// 造出一个落点。第一条如果写成"每条请求都 advance_rr 两次"，轮询分布会变、而网关
+// 看起来完全在正常工作——那是 B-013 那条 98.3% 吸附的兄弟形状（口径⑦一族）。
+TEST(S4_06_RetryTarget, FallbackIsTheNextCandidateAndNeverAdvancesTheCursor) {
+  GroupTable table;
+  const std::vector<std::string> keys = l7gate::testing::endpoint_keys_for(4);
+  // 故意用 {2, 0, 3} 这个登记顺序：候选集的顺序 = 成员表顺序，备选必须是"这一对的下一位"。
+  const std::uint16_t group = make_group(&table, "svc", Balance::kRoundRobin, {2, 0, 3}, keys);
+  auto state = std::make_shared<LbState>(4, table.size());
+  LoadBalanceFilter filter(table, state);
+
+  const std::vector<std::uint16_t> primary{2, 0, 3, 2, 0, 3};
+  const std::vector<std::uint16_t> fallback{0, 3, 2, 0, 3, 2};  // 末位回绕到首位
+  for (std::size_t i = 0; i < primary.size(); ++i) {
+    RequestInfo info = plain_request("/x");
+    info.upstream_group = group;
+    ASSERT_EQ(filter.on_request(info), Decision::kContinue) << i;
+    EXPECT_EQ(info.upstream_target, primary[i])
+        << i << "：游标被推了两次（备选算了一次选择）——轮询分布会跟着变形";
+    EXPECT_EQ(info.retry_target, fallback[i]) << i << "：备选该是候选集里被选者的下一位";
+    EXPECT_NE(info.retry_target, info.upstream_target) << i << "：换一台才叫重试";
+  }
+}
+
+TEST(S4_06_RetryTarget, SingleMemberGroupHasNoFallbackAtAll) {
+  GroupTable table;
+  const std::vector<std::string> keys = l7gate::testing::endpoint_keys_for(2);
+  const std::uint16_t group = make_group(&table, "solo", Balance::kRoundRobin, {1}, keys);
+  auto state = std::make_shared<LbState>(2, table.size());
+  LoadBalanceFilter filter(table, state);
+
+  RequestInfo info = plain_request("/x");
+  info.upstream_group = group;
+  ASSERT_EQ(filter.on_request(info), Decision::kContinue);
+  EXPECT_EQ(info.upstream_target, 1u);
+  EXPECT_EQ(info.retry_target, l7gate::route::kNoUpstreamTarget)
+      << "只有一个候选还写出一个'备选'，等于把同一条请求发给同一台两次";
+}
+
+// 一致哈希组：备选取**候选表顺序**的下一位，不是"环上顺时针的第二个点"。
+// 这条是 ADR-23 第五节那个选择的收据——引入第二种选择算法的代价（多一套环遍历、
+// 同一成员的多个 vnode 还要去重）我拒绝付，因为重试要的是"任何另一台活着的人"。
+TEST(S4_06_RetryTarget, HashGroupFallbackFollowsMemberOrderNotTheRing) {
+  GroupTable table;
+  const std::uint16_t group = make_group(&table, "svc", Balance::kConsistentHash, {0, 1, 2},
+                                         three_keys());
+  const UpstreamGroup* built = group_of(table, group);
+  ASSERT_NE(built, nullptr);
+  auto state = std::make_shared<LbState>(3, table.size());
+  LoadBalanceFilter filter(table, state);
+
+  RequestInfo info = plain_request("/orders/7");
+  info.upstream_group = group;
+  ASSERT_EQ(filter.on_request(info), Decision::kContinue);
+  const std::uint16_t picked = info.upstream_target;
+  EXPECT_EQ(picked, *select_from_ring(*built, "/orders/7")) << "哈希本身的选择被改动了";
+
+  // 同一个 key 换一条连接仍然是同一台，而备选始终是"成员表里的下一位"（末位回绕）。
+  RequestInfo again = plain_request("/orders/7");
+  again.upstream_group = group;
+  ASSERT_EQ(filter.on_request(again), Decision::kContinue);
+  EXPECT_EQ(again.upstream_target, picked) << "同一个 key 该钉在同一台（亲和没坏）";
+  const std::uint16_t expected = static_cast<std::uint16_t>((picked + 1u) % 3u);
+  EXPECT_EQ(again.retry_target, expected) << "备选该是成员顺序的下一位，不是环上的第二个点";
+}

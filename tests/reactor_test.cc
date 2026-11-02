@@ -5796,5 +5796,562 @@ TEST(S4_03_RateLimit, FourWorkersShareOneBucketNotFour) {
   harness.stop_loop();
   harness.shutdown_all();
 }
+
+// ======================= S4-06：connect 失败的重试（ADR-23）=======================
+//
+// 这批用例的地基判据是**成对**的（ADR-12 追加二第八节）：光有"放大倍数 ≤ 预算上界"挡不住
+// "从不重试"的实现，所以每条上界旁边都有一条点名落点的下界。而"上游到底收到几条请求"
+// 这件事由 `TestUpstream` 自报——仪器与被测方各数一遍才互背书（S4-05 那条等式的形状）。
+namespace {
+
+// 两台后端 + 一个组 + catch-all 的装配具。`with_health` 关掉时链上的 `LoadBalanceFilter`
+// 拿空健康表（资格判据退化成"全员合格"，与 `candidates_for` 同形）；打开时由调用方
+// 自己构造 policy 并拿到 `health` 指针，用来读摘除账。
+struct RetryRig {
+  l7gate::route::RouteTable table;
+  l7gate::route::GroupTable groups;
+  std::shared_ptr<l7gate::route::LbState> state;
+  std::shared_ptr<l7gate::route::HealthTable> health;
+  std::uint16_t group = l7gate::route::kNoUpstreamGroup;  // 用例要拿它反查环上的落点
+
+  void install(Harness::Options* options, Harness* harness,
+               const std::vector<std::uint16_t>& members,
+               const std::vector<std::string>& endpoint_keys,
+               l7gate::route::Balance balance,
+               const l7gate::route::HealthPolicy* policy) {
+    group = l7gate::route::kNoUpstreamGroup;
+    std::string why;
+    ASSERT_TRUE(l7gate::testing::add_balanced_group(&groups, "all", balance, members,
+                                                    endpoint_keys, &group, &why))
+        << why;
+    catch_all_to_route_table(&table, group);
+    state = std::make_shared<l7gate::route::LbState>(members.size(), 1);
+    options->config.lb_state = state;  // 必须在 start() 之前（口径⑦那条副本教训）
+    if (policy != nullptr) {
+      health = std::make_shared<l7gate::route::HealthTable>(members.size(), *policy);
+      options->config.health = health;
+    }
+    harness->add_filter(std::make_unique<l7gate::filter::RouteFilter>(table));
+    if (health != nullptr) {
+      harness->add_filter(
+          std::make_unique<l7gate::filter::LoadBalanceFilter>(groups, state, health));
+    } else {
+      harness->add_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(groups, state));
+    }
+  }
+};
+
+std::vector<std::uint16_t> members_upto(std::size_t count) {
+  std::vector<std::uint16_t> members;
+  for (std::size_t i = 0; i < count; ++i) members.push_back(static_cast<std::uint16_t>(i));
+  return members;
+}
+
+std::vector<std::string> keys_for(const std::vector<int>& ports) {
+  std::vector<std::string> keys;
+  for (const int port : ports) keys.push_back("127.0.0.1:" + std::to_string(port));
+  return keys;
+}
+
+void add_target(Harness::Options* options, std::string_view address, int port) {
+  Reactor::Config::Target target;
+  target.address = std::string(address);
+  target.port = static_cast<std::uint16_t>(port);
+  options->config.upstream_targets.push_back(target);
+}
+
+// 一次请求一条新连接的回法：回源失败的表态会关掉配对下游（ADR-22），
+// 所以"多条请求"在这些用例里天然是多条连接。
+std::string one_shot_request(Harness* harness, std::string_view path, std::string* why) {
+  Client c;
+  if (!c.connect_to(harness->port(), why)) return "CONNECT-FAILED";
+  if (!c.write_all(get_request(path))) return "WRITE-FAILED";
+  std::string status;
+  std::string body;
+  if (!c.read_response(&status, &body, why)) return "READ-FAILED";
+  c.close();
+  return status;
+}
+
+}  // namespace
+
+// 一、**首试被拒 → 换一台并被服务**（下界那一半：`retries ≥ 1` 且那条重试真的落到了
+// **另一台**上）。轮询让第 1 条请求去被拒的那台、第 2 条本来就去健康的那台，所以
+// 两条客户端请求应当由健康那台**一条不少地**接走 2 条，而回源失败的表态一条都没有。
+TEST(S4_06_Retry, RefusedFirstMemberIsRetriedOntoTheSecond) {
+  std::string why;
+  TestUpstream alive;
+  ASSERT_TRUE(start_sized_upstream(&alive, 64, &why)) << why;
+  TestUpstream dying;
+  ASSERT_TRUE(start_sized_upstream(&dying, 64, &why)) << why;
+  const int dead_port = dying.port();
+  dying.stop_and_join();  // 端口关掉：connect 必然被拒
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", dead_port);   // 目标 0 = 死的那台
+  add_target(&options, "127.0.0.1", alive.port());  // 目标 1 = 活的
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({dead_port, alive.port()}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  const std::string first = one_shot_request(&harness, "/r1", &why);
+  const std::string second = one_shot_request(&harness, "/r2", &why);
+  EXPECT_EQ(first, "HTTP/1.1 200 OK") << "被拒的那台没能被重试救回来：" << why;
+  EXPECT_EQ(second, "HTTP/1.1 200 OK") << why;
+
+  EXPECT_EQ(stats.load(stats.requests_parsed), 2u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 2u);
+  // 下界（点名落点）：重试发生过一次，而那一条请求最终由**另一台**服务。
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u) << "换成员重试没有发生（上界照样绿，所以要这条）";
+  EXPECT_EQ(alive.requests_served(), 2u) << "健康那台应当接住两条（重试那条 + 本来就该它的那条）";
+  // 上界：一次都没被复制——后端实收 == 客户端请求数。
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 1u) << "两次尝试里只有一次真的失败";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "救回来的请求不该拿到 502";
+  EXPECT_EQ(stats.load(stats.gateway_replies_after_retry), 0u);
+  // 分支签名：异步那一支会先造出连接对象（`upstream_opened` 含那条死配对），
+  // 同步那一支不会。这里只断"没有第三次尝试"，哪一支由上面的数字与落点决定。
+  EXPECT_LE(stats.load(stats.upstream_opened), 2u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  alive.stop_and_join();
+}
+
+// 二、**同步那一支也重试**（ADR-23 第三节的第一个揭晓点）。判据用 `upstream_opened == 0`
+// 钉住"这一支根本没造出连接对象"——不这么写的话，用例过了也不知道过的是哪一支（口径⑮）。
+TEST(S4_06_Retry, SyncConnectFailureRetriesWithoutOpeningAConnection) {
+  int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(9);
+  addr.sin_addr.s_addr = htonl(0xFFFFFFFFu);  // 255.255.255.255 → ENETUNREACH
+  const int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  const int probe_errno = errno;
+  ::close(probe);
+  if (rc == 0 || (rc < 0 && probe_errno == EINPROGRESS)) {
+    GTEST_SKIP() << "255.255.255.255 没有当场失败（rc=" << rc << " errno=" << probe_errno
+                 << "）：环境不产生同步失败，不判";
+  }
+
+  std::string why;
+  TestUpstream alive;
+  ASSERT_TRUE(start_sized_upstream(&alive, 64, &why)) << why;
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "255.255.255.255", 9);
+  add_target(&options, "127.0.0.1", alive.port());
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2),
+              keys_for({9, alive.port()}), l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  EXPECT_EQ(one_shot_request(&harness, "/sync", &why), "HTTP/1.1 200 OK") << why;
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "同步支不该为那条失败的尝试造连接对象";
+  EXPECT_EQ(alive.requests_served(), 1u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  alive.stop_and_join();
+}
+
+// 三、**两台全死**：预算上界的正面形状。每条请求恰好花掉一次重试（`retries == 请求数`，
+// 不是 2 倍——级联重试会把这里顶破），而且**一次表态仍然只有一条**：
+// `gateway_replies_after_retry == gateway_replies_sent == 请求数`。
+TEST(S4_06_Retry, BothMembersDeadSpendExactlyOneRetryAndReplyOnce) {
+  std::string why;
+  TestUpstream first;
+  ASSERT_TRUE(start_sized_upstream(&first, 64, &why)) << why;
+  const int port_a = first.port();
+  first.stop_and_join();
+  TestUpstream second;
+  ASSERT_TRUE(start_sized_upstream(&second, 64, &why)) << why;
+  const int port_b = second.port();
+  second.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", port_a);
+  add_target(&options, "127.0.0.1", port_b);
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({port_a, port_b}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  constexpr int kRequests = 3;
+  for (int i = 0; i < kRequests; ++i) {
+    EXPECT_EQ(one_shot_request(&harness, "/both-dead", &why), "HTTP/1.1 502 Bad Gateway") << i;
+  }
+  // 上界：尝试数 = 请求数 + retries ≤ 2 × 请求数。
+  EXPECT_EQ(stats.load(stats.upstream_retries), static_cast<std::uint64_t>(kRequests))
+      << "要么没重试（下界红），要么级联重试（上界红）";
+  EXPECT_LE(stats.load(stats.upstream_retries), static_cast<std::uint64_t>(kRequests));
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), static_cast<std::uint64_t>(kRequests * 2))
+      << "两次尝试都该有账（ADR-23 第六节：失败样本 ≤ 请求数 ×(1+预算)）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), static_cast<std::uint64_t>(kRequests))
+      << "重试用掉之后仍然只许一条表态";
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), static_cast<std::uint64_t>(kRequests));
+  EXPECT_EQ(stats.load(stats.gateway_replies_after_retry), static_cast<std::uint64_t>(kRequests));
+  EXPECT_LE(stats.load(stats.gateway_replies_after_retry),
+            stats.load(stats.gateway_replies_connect_failed) +
+                stats.load(stats.gateway_replies_all_ejected));
+  // 后端实收 0 条：connect 失败不产生任何"后端执行过"的请求，所以复制与否这条上界
+  // 在这里是 `0 ≤ kRequests` 的平凡式——真正数它的是下面 `FiveXxIsNeverRetried` 那条。
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 四、**5xx 一条都不重发**（防放大真正的那格：后端实收必须恰好等于客户端请求数）。
+// 坏的那台走 `set_path_status_code` 那条分支，而它**另外记一笔**
+// `path_status_responses_served()`（口径⑮：拿 `requests_served()` 数这条分支会恒真）。
+TEST(S4_06_Retry, FiveXxIsNeverRetriedAndBackendsSeeExactlyN) {
+  std::string why;
+  TestUpstream good;
+  TestUpstream bad;
+  ASSERT_TRUE(start_sized_upstream(&good, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&bad, 64, &why)) << why;
+  bad.set_path_status("/boom", 500);  // 前缀只在 start 之前设（它是 std::string，运行中改就是 race）
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", good.port());
+  add_target(&options, "127.0.0.1", bad.port());
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({good.port(), bad.port()}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  constexpr int kRequests = 4;
+  for (int i = 0; i < kRequests; ++i) {
+    // 轮询：偶数条去健康那台、奇数条去回 500 的那台。两条都必须原样是**上游自己的**答案——
+    // 网关既不改写（ADR-22 第四节）也不重发（ADR-23 第一节）。按片段匹配状态行是因为
+    // 夹具那条分支的 reason 文案是 "Probe"，抄进期望值就成了一条会随夹具改动的字符串。
+    const std::string status_line = one_shot_request(&harness, "/boom", &why);
+    const std::string_view want = (i % 2) == 1 ? " 500 " : " 200 ";
+    EXPECT_NE(status_line.find(want), std::string::npos) << i << "：" << status_line;
+  }
+  EXPECT_EQ(stats.load(stats.upstream_retries), 0u) << "5xx 被重发就是一次重复执行";
+  // 后端实收恰好 == 客户端请求数：两台各 2 条，一条不多。
+  EXPECT_EQ(good.requests_served() + bad.path_status_responses_served(),
+            static_cast<std::uint64_t>(kRequests))
+      << "后端看见的请求数超过了客户端发的数——放大就在这格";
+  EXPECT_EQ(bad.path_status_responses_served(), 2u);
+  EXPECT_EQ(good.requests_served(), 2u);
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u) << "上游回了 500，网关不另造表态";
+
+  harness.stop_loop();
+  harness.shutdown_all();
+  good.stop_and_join();
+  bad.stop_and_join();
+}
+
+// 五、**"连上不回字节"不在重试的定义域内**（§12 类 3 那一族的边界证明）：它握手成功，
+// 管它的是响应头限期（ADR-21），落到 504 而不是换一台。这条用例存在的理由很具体——
+// 交接段原来把那一格当成重试的落地对象，而它不是。
+TEST(S4_06_Retry, StalledMemberTimesOutAndIsNotRetried) {
+  std::string why;
+  TestUpstream stalled;
+  TestUpstream alive;
+  ASSERT_TRUE(start_sized_upstream(&stalled, 64, &why)) << why;
+  ASSERT_TRUE(start_sized_upstream(&alive, 64, &why)) << why;
+  stalled.set_stall_reads(true);  // 连上、吃掉请求、不回字节
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_head_timeout_ms = 300;
+  add_target(&options, "127.0.0.1", stalled.port());
+  add_target(&options, "127.0.0.1", alive.port());
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({stalled.port(), alive.port()}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  EXPECT_EQ(one_shot_request(&harness, "/slow", &why), "HTTP/1.1 504 Gateway Timeout")
+      << "卡住的那台应当由响应头限期表态：" << why;
+  EXPECT_EQ(one_shot_request(&harness, "/slow", &why), "HTTP/1.1 200 OK") << why;
+
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_retries), 0u) << "超时不重试（已裁第二条；含连接超时）";
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 0u) << "这一支根本没发生 connect 失败";
+  EXPECT_EQ(alive.requests_served(), 1u);
+  EXPECT_EQ(stalled.requests_served(), 0u);
+
+  stalled.set_stall_reads(false);
+  harness.stop_loop();
+  harness.shutdown_all();
+  stalled.stop_and_join();
+  alive.stop_and_join();
+}
+
+// 六、**全员被摘的回退那一格不重试、503 形状一字不动**（ADR-23 第五节那条"最后防线"的
+// 收据）。max_fails=1、纯被动：前两条请求把两台都送进摘除，之后的请求走候选集回退，
+// 备选也在摘除中 → `retry_eligible` 拒绝 → 不重试、`all_ejected` 那一格继续数。
+TEST(S4_06_Retry, EjectedFallbackSetIsNotARetryTarget) {
+  std::string why;
+  TestUpstream first;
+  ASSERT_TRUE(start_sized_upstream(&first, 64, &why)) << why;
+  const int port_a = first.port();
+  first.stop_and_join();
+  TestUpstream second;
+  ASSERT_TRUE(start_sized_upstream(&second, 64, &why)) << why;
+  const int port_b = second.port();
+  second.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", port_a);
+  add_target(&options, "127.0.0.1", port_b);
+  l7gate::route::HealthPolicy policy;
+  policy.probe_interval_ms = 0;  // 纯被动（S4-05 同一条取证形状）
+  policy.max_fails = 1;
+  policy.fail_timeout_ms = 60'000;
+  policy.max_ejection_percent = 100;
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({port_a, port_b}),
+              l7gate::route::Balance::kRoundRobin, &policy);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+  l7gate::route::HealthTable& health = *rig.health;
+
+  // 第一阶段：两台还都"没被判死"，重试有地方落 → 第 1 条花掉一次重试。
+  EXPECT_EQ(one_shot_request(&harness, "/pre", &why), "HTTP/1.1 502 Bad Gateway") << why;
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u);
+  ASSERT_TRUE(wait_until([&] { return health.ejected_now() == 2u; }, 3000))
+      << "两台都没被摘掉：max_fails=1 的形状不成立";
+
+  // 第二阶段：全员摘除 → 候选集空 → 回退全员 → 备选也在摘除中 → 不许再重试。
+  const std::uint64_t retries_at_ejection = stats.load(stats.upstream_retries);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(one_shot_request(&harness, "/post", &why), "HTTP/1.1 503 Service Unavailable") << i;
+  }
+  EXPECT_EQ(stats.load(stats.upstream_retries), retries_at_ejection)
+      << "重试绕过了摘除——ADR-12 的判死就白记了";
+  EXPECT_EQ(stats.load(stats.gateway_replies_all_ejected), 2u)
+      << "回退之后仍然连不上，503 是最后防线（ADR-22 第二节）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_connect_failed), 1u) << "只有第一阶段那一条";
+  EXPECT_EQ(stats.load(stats.gateway_replies_after_retry), 1u) << "子集关系：after_retry ⊆ 那两格";
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 七、**预算挂在请求上、不挂在连接上**：一条 keep-alive 上 pipeline 三条，全被哈希钉在
+// 那台死成员上（同一配对、同一 `kConnecting` 连接里排着 3 条未发出的请求）→ 握手失败时
+// 三条**一起**搬，`upstream_retries == 3` 而客户端只发了 3 条。
+TEST(S4_06_Retry, PipelinedRequestsReplayAsRequestsNotAsConnections) {
+  std::string why;
+  TestUpstream alive;
+  ASSERT_TRUE(start_sized_upstream(&alive, 64, &why)) << why;
+  TestUpstream dying;
+  ASSERT_TRUE(start_sized_upstream(&dying, 64, &why)) << why;
+  const int dead_port = dying.port();
+  dying.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", dead_port);
+  add_target(&options, "127.0.0.1", alive.port());
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({dead_port, alive.port()}),
+              l7gate::route::Balance::kConsistentHash, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // **path 必须现选，不能写死**：环上的点是按端点键（含内核分配的夹具端口）建的，
+  // 同一个 `/pin` 这一轮可能落在那台死的、下一轮落在活的——写死就成了一枚每轮重掷的硬币
+  // （ADR-19 追加二那条"样本太小"的同族坑，本轮实测就是它：间歇读到 `retries == 0`）。
+  // 这里用 filter 真用的那同一个函数反查，把 key 钉到"落点 = 目标 0（死的那台）"。
+  const l7gate::route::UpstreamGroup* built = rig.groups.group_at(rig.group);
+  ASSERT_NE(built, nullptr);
+  std::string pin;
+  for (int i = 0; i < 200 && pin.empty(); ++i) {
+    const std::string candidate = "/pin-" + std::to_string(i);
+    const auto picked = l7gate::route::select_from_ring(*built, candidate);
+    if (picked.has_value() && *picked == 0) pin = candidate;
+  }
+  ASSERT_FALSE(pin.empty()) << "200 个 key 都没落在死的那台上——环的装配本身可疑";
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  // 三条同一个 path → 一致哈希给同一个成员 → 排进同一条还在握手的上游连接。
+  const std::string triple = get_request(pin) + get_request(pin) + get_request(pin);
+  ASSERT_TRUE(client.write_all(triple)) << why;
+  std::string status;
+  std::string body;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << i << " 条响应没回来：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << i;
+    EXPECT_EQ(body.size(), 64u) << i;
+  }
+  EXPECT_EQ(stats.load(stats.upstream_retries), 3u)
+      << "按连接计会读成 1——预算挂在请求上（ADR-23 第二节）";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 3u);
+  EXPECT_EQ(stats.load(stats.responses_completed), 3u) << "三条响应都按 FIFO 配回去了";
+  EXPECT_EQ(alive.requests_served(), 3u) << "整块搬运之后健康那台应当收到三条";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 0u);
+
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  alive.stop_and_join();
+}
+
+// 八、**一次性配对的意图跟着字节走**：`Connection: close` 那条请求排在死成员那条未连上的
+// 连接上，重放之后 B 必须继承"回完就关、不进池"的语义。不转的话它会被归还进池当热连接
+// 复用（语义变更，不是性能问题），而这条用例是唯一的收据。
+TEST(S4_06_Retry, CloseIntentTravelsWithTheReplayedBytes) {
+  std::string why;
+  TestUpstream alive;
+  ASSERT_TRUE(start_sized_upstream(&alive, 64, &why)) << why;
+  // **夹具不许自己先断**：它默认看到 `Connection: close` 就把连接关掉，那样一来
+  // "配对有没有被网关自己标成一次性"这件事根本测不出来——上游先走了一步，
+  // 池子那格永远是 0，退化实现也照样绿（口径⑮那条"仪器看不见事件"的第 N 次应验，
+  // 这次看不见的是**网关自己的**决定）。
+  alive.set_ignore_close_header(true);
+  TestUpstream dying;
+  ASSERT_TRUE(start_sized_upstream(&dying, 64, &why)) << why;
+  const int dead_port = dying.port();
+  dying.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "127.0.0.1", dead_port);
+  add_target(&options, "127.0.0.1", alive.port());
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({dead_port, alive.port()}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(
+      "GET /once HTTP/1.1\r\nHost: gateway.test\r\nConnection: close\r\n\r\n"))
+      << why;
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK");
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u);
+  EXPECT_EQ(stats.load(stats.close_headers_honored), 1u) << "重放不该把同一条意图计两次";
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.live_connections) == 0u; }, 3000))
+      << "close 之后配对没收干净";
+  EXPECT_EQ(stats.load(stats.pool_returns), 0u) << "一次性配对被归还进池了——语义变了";
+  client.close();
+
+  harness.stop_loop();
+  EXPECT_EQ(harness.reactor()->pool_idle_count(), 0u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), stats.load(stats.connections_destructed));
+  harness.shutdown_all();
+  alive.stop_and_join();
+}
+
+// 九、**重放之后限期仍然管得住**（ADR-23 第四节第 6 步：在飞计数必须跟着字节走）。
+// 落点那台是"连上但不回字节"的，请求排进去之后只有响应头限期能让它表态；
+// 而那句登记写在"这条连接手上还有在飞请求"的条件里——**在飞计数没搬过来，
+// 限期就永远不登记**，客户端挂死到测试超时。这条用例是那一步唯一的收据
+// （阳性验证第一版里它就是 0 红：前面几条用例的形状刚好都让响应先回来了，看不出限期没挂上）。
+TEST(S4_06_Retry, ReplayedRequestsStillAnswerToTheHeadTimeout) {
+  std::string why;
+  TestUpstream stalled;
+  ASSERT_TRUE(start_sized_upstream(&stalled, 64, &why)) << why;
+  stalled.set_stall_reads(true);  // 连上、吃请求、不回字节
+  TestUpstream dying;
+  ASSERT_TRUE(start_sized_upstream(&dying, 64, &why)) << why;
+  const int dead_port = dying.port();
+  dying.stop_and_join();
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  options.config.upstream_head_timeout_ms = 300;
+  add_target(&options, "127.0.0.1", dead_port);   // 首试：被拒
+  add_target(&options, "127.0.0.1", stalled.port());  // 落点：连上但不回
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({dead_port, stalled.port()}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  // 首试被拒 → 重放到那台卡住的 → 响应头限期应当把它捞回来（504），不是让客户端干等。
+  EXPECT_EQ(one_shot_request(&harness, "/after-replay", &why), "HTTP/1.1 504 Gateway Timeout")
+      << "重放之后限期没生效：在飞计数没跟着字节走：" << why;
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u);
+  EXPECT_EQ(stats.load(stats.upstream_head_timeout), 1u) << "504 来了但不是这一格记的账";
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 1u) << "只有首试那一次是 connect 失败";
+
+  stalled.set_stall_reads(false);
+  harness.stop_loop();
+  harness.shutdown_all();
+  stalled.stop_and_join();
+}
+
+// 十、**同步支的重放也不许留备选**（第二节那条结构性事实的另一半）。
+// 形状刻意做成"首试当场失败（同步）+ 落点稍后失败（异步）"：只有这两个揭晓点**串起来**，
+// 才能看出同步那一支盖的记号有没有生效——单看任何一支都看不出（阳性验证里
+// "同步支不盖记号"这一处第一版就是 0 红，理由就在这）。
+// 级联的话会多出**第三次尝试**：`upstream_opened` 从 1 变 2、`upstream_retries` 从 1 变 2。
+TEST(S4_06_Retry, SyncRetryStampsTheSpentBudgetToo) {
+  int probe = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(9);
+  addr.sin_addr.s_addr = htonl(0xFFFFFFFFu);
+  const int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  const int probe_errno = errno;
+  ::close(probe);
+  if (rc == 0 || (rc < 0 && probe_errno == EINPROGRESS)) {
+    GTEST_SKIP() << "255.255.255.255 没有当场失败（rc=" << rc << " errno=" << probe_errno
+                 << "）：环境不产生同步失败，这一支不判";
+  }
+
+  std::string why;
+  TestUpstream dying;
+  ASSERT_TRUE(start_sized_upstream(&dying, 64, &why)) << why;
+  const int dead_port = dying.port();
+  dying.stop_and_join();  // 落点：端口关掉 → 异步被拒（ECONNREFUSED 经 SO_ERROR 揭晓）
+
+  Harness harness;
+  Harness::Options options = default_options();
+  options.with_upstream = false;
+  add_target(&options, "255.255.255.255", 9);        // 首试：同步失败，不造连接对象
+  add_target(&options, "127.0.0.1", dead_port);      // 落点：异步失败，会造连接对象
+  RetryRig rig;
+  rig.install(&options, &harness, members_upto(2), keys_for({9, dead_port}),
+              l7gate::route::Balance::kRoundRobin, nullptr);
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  EXPECT_EQ(one_shot_request(&harness, "/sync-then-async", &why), "HTTP/1.1 502 Bad Gateway") << why;
+  EXPECT_EQ(stats.load(stats.upstream_retries), 1u) << "预算 1 失守：重放那一次还留着备选";
+  EXPECT_EQ(stats.load(stats.upstream_connect_failed), 2u) << "两次尝试各一账，不多不少";
+  EXPECT_EQ(stats.load(stats.upstream_opened), 1u) << "只有落点那一次造了连接对象（第三次尝试=级联）";
+  EXPECT_EQ(stats.load(stats.gateway_replies_sent), 1u) << "一次表态";
+  EXPECT_EQ(stats.load(stats.gateway_replies_after_retry), 1u);
+
+  harness.stop_loop();
+  harness.shutdown_all();
+}
 }  // namespace l7gate::net
 

@@ -12,7 +12,8 @@
 namespace l7gate::filter {
 
 // 负载均衡 filter（S3-02，ADR-19 第三条）——链上的**第二环**：读 `RequestInfo::upstream_group`，
-// 写 `RequestInfo::upstream_target`。
+// 写 `RequestInfo::upstream_target`；S4-06（ADR-23 第五节）起还写 `RequestInfo::retry_target`
+// =候选集里被选者之后的那一位（**不推游标**，所以它不是第二次选择，只是一个下标）。
 //
 // 为什么它与 `RouteFilter` 是两个 filter 而不是一个：路由是纯函数（给定表与 URI，答案唯一），
 // 均衡**天生有状态**（轮询游标、每后端的配对数、一致性哈希环）。合成一环就等于把状态塞进

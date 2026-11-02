@@ -43,7 +43,8 @@ enum class Decision : std::uint8_t {
 // 参数为什么不再是 const：链需要一个**写通道**——路由要改目的地，S4 的限流要带状态码。
 // 我选择去掉 const 而不是另造一个出参结构体，因为那样链就有两个通信通道（返回值 + 出参），
 // 而这两个通道在 S4 会开始互相说不同的话（`kStop` 了却还带着一个 target）。写面就是下面
-// 那两个 `uint16_t`，读面那四个 view 照旧只读；这个对象每次调用在栈上现造，没有生命周期风险。
+// 那几个 `uint16_t`（S4-06 起三个：主目标、备选、表态码），读面那四个 view 照旧只读；
+// 这个对象每次调用在栈上现造，没有生命周期风险。
 struct RequestInfo {
   std::string_view method;
   std::string_view target;
@@ -60,6 +61,14 @@ struct RequestInfo {
   // 默认目标。**这条就是"没装路由/均衡 filter 时行为逐字节等于 S2"的实现位置**：
   // 缺了它，空链那一臂就变成"每条请求都必须有 filter 表态"。
   std::uint16_t upstream_target = route::kNoUpstreamTarget;
+  // S4-06（ADR-23 第五节）：**备选目标**——首试 connect 失败时换到哪一台。
+  // 它不是第二次选择：`LoadBalanceFilter` 在选中主目标那一刻顺手记下"候选集里被选者之后的
+  // 那一位"，**不调 `advance_rr`**（推游标就会让每条请求推进两次，轮询分布与 B-013 的
+  // 成本对照全部变形）。为什么不在失败那一刻重选：重选要读候选集，而候选集住在这一环
+  // 手里（它才知道组、才有本 worker 的游标）——把那套东西抄进 `Reactor` 就是第二份真相。
+  // `route::kNoUpstreamTarget` 读作"不重试"：单成员组、半开被钉的那一条、
+  // 没装路由/均衡 filter 的路径（ADR-17 候选 A 是容量手段不是候选集）全都是这个值。
+  std::uint16_t retry_target = route::kNoUpstreamTarget;
   // 拒这条请求时回什么状态码。0 = 不表态，保持 S1-08 的行为（字节留在原地、连接不关、
   // 一条响应都不发）；非 0 走 S1-06 已有的 `fail_pair_with_reply()` 那条路。
   // 取值必须是 `http::gateway_error_reply()` 那张表里有货的数字。写一个表里没有的数会
@@ -85,7 +94,9 @@ class RequestFilter {
   // **不许抛异常**：链的 run 是 noexcept 的，抛出来就是 std::terminate。
   // 单线程事件循环里没有"捕获 filter 的异常继续跑"这条路——那条路会把一条请求
   // 停在半处理状态，比当场停下更难查。要拒绝请返回 Decision::kStop。
-  // `info` 可写，但**只许写 `upstream_target` / `reject_status` 那两个数字**（读面是借的）。
+  // `info` 可写，但**只许写 `upstream_target` / `retry_target` / `reject_status` 那三个数字**
+  // （读面是借的）。S4-06 把 `retry_target` 加进来时改的是这一句，不是只在结构体里加字段——
+  // 留着"那两个数字"的旧说就等于留一份说谎的注释。
   virtual Decision on_request(RequestInfo& info) = 0;
 };
 

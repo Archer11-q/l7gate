@@ -306,6 +306,9 @@ class Reactor {
   // 由本函数决定落到哪条连接、何时置 kClosing。判定不碰字节：转发出去的仍是原始请求。
   // `upstream_target` 是链调用点读回来的那个下标（S3-01，ADR-18）：filter 没表态时
   // 它已经被换成 `config_.default_target`，所以本函数以下只认"这就是要去的桶"。
+  // `retry_target`（S4-06，ADR-23 第三节）是同一处读回来的**备选**下标：首试 connect 失败时
+  // 先换它试一次，仍失败才走到那句自产表态。`Connection::kNoRetryTarget` = 不重试
+  // （没装候选集、单成员组、半开被钉的那一条，全都是这个值）。
   enum class ForwardStep : std::uint8_t {
     kForwarded,
     kBlocked,
@@ -313,7 +316,7 @@ class Reactor {
   };
   ForwardStep forward_request(const std::shared_ptr<Connection>& downstream,
                               std::size_t request_bytes, bool upgrade, bool close_after,
-                              std::uint16_t upstream_target);
+                              std::uint16_t upstream_target, std::uint16_t retry_target);
   // 响应语义泵（S1-06）：上游入向缓冲里的字节按"当前响应的阶段"过一遍框架判定
   // （http/response_framing 的纯函数），然后透传——头整块排（半个头排出去就是把
   // 畸形喂给客户端），body 按框架边界拆散排（截断的权力在框架知识，不在这条泵）。
@@ -340,8 +343,13 @@ class Reactor {
     kAllEjected,
     kCapacity,
   };
+  // `after_retry`（S4-06，ADR-23 第八节）：这条表态之前已经换成员试过。它与上面四格
+  // **不是互斥关系而是子集关系**——一条 after_retry 的表态同时进 `kConnectFailed`
+  // （或竞态里的 `kAllEjected`）那一格，所以可断言的是
+  // `gateway_replies_after_retry ≤ connect_failed + all_ejected`，不是五个互斥格。
   void fail_pair_with_reply(const std::shared_ptr<Connection>& downstream,
-                            std::uint16_t status, ReplyCause cause = ReplyCause::kNone);
+                            std::uint16_t status, ReplyCause cause = ReplyCause::kNone,
+                            bool after_retry = false);
 
   // 隧道泵（S1-05）：不解析、不改写、不重新分帧，把 src 入向缓冲里的全部可读
   // 字节整块搬进 dst 的出向缓冲。装不下（出向水位）就一个字节都不搬——和请求侧
@@ -394,8 +402,30 @@ class Reactor {
     std::uint16_t reject_status = 0;  // 非 0 = 自产响应状态码（502/503）
     ReplyCause reject_cause = ReplyCause::kNone;
   };
+  // `retry_target`（S4-06，ADR-23 第四节）盖在**新建**的那条上游上：它此刻是
+  // `kConnecting`，握手结果要在 EPOLLOUT + SO_ERROR 那一次才揭晓，而揭晓时人已经不在这个
+  // 调用栈里了——所以"换哪一台"必须跟着这条连接存下来（存下标不等于做决策，1.23 那句话）。
+  // 借来自池的那条不盖：它是 `kOpen`，connect 失败在结构上不可能发生在它身上。
   UpstreamPick ensure_upstream(const std::shared_ptr<Connection>& downstream,
-                               std::uint16_t upstream_target);
+                               std::uint16_t upstream_target, std::uint16_t retry_target);
+
+  // --- S4-06（ADR-23 第四节）：异步 connect 失败的重放 --------------------------
+  // 三个返回值对应"这一支走到哪儿了"，调用方（`on_upstream_event` 的 SO_ERROR 分支）据此
+  // 决定还要不要走 ADR-22 那句原样表态：
+  //   kReplayed —— 未发出的字节已整体搬给备选成员，那条配对接管了这批请求；
+  //   kReplied  —— 换成员试了、当场也没连上，**自产响应已在本函数里发出**（不重复表态）；
+  //   kNotRetried —— 无备选 / 预算已用掉 / 落点不合格 / 没有未发出的字节 / 下标越界，
+  //                调用方回到 ADR-22 的原路径（这条分支绝不能变成"什么都不做"，
+  //                否则请求就又挂回下游缓冲里了——那是 S2-06 那 71,769 条的形状）。
+  enum class RetryStep : std::uint8_t { kReplayed, kReplied, kNotRetried };
+  RetryStep retry_connect_failure(const std::shared_ptr<Connection>& upstream,
+                                  const std::shared_ptr<Connection>& downstream);
+  // 落点资格：`config_.health` 为空 = 全员合格（与 `candidates_for` 的
+  // "健康检查未装配 → 全员候选"同形）；否则走 `HealthTable::retry_eligible`（纯读）。
+  bool retry_eligible(std::uint16_t target, std::int64_t now_ms) const noexcept;
+  // 请求字节排进上游之后的限期登记（S4-01 那格）。转发主路径与重放路径**共用这一句**：
+  // 两处各写一遍迟早一边改一边没改，而漏登记那一格的表现是"这条请求永远不超时"。
+  void arm_forward_deadline(const Connection& upstream) noexcept;
 
   // --- 上游连接池（S2-02，ADR-15；分桶见 ADR-15 追加节）：借 / 还 / 淘汰 ---------
   // 池是**每 worker 一份**、只被本循环线程碰的按目标分桶的空闲热上游表，所以全程无锁

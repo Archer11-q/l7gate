@@ -176,6 +176,18 @@ class HealthTable {
   // 主动放进去的探测，它失败就是普通的 502。
   bool is_ejected(std::uint16_t target, std::int64_t now_ms) const noexcept;
 
+  // S4-06（ADR-23 第五节）：**重放落点的资格**。与 `admit` 回答的是同一个问题
+  // （"这一台现在能接请求吗"），但它是**纯读**：不消费半开的探测名额、不做"到期未扫
+  // 顺手进半开"的那次 CAS 迁移。为什么不复用 `admit`：
+  //   ① 名额是恢复机的账（`half_open_admitted/denied` 只由均衡那一处决定），一条被重放的
+  //      业务请求去占它，S4-05 刚钉住的那套配对断言就多了个没人数的入口；
+  //   ② 重试只想知道"能不能落"，不想替循环推进状态——推进留给 `admit` 与 `sweep_expired`，
+  //      否则同一个迁移有了两个发起者，正是 1.25 那条"记账点少是刻意的"要避免的事。
+  // 取值口径与 `admit`/`is_ejected` 逐字对齐：健康 ✓；摘除中 ✗；半开 ✗（不管有没有名额）；
+  // **到期未扫**：未装配熔断时按健康算（S3-03 的读侧原口径），装配熔断时 ✗——
+  // 那一台已经归半开门管了，我不动它的门。
+  bool retry_eligible(std::uint16_t target, std::int64_t now_ms) const noexcept;
+
   // 安全阀：可摘除上限 = floor(成员数 × max_ejection_percent / 100)。
   std::size_t max_ejected_count() const noexcept;
 

@@ -134,6 +134,26 @@ Decision LoadBalanceFilter::on_request(RequestInfo& info) {
     return Decision::kStop;
   }
   info.upstream_target = *picked;
+  // S4-06（ADR-23 第五节）：备选 = **候选集里被选者之后的那一位**，n ≥ 2 才有。
+  // 三条刻意的性质：
+  //   ① **不调 `advance_rr`**——备选不是第二次选择，推游标等于每条请求推进两次，
+  //      轮询分布与 B-013 那张成本对照全部变形，而它看起来完全在正常工作（口径⑦那一族）；
+  //   ② 一致哈希也取**表顺序**的下一位，不引入"环上第二个点"那第二种选择算法——
+  //      重试要的是"任何另一台活着的人"，不是"哈希意义上的第二优选"。
+  //      代价写在 ADR-23 第五节：这一条请求打破了 `key → 成员` 的亲和；
+  //   ③ `candidates.size() == 1` 就是 `kNoUpstreamTarget`（不重试）。半开被钉的那一条
+  //      走的正是这一格（上面 `kProbeSlot` 分支返回只含一人的候选集）：**探测请求不许换台**，
+  //      否则等于用别人的答案替这次探测结案，ADR-12 追加二第二节第 3 条那套证据链就断了。
+  // 全员被摘回退那一格会算出一个备选，但落点资格（`retry_eligible`）在搬运那一刻把它拒掉，
+  // 所以 `gateway_replies_all_ejected` 的形状逐字节不变——那是 ADR-22 第二节的最后防线。
+  info.retry_target = route::kNoUpstreamTarget;
+  if (candidates.size() >= 2) {
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      if (candidates[i] != *picked) continue;
+      info.retry_target = candidates[(i + 1) % candidates.size()];
+      break;
+    }
+  }
   return Decision::kContinue;
 }
 

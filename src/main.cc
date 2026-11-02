@@ -304,6 +304,12 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
       static_cast<long long>(stats.load(stats.gateway_replies_all_ejected)));
   put("gateway_replies_over_capacity",
       static_cast<long long>(stats.load(stats.gateway_replies_over_capacity)));
+  // S4-06（ADR-23 第八节）：重试防放大的两格。一行一个键（口径⑭(b)）。
+  // `upstream_retries` 是按**请求**计的重放条数（放大上界的分子），
+  // `gateway_replies_after_retry` 是"换成员试过之后仍然表态"的那部分（子集不是第四格）。
+  put("upstream_retries", static_cast<long long>(stats.load(stats.upstream_retries)));
+  put("gateway_replies_after_retry",
+      static_cast<long long>(stats.load(stats.gateway_replies_after_retry)));
   put("upstream_truncated_before_head",
       static_cast<long long>(stats.load(stats.upstream_truncated_before_head)));
   put("upstream_truncated_in_body",

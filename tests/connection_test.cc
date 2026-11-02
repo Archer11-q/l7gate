@@ -858,4 +858,39 @@ TEST(S3_01_ConnectionLayout, TargetLabelFitsInTheExistingPadding) {
   EXPECT_EQ(conn.upstream_target(), 0xffffu);
 }
 
+// S4-06（ADR-23 第五节）：重试落点那个下标也必须落在**既有空位**里，理由与上面那条
+// 一模一样（B-011 把 `Connection`×2 = 1,056 B 钉进了 17,861 B/对）。这条断言的分量
+// 不在"对象没变大"这句抱怨，而在一张已经进档的构成表会不会被重写。
+// 另外两条是这个字段的语义钉子：默认必须读作"不重试"（0 在这里是一个合法下标，
+// 与 `upstream_target_` 那个"默认 0 与单目标同形"的取舍刻意相反），以及两个记号值
+// 都大于任何真实下标——唯一读它的人在拿它索引目标表之前先比这两个值。
+TEST(S4_06_ConnectionLayout, RetryLabelFitsAndTakeOutboundHandsOverTheBytes) {
+  static_assert(sizeof(Connection) == 528,
+                "S4-06 的落点标签必须落在 in_flight_requests_ 之后那两个 bool 的空位里");
+  EXPECT_EQ(sizeof(Connection), 528u);
+  static_assert(Connection::kNoRetryTarget == 0xffffu, "不重试的记号 = uint16 满值");
+  static_assert(Connection::kRetrySpentTarget == 0xfffeu, "预算用掉的记号必须也越出真实下标空间");
+
+  PipePair pipe;
+  ASSERT_TRUE(pipe.ok());
+  ReactorStats stats;
+  Connection conn(pipe.take_read_end(), Connection::Role::kUpstream, default_config(), stats);
+
+  EXPECT_EQ(conn.retry_target(), Connection::kNoRetryTarget) << "默认值必须读作\"不重试\"";
+  conn.set_retry_target(3);
+  EXPECT_EQ(conn.retry_target(), 3u);
+  conn.set_retry_target(Connection::kRetrySpentTarget);
+  EXPECT_EQ(conn.retry_target(), Connection::kRetrySpentTarget);
+
+  // `take_outbound()` 是整体移交，不是读一份：重放路径靠它做到"字节先离开 A、
+  // A 再被关掉、然后才向 B 要连接"这个顺序（ADR-23 第四节第 1/3 步）。
+  ASSERT_TRUE(conn.queue_bytes("GET /x HTTP/1.1\r\n\r\n", 20));
+  EXPECT_EQ(conn.outbound_pending(), 20u);
+  std::unique_ptr<Buffer> handed = conn.take_outbound();
+  ASSERT_NE(handed, nullptr);
+  EXPECT_EQ(handed->readable_bytes(), 20u);
+  EXPECT_EQ(conn.outbound_pending(), 0u) << "交出去之后\"没有货要发\"必须是真的，不是骗过检查";
+  EXPECT_FALSE(conn.has_outbound());
+}
+
 }  // namespace

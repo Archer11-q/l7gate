@@ -767,3 +767,42 @@ TEST(S4_05_Candidates, AllHalfOpenExhaustedFallsBackAndCountsIt) {
   EXPECT_LT(picked[2], 2u) << "全员预算耗尽也必须有个落点（回退全员）";
   EXPECT_EQ(health->all_denied_fallbacks(), 1u);
 }
+
+// ==================== S4-06：重放落点的资格（ADR-23 第五节）====================
+//
+// 这张表的钉子有两层：一层是"谁能当落点"，另一层是**这个问句不许改变任何东西**——
+// 半开的名额是恢复机的账（`half_open_admitted/denied` 只该由 `admit` 一处决定），
+// 重试读一次就吃掉一个名额的话，S4-05 刚钉住的那套配对断言就多了一个没人数的入口。
+// 所以最后一段是"读 50 次之后门仍然发得出名额"，不是又一行 bool。
+TEST(S4_06_RetryEligible, ReadsStateButNeverTouchesTheGate) {
+  // 一、未装配熔断那一台：健康 ✓、摘除中 ✗、到期 = 健康（S3-03 的读侧原口径）。
+  HealthTable plain(2, policy_with(/*max_fails=*/1, /*fail_timeout_ms=*/1000, /*percent=*/100));
+  EXPECT_TRUE(plain.retry_eligible(0, 500)) << "健康的成员必须是合格落点";
+  EXPECT_EQ(plain.note_failure(0, 500, 0), FailureVerdict::kEjected);
+  EXPECT_FALSE(plain.retry_eligible(0, 900)) << "摘除中的成员被重试绕过 = ADR-12 白判死";
+  EXPECT_TRUE(plain.retry_eligible(1, 900)) << "另一台还活着，它当然能接";
+  EXPECT_TRUE(plain.retry_eligible(0, 1600)) << "未装配熔断时到期就是健康（`admit` 同一句口径）";
+  EXPECT_TRUE(plain.retry_eligible(9, 0)) << "没登记过的槽位按健康读（与 admit 的前置同形）";
+
+  // 二、装配熔断那一台：到期归半开门管，重试不预支它。
+  HealthTable gated(1, gate_policy(/*max_fails=*/1, /*fail_timeout_ms=*/1000,
+                                   /*half_open_requests=*/2, /*half_open_successes=*/1));
+  EXPECT_EQ(gated.note_failure(0, 1000, 0), FailureVerdict::kEjected);
+  EXPECT_FALSE(gated.retry_eligible(0, 1500)) << "摘除期内";
+  EXPECT_FALSE(gated.retry_eligible(0, 2500))
+      << "熔断装配时到期那台已经归半开门管，重试不许绕过门去预支名额";
+
+  // 三、**纯读**：把这台推进半开（走 `sweep_expired`，它自己不吃名额），
+  // 读 50 次资格，放行的账一条都不许多，而门仍然发得出名额。
+  ASSERT_EQ(gated.sweep_expired(2500), 1u) << "到期该由 sweep 推进半开";
+  ASSERT_TRUE(gated.snapshot(0).half_open) << "推进的目标状态是半开，不是全量";
+  EXPECT_FALSE(gated.retry_eligible(0, 2600)) << "半开（哪怕还有名额）不是合格落点";
+  for (int i = 0; i < 50; ++i) (void)gated.retry_eligible(0, 2600 + i);
+  EXPECT_EQ(gated.snapshot(0).half_open_admitted_total, 0u)
+      << "资格问句消费了半开名额——它就成了第二个放行入口";
+  EXPECT_EQ(gated.snapshot(0).half_open_denied_total, 0u) << "同上，拒绝那一格也不许被它动";
+  EXPECT_EQ(gated.admit(0, 2700), Admission::kProbeSlot) << "读 50 次之后门必须还发得出名额";
+  EXPECT_EQ(gated.admit(0, 2701), Admission::kProbeSlot);
+  EXPECT_EQ(gated.admit(0, 2702), Admission::kDeny) << "B=2 用完了";
+  EXPECT_FALSE(gated.retry_eligible(0, 2703)) << "预算耗尽的半开同样不合格";
+}

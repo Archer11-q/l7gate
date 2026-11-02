@@ -145,6 +145,13 @@ class TestUpstream {
   //                              去改标志，能做的只有"按启动时间掐一段 stall"）。
   void set_stall_reads(bool on) noexcept { stall_reads_.store(on, std::memory_order_relaxed); }
   void set_stall_reads_first_ms(int ms) noexcept { stall_reads_ms_ = ms; }
+  // S4-06：忽略请求里的 `Connection: close`，**回完就把连接留着**。
+  // 这个旋钮存在的理由不是"想模拟一个不守规矩的后端"，而是：网关把这条配对标成
+  // 一次性（`close_after_response`）是**网关自己的语义**，它不能依赖后端配合才成立。
+  // 默认行为（看到 close 就自己断）会让"一次性意图有没有跟着重放走"这件事
+  // 不可观测——夹具先关了一步，池子那格永远是 0，退化实现也照样绿（口径⑮）。
+  // 只在 `start()` 之前设（它是普通 bool，运行中改就是 data race）。
+  void set_ignore_close_header(bool on) noexcept { ignore_close_header_ = on; }
 
   // 这一档 stall 原本还有**第二个动作**：`clamp_receive_window` / `release_receive_window`
   // 在 stall 期间把每条连接的 SO_RCVBUF 显式设成 4096（内核翻倍记账 → 通告窗口 8 KiB），
@@ -310,7 +317,8 @@ class TestUpstream {
       }
       (void)has_cl;
       if (client.pending.size() < block_end + body_len) return;  // body 还没到齐
-      const bool want_close = lower.find("connection: close") != std::string::npos;
+      const bool want_close =
+          !ignore_close_header_ && lower.find("connection: close") != std::string::npos;
       if (want_close) client.closed_by_close_header = true;
 
       // S1-06 的故障与框架模式。判定口径只看请求 target 里的路径前缀——
@@ -572,6 +580,9 @@ class TestUpstream {
   std::size_t response_body_bytes_ = 64;
   int delay_ms_ = 0;
   bool close_after_response_ = false;
+  // S4-06：见 `set_ignore_close_header` 那段——网关的一次性配对语义必须由网关自己兑现，
+  // 不能靠后端先断连才"看起来对了"。
+  bool ignore_close_header_ = false;
   std::string fixed_body_;
   std::size_t die_after_bytes_ = std::numeric_limits<std::size_t>::max();
   std::size_t stall_after_bytes_ = std::numeric_limits<std::size_t>::max();

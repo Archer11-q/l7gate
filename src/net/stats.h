@@ -124,6 +124,26 @@ struct ReactorStats {
   std::atomic<std::uint64_t> gateway_replies_connect_failed{0};
   std::atomic<std::uint64_t> gateway_replies_all_ejected{0};
   std::atomic<std::uint64_t> gateway_replies_over_capacity{0};
+  // --- S4-06（ADR-23 第八节）：重试防放大的两格账 ---------------------------
+  // 判据是成对写的（ADR-12 追加二第八节那个形状），这两格各自负责一半：
+  //   upstream_retries            —— **发起了第二次尝试**的请求条数。口径三条：
+  //       ① 按**请求**计不按连接计（pipeline 里 N 条一起重放就计 N，预算挂在请求上）；
+  //       ② 计的是"换成员再试"这个动作，所以第二试当场也失败时这一格照加
+  //          （否则"重试了但没救活"那一臂会读成"根本没重试"）；
+  //       ③ 上界判据是 `upstream_retries ≤ 客户端请求数` → 网关尝试数 ≤ 2 × 请求数。
+  //     放大倍数的另一半（"一次都没被复制"）不在网关侧数，读的是**后端自报的实收请求数**
+  //     ——那件事的主语是后端执行了几次，仪器与被测方各数一遍才互背书（同 S4-05 那条等式）。
+  //   gateway_replies_after_retry —— 自产 502/503 里"此前已经换成员试过"的那部分。
+  //     它与上面三格**不是**互斥关系而是子集关系：一条 after_retry 的表态同时计入
+  //     `connect_failed` 或 `all_ejected` 那一格（后者只在竞态里可能：备选在资格判定之后、
+  //     第二试揭晓之前被别的 worker 摘了）。判据 `≤ 两格之和` 因此是可断言的等式关系。
+  //     它存在的理由是把 ADR-22 那句"先重试、仍失败才表态"变成可引用读数，
+  //     而不是只在文档里说"我相信走到了那一支"。
+  //     **归因是配对级不是请求级**：异步那一支的揭晓点是"这条连接握手失败"，而"换过成员"
+  //     这件事本来就发生在配对上——同一条重放连接里后来排进的 pipeline 请求也跟着算这一格。
+  //     少这条注释，下一个读者会以为它与 `upstream_retries` 逐条对得上。
+  std::atomic<std::uint64_t> upstream_retries{0};
+  std::atomic<std::uint64_t> gateway_replies_after_retry{0};
   // 上游在**最终响应头之前**断开/坏头 → 网关回 502 的次数。与下一条互斥可断言：
   // 头已经出去之后只能以 EOF 表态，那记在下面那条，不会重复计入这一条。
   std::atomic<std::uint64_t> upstream_truncated_before_head{0};
