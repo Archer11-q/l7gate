@@ -12,6 +12,7 @@
 #include "net/connection.h"
 #include "net/epoll.h"
 #include "net/fd.h"
+#include "net/loop_observation.h"
 #include "net/stats.h"
 #include "route/balance.h"
 #include "route/health.h"
@@ -199,6 +200,14 @@ class Reactor {
   std::uint64_t epoll_registrations() const noexcept { return epoll_.registrations(); }
   std::uint64_t epoll_unregistrations() const noexcept { return epoll_.unregistrations(); }
   std::uint64_t epoll_modifications() const noexcept { return epoll_.modifications(); }
+
+  // S5-01（ADR-24 第四节）：运行期观测槽。只能在 run() 之前设置——它和 filter 链
+  // 同一条纪律（循环线程按无锁读法碰自己的私有内存，运行中改指针就是 data race）。
+  // **nullptr = 指标面关闭**，这时循环里连抄的动作都没有（验收 ⑤「关掉时代码路径与
+  // 今天逐字节相同」在这一层的具体形态）。`ReactorGroup` 持有槽本体，声明顺序保证
+  // 它比所有 worker 活得长（见 reactor_group.h 那条析构顺序规矩）。
+  void set_loop_observation(LoopObservation* obs) noexcept { snapshot_ = obs; }
+  LoopObservation* loop_observation() const noexcept { return snapshot_; }
 
   // --- filter 链（S1-08）--------------------------------------------------
   // 只能在 run() 之前添加。链在循环线程里被逐条读，没有任何加锁，运行中改它就是一场
@@ -588,6 +597,12 @@ class Reactor {
   UniqueFd listener_;
   UniqueFd wake_fd_;
   int listen_port_ = -1;
+
+  // S5-01：每拍抄进观测槽的目标（nullptr = 不抄）。`observations_at_ms_` 只管
+  // O(n) 那一格的降频，**只被循环线程碰**，所以是普通 int64，不进原子面（与
+  // `drain_first_sweep_done_` 同一条理由）。
+  LoopObservation* snapshot_ = nullptr;
+  std::int64_t observations_at_ms_ = -1;
 
   std::unordered_map<int, std::shared_ptr<Connection>> connections_;
   std::vector<std::shared_ptr<Connection>> retiring_;

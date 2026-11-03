@@ -37,6 +37,7 @@
 #include "filter/rate_limit.h"   // S4-03：链首的限流（ADR-21）
 #include "filter/route_filter.h"  // S3-01：端到端那组用例装的就是它
 #include "lb_fixture.h"           // S3-02：测试侧的组装配（含建环）
+#include "metrics/metrics_server.h"  // S5-01：指标暴露面（端到端那三条用例装的就是它）
 #include "net/reactor.h"
 #include "net/reactor_group.h"
 #include "route/balance.h"
@@ -2037,6 +2038,9 @@ class GroupHarness {
   struct Options {
     ReactorGroup::Config config;
     bool with_upstream = true;
+    // S5-01：打开每 worker 的运行期观测槽。**必须在 start_listen 之前**开（槽地址在
+    // worker 构造时分派），所以它是 start() 的选项而不是事后能补的 setter。
+    bool enable_loop_observation = false;
   };
 
   bool start(const Options& options, std::string* why) {
@@ -2051,6 +2055,7 @@ class GroupHarness {
     }
     config.listen_port = 0;  // 内核选端口：测试并行/重跑都不该撞车
     group_ = std::make_unique<ReactorGroup>(config);
+    if (options.enable_loop_observation) group_->enable_loop_observation();
     int error = 0;
     if (!group_->start_listen(&error)) {
       *why = "start_listen failed errno=" + std::to_string(error);
@@ -6523,5 +6528,263 @@ TEST(S4_06a_PairingAccount, OneReplyDebitsExactlyOnePairing) {
   a.close();
   harness.shutdown_all();
 }
+
+// ============================================================================
+// S5-01（ADR-24）：指标暴露面的端到端三条。
+//
+// 格式那一层（键名清单、`# TYPE`、点号变换）在 `metrics_test.cc` 里测，这里只测
+// **只有真循环 + 真 fd 才能回答的三件事**：抓取会不会混进业务账（验收 ②）、
+// 关掉时循环是否一个字节都不抄（验收 ④/⑤）、坏请求是否进失败账（判据的下界）。
+// ============================================================================
+
+constexpr char kScrapeRequest[] =
+    "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+
+// 把暴露面架起来：端口给 0（内核选，测试并行不撞车），读的是**正在跑的** group。
+// server 在 `start()` 里才构造——`MetricsServer` 拿的是 `Dependencies` 的**副本**，
+// 先把成员版填好再交出去，否则观测面读到的一身空指针（这个坑的形状与
+// 「Reactor 存 config 的副本，构造之后再写等于没写」那条一模一样）。
+struct MetricsOnGroup {
+  std::atomic<std::int64_t> origin{1'000'000};
+  l7gate::metrics::Dependencies deps;
+  std::unique_ptr<l7gate::metrics::MetricsServer> server;
+
+  MetricsOnGroup(ReactorGroup& group, int workers) {
+    deps.base.stats = &group.stats();
+    deps.base.loop = group.loop_observations();
+    deps.base.loop_count = group.loop_observation_count();
+    deps.base.workers = workers;
+    deps.base.expose_workers_key = true;
+    deps.base.started_at_ms = &origin;
+    deps.base.fd_start = 12;
+    deps.base.rss_start_kib = 3'456;
+  }
+
+  bool start(std::string* why) {
+    l7gate::metrics::MetricsServer::Config config;  // 默认 127.0.0.1 + 端口 0
+    server = std::make_unique<l7gate::metrics::MetricsServer>(config, deps);
+    int error = 0;
+    if (!server->start_listen(&error)) {
+      *why = "metrics start_listen 失败 errno=" + std::to_string(error);
+      return false;
+    }
+    if (!server->start(&error)) {
+      *why = "metrics start 失败 errno=" + std::to_string(error);
+      return false;
+    }
+    return true;
+  }
+
+  int port() const noexcept { return server->port(); }
+  std::uint64_t scrapes_ok() const noexcept { return server->scrapes_ok(); }
+  std::uint64_t scrapes_failed() const noexcept { return server->scrapes_failed(); }
+  void stop() {
+    if (server != nullptr) server->stop();
+  }
+};
+
+// 一次抓取，返回 body。status/why 由调用方断言。
+bool scrape(int port, std::string* status, std::string* body, std::string* why) {
+  Client client;
+  if (!client.connect_to(port, why)) return false;
+  if (!client.write_all(kScrapeRequest)) {
+    *why = "抓取请求写不出去";
+    return false;
+  }
+  return client.read_response(status, body, why);
+}
+
+// 验收 ②：**一条业务请求都不许多计**。这不是"写了个 if"，是结构——抓取连接从来
+// 不是 `Connection`，那个唯一的自增点（`connection.cc:184-187`）对它不可达。
+TEST(S5_01_MetricsE2E, ScrapesNeverEnterBusinessCounters) {
+  std::string why;
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(2);
+  options.enable_loop_observation = true;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  MetricsOnGroup metrics(*harness.group(), 2);
+  ASSERT_TRUE(metrics.start(&why)) << why;
+
+  ReactorStats& stats = harness.group()->stats();
+
+  // 一、业务侧一条请求都没打，先抓 5 次。
+  for (int i = 0; i < 5; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(scrape(metrics.port(), &status, &body, &why)) << "第 " << i << " 次：" << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK") << status;
+    // 下界：这条断言存在的意义是"一动不动"也可能只是因为服务根本没起来。
+    EXPECT_NE(body.find("# TYPE requests_parsed counter\n"), std::string::npos) << body.substr(0, 200);
+    EXPECT_NE(body.find("metrics_scrapes_ok "), std::string::npos);
+  }
+  EXPECT_EQ(metrics.scrapes_ok(), 5u) << "五次抓取没有全部成功";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 0u) << "抓取被算成了业务请求";
+  EXPECT_EQ(stats.load(stats.responses_completed), 0u) << "抓取被算成了业务响应";
+  EXPECT_EQ(stats.load(stats.connections_constructed), 0u)
+      << "抓取连接进了 Connection 的生命周期账——它不该是 Connection";
+  EXPECT_EQ(stats.load(stats.downstream_accepted), 0u);
+  EXPECT_EQ(stats.load(stats.live_connections), 0u);
+
+  // 二、放**一条**真业务请求：配对模型（ADR-16）下它是 1 条下游 + 1 条上游 =
+  // **2 个连接对象**，业务计数各 +1。这一格定的是"一条请求应当产生多少账"的基准。
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  ASSERT_TRUE(client.write_all(get_request("/scrape-counting")));
+  std::string status;
+  std::string body;
+  ASSERT_TRUE(client.read_response(&status, &body, &why)) << why;
+  ASSERT_EQ(status, "HTTP/1.1 200 OK") << status;
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == 1u; }, 3000))
+      << why << "（一条业务请求打完，responses_completed 却没到 1：这条用例的对照面没了）";
+  EXPECT_EQ(stats.load(stats.requests_parsed), 1u);
+  EXPECT_EQ(stats.load(stats.connections_constructed), 2u)
+      << "一条配对请求应当恰好是 1 下游 + 1 上游";
+
+  // 三、再抓 3 次：以**抓取之前的账**为基准，断之后一格都没动。
+  // （基准是从读数里取的，不是我推算的——推算的那份正是"2 还是 1"这种口径能出错的地方。）
+  const std::uint64_t parsed_before = stats.load(stats.requests_parsed);
+  const std::uint64_t completed_before = stats.load(stats.responses_completed);
+  const std::uint64_t constructed_before = stats.load(stats.connections_constructed);
+  const std::uint64_t accepted_before = stats.load(stats.downstream_accepted);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(scrape(metrics.port(), &status, &body, &why)) << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK") << status;
+  }
+  EXPECT_EQ(stats.load(stats.requests_parsed), parsed_before) << "抓取被多计了一次请求";
+  EXPECT_EQ(stats.load(stats.responses_completed), completed_before) << "抓取被多计了一次响应";
+  EXPECT_EQ(stats.load(stats.connections_constructed), constructed_before)
+      << "抓取连接进了 Connection 的生命周期账——它不该是 Connection";
+  EXPECT_EQ(stats.load(stats.downstream_accepted), accepted_before) << "抓取占了一次 accept 账";
+  EXPECT_EQ(metrics.scrapes_ok(), 8u);
+
+  // 四、**阳性对照**：同一条字节原样发给业务端口。它会被路由、会进限流键、会被计成
+  // 一次请求——这条臂的作用是把上面那串"一动不动"从"因为结构上不可达"变成
+  // "因为确实可达而没到"，否则一个根本没在服务的实现也能让前三段全绿。
+  const std::uint64_t parsed_before_control = stats.load(stats.requests_parsed);
+  {
+    Client business;
+    ASSERT_TRUE(business.connect_to(harness.port(), &why)) << "对照臂连不上业务端口：" << why;
+    ASSERT_TRUE(business.write_all(kScrapeRequest));
+    std::string control_status;
+    std::string control_body;
+    ASSERT_TRUE(business.read_response(&control_status, &control_body, &why))
+        << "对照臂没拿到响应：" << why;
+  }
+  ASSERT_TRUE(wait_until(
+      [&] { return stats.load(stats.requests_parsed) > parsed_before_control; }, 3000))
+      << "同一条请求从业务端口进来也没被计数——那第三节那串相等什么也没证明";
+  EXPECT_EQ(stats.load(stats.requests_parsed), parsed_before_control + 1u)
+      << "业务端口那条多计了不止一次";
+
+  // 正面证据：观测槽真的在被属主线程抄（否则下面那条"关闭态全 0"只是在比零）。
+  const l7gate::net::LoopObservation* slots = harness.group()->loop_observations();
+  ASSERT_NE(slots, nullptr);
+  ASSERT_TRUE(wait_until(
+      [&] {
+        return slots[0].epoll_registrations.load(std::memory_order_relaxed) +
+                   slots[1].epoll_registrations.load(std::memory_order_relaxed) >
+               0u;
+      },
+      3000))
+      << "循环在跑、连接建过，槽里却还是 0——抄写那一拍没进循环";
+
+  metrics.stop();
+  client.close();
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
+// 验收 ④/⑤ 的那半：**没开指标面时循环一个字节都不抄**。
+// 形态是"槽根本没分配"（`enable_loop_observation()` 没被调），所以这里能断言的是
+// 指针为空 + 求和为全零；下界用 join 之后的权威求和证明这条循环确实干过活。
+TEST(S5_01_MetricsE2E, DisabledSurfaceAllocatesAndWritesNoObservationSlots) {
+  std::string why;
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(2);
+  options.enable_loop_observation = false;  // = `--metrics-port` 没给的形态
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+
+  ReactorStats& stats = harness.group()->stats();
+  constexpr int kRequests = 40;
+  Client client;
+  ASSERT_TRUE(client.connect_to(harness.port(), &why)) << why;
+  for (int i = 0; i < kRequests; ++i) {
+    ASSERT_TRUE(client.write_all(get_request("/off-arm")));
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(client.read_response(&status, &body, &why)) << "第 " << i << " 条：" << why;
+    ASSERT_EQ(status, "HTTP/1.1 200 OK") << status;
+  }
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == kRequests; }, 5000))
+      << why;
+
+  // 关闭态：没有槽，也就没有任何"抄"的动作可能发生。
+  EXPECT_EQ(harness.group()->loop_observations(), nullptr)
+      << "没开指标面却分配了槽——那循环里那次判空就不是恒假的，验收 ⑤ 的'逐字节相同'要重说";
+  EXPECT_EQ(harness.group()->loop_observation_count(), 0u);
+  const auto sum = l7gate::net::sum_loop_observations(harness.group()->loop_observations(),
+                                                      harness.group()->loop_observation_count());
+  EXPECT_EQ(sum.epoll_registrations, 0u);
+  EXPECT_EQ(sum.epoll_modifications, 0u);
+  EXPECT_EQ(sum.read_disarmed_connections, 0u);
+
+  // 下界：**同一批工作**在退出账那侧是有数的，所以上面的全零不是"没干活"。
+  client.close();
+  harness.stop_loop();
+  EXPECT_GT(harness.group()->epoll_registrations(), 0u) << "对照面没了：这条循环一次都没注册";
+  EXPECT_GT(harness.group()->epoll_modifications(), 0u);
+  EXPECT_EQ(stats.load(stats.requests_parsed), static_cast<std::uint64_t>(kRequests));
+  harness.shutdown_all();
+}
+
+// 上界配下界：坏请求进 `metrics_scrapes_failed`，而同一台服务紧接着必须还能给出 200，
+// 否则"失败计数在涨"可能只是"这条路从来不通"。
+TEST(S5_01_MetricsE2E, BadRequestsCountAsFailedScrapesWithoutBreakingTheSurface) {
+  std::string why;
+  GroupHarness harness;
+  GroupHarness::Options options;
+  options.config = group_base_config(2);
+  options.enable_loop_observation = true;
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  MetricsOnGroup metrics(*harness.group(), 2);
+  ASSERT_TRUE(metrics.start(&why)) << why;
+
+  auto raw_request = [&](const char* text, std::string* status) -> bool {
+    Client client;
+    if (!client.connect_to(metrics.port(), &why)) return false;
+    if (!client.write_all(text)) return false;
+    std::string body;
+    return client.read_response(status, &body, &why);
+  };
+
+  std::string status;
+  ASSERT_TRUE(raw_request("POST /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &status))
+      << why;
+  EXPECT_EQ(status, "HTTP/1.1 405 Method Not Allowed") << status;
+  ASSERT_TRUE(raw_request("GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &status))
+      << why;
+  EXPECT_EQ(status, "HTTP/1.1 404 Not Found") << status;
+  ASSERT_TRUE(raw_request("GARBAGE\r\n\r\n", &status)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 400 Bad Request") << status;
+
+  // 三笔都进失败账，而且**是在响应真的发完之后**才进的（不是"决定了要回 4xx"就算）。
+  ASSERT_TRUE(wait_until([&] { return metrics.scrapes_failed() == 3u; }, 3000))
+      << "失败账没跟上：scrapes_failed=" << metrics.scrapes_failed();
+  EXPECT_EQ(metrics.scrapes_ok(), 0u) << "三次都没打出 /metrics，成功账不该动";
+
+  std::string body;
+  ASSERT_TRUE(scrape(metrics.port(), &status, &body, &why)) << why;
+  EXPECT_EQ(status, "HTTP/1.1 200 OK") << "坏请求把暴露面弄死了——那后面所有读数都不可信";
+  EXPECT_EQ(metrics.scrapes_ok(), 1u);
+  EXPECT_EQ(metrics.scrapes_failed(), 3u) << "成功一格不该把失败账抹平";
+
+  metrics.stop();
+  harness.stop_loop();
+  harness.shutdown_all();
+}
+
 }  // namespace l7gate::net
 

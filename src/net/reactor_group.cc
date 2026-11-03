@@ -84,6 +84,13 @@ bool ReactorGroup::start_listen(int* error) noexcept {
   // 它们的 Config 里 listen_* 留空、stop_after_requests 归零（停止由本 group 决定）。
   int n = config_.worker_count;
   if (n < 1) n = 1;
+  // S5-01（ADR-24 第四节）：观测槽必须在下面这个循环**之前**定容。理由不是风格：
+  // 槽地址在 worker 构造时分派下去，之后任何搬家都会让 worker 指向旧地址。开在
+  // start_listen 之后等于把一堆悬垂指针发给循环线程，所以这里没有"运行中再开"这条路。
+  if (observations_enabled_) {
+    loop_obs_ = std::make_unique<LoopObservation[]>(static_cast<std::size_t>(n));
+    loop_obs_count_ = static_cast<std::size_t>(n);
+  }
   for (int i = 0; i < n; ++i) {
     Reactor::Config wc;
     // S3-01（ADR-18）：整张目标表交给每一个 worker，而 `i mod E` 降级成**这个 worker 的
@@ -125,6 +132,9 @@ bool ReactorGroup::start_listen(int* error) noexcept {
       wc.lb_state = lb_state;
     }
     auto worker = std::make_unique<Reactor>(wc, *stats_);
+    // S5-01：没开指标面时这里传 nullptr，worker 的循环里那个判空就此永不进入写分支。
+    worker->set_loop_observation(observations_enabled_ ? &loop_obs_[static_cast<std::size_t>(i)]
+                                                       : nullptr);
     // 两个 filter 都只能在 run() 之前挂（链在循环线程里被逐条读、无锁，S1-08 那条时序纪律）。
     // **S4-03 起链首多一环限流**（ADR-21 第二节第 3 条：限的是"进门"，路由决定"去哪"）。
     // 全部 worker 的 filter 拿同一个 `RateLimiter`——共享的是桶表，不是状态的所有权。

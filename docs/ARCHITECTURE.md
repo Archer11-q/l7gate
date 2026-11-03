@@ -1298,6 +1298,88 @@ TASKS 交接段「已验证」那条里，不写成"一开始就过"）；`smoke
 
 
 
+### 1.34 运行期指标暴露面（S5-01，ADR-24）：把退出账变成可拉取，而仪器不进被测方
+
+**这一节在问什么**：网关的计数过去只在优雅退出时打一行 `[serve] k=v`。契约要的是 Grafana
+上"能亲眼看到 429 与后端被摘除"，那需要一个**运行期可拉取**的面——而它一旦要读的还是同一批数，
+就必然与还在跑的 16 条循环打交道。这一节定的就是那条边界：观测面怎么读到数，而不改变被读的东西。
+
+**先说一个把问题砍掉一半的事实**：`ReactorStats` 从来不是"每 worker 一份"。它是**全 worker 共享
+的一张表、50 个字段全是 `std::atomic<std::uint64_t>`、读写全 `relaxed`**（`reactor_group.h:30`
+原话："并发 fetch_add 安全、聚合计数自动成立"）。所以 77 个退出账键里 **50 个"汇聚"这个说法不成立**
+——采集线程 `group.stats()` 做 relaxed load 就完了。ADR-24 里"原子表直读"那半个选项，落地时是免费的。
+
+麻烦在剩下那一族。`epoll_registrations` / `_unregistrations` / `_modifications` /
+`read_disarmed_connections` 今天是由 `ReactorGroup` 在**全部 worker join 之后**遍历求和的
+（`reactor_group.cc:305-309`），底层是每 worker 各一份的普通 `std::uint64_t`，而 `stats.h:25`
+把规矩写死了：这类非原子观测**只能在循环线程 join 之后读**。这条不是形式——S1-08 在循环还转着的时候
+读了 `epoll_registrations()`，TSan 当场报 data race（第 5 节那条坑）。pull 模型读的时候循环一定在转，
+所以"运行期可读"这一格没有现成路径，必须新造。
+
+**我造的形状：属主线程按拍抄进原子槽，采集线程只读原子。**
+
+| 格 | 谁写 | 什么时候 | 采集侧做什么 |
+|---|---|---|---|
+| `epoll_*` 三键 | **属主 worker 自己**，在循环已有的那一拍（`reactor.cc` 健康 tick 之后） | 每 `wait_timeout_ms`（缺省 200ms）一次，三个 O(1) store | `sum_loop_observations()` 逐槽相加（与 `reactor_group.cc` 那个求和同一个集合） |
+| `read_disarmed_connections` | 同上，但要**遍历注册表** | **每秒至多一次**（`kMetricsSampleEveryMs`） | 同上 |
+| `ReactorStats` 那 50 键 | 各 worker 的 `fetch_add`（原本就有） | 事件发生时 | relaxed load，不求和 |
+| `fd_open_now` / `rss_kib_now` | 采集线程自己读 `/proc` | 每次抓取 | syscall 落在观测者身上，不落 worker |
+
+三处不是风格的选择：
+
+1. **时间源不新增**。那一拍里 `monotonic_ms()` 已经被 `enforce_upstream_timeouts()` 无条件调过一次，
+   节拍判据用的是**同一次**读数。降频判据也不能按拍数：探活开着时一拍只有 20ms
+   （`reactor.cc:294-302` 把 `epoll_wait` 上限夹到探活间隔），按拍遍历等于每秒 50 次 O(连接数) 走查。
+2. **没开指标面时循环里那次判空恒假**（`LoopObservation* snapshot_ = nullptr`），连那次 clock 读数都不发生。
+   槽本身也不分配——`smoke-s5-01.sh` 阶段 1 判的就是"关闭态的退出账键集合与**修前二进制**逐行相同"，
+   对照对象是 `e229ce0` 编出来的 l7gate。
+3. **求和集合不含 accept 侧的 `accept_epoll_`，也不含指标线程自己的 `Epoll`**。这是退出账今天的口径
+   （那个求和只遍历 workers），跟着它走；一旦把观测面自己的 `epoll_ctl` 掺进去，B-018 那把
+   "每请求 `epoll_modifications` = 4.0003–4.0004"的尺就换了定义，历史读数当场不可比。
+
+**为什么不把 `Epoll` 的计数器本身做成原子**：今天 `++modifications_`（`epoll.cc:40-51`）打在属主自己的
+私有内存上，16 条 worker 零争用；做成一张共享原子表等于把 4 次/请求的 RMW 全压到同一根 cache line，
+而那条指令正是 B-018 当尺用的东西——**为了观测去改被观测的指令，方向反了**。所以槽是
+`alignas(64)` 的每 worker 一份（`loop_observation.h`），抄的动作发生在唯一有权读那张注册表的线程上，
+纪律没有被绕过，被改变的只是"谁读"。
+
+**仪器不进被测方，在这一层是五条结构而不是五个 if**（口径第 3 条，先例是 1.25 的探活与 1.31 的错误率窗口）：
+
+- 抓取连接**不是 `Connection`**：`requests_parsed` 那个唯一自增点在 `connection.cc:184-187`，
+  对一条只走 `MetricsServer` 三拍状态机的 socket 结构上不可达。这条被 `S5_01_MetricsE2E` 钉住，
+  用例里还带一条**阳性对照**：同一条字节发给业务端口，`requests_parsed` 确实 +1——
+  否则"一动不动"可能只是因为服务根本没起来。
+- 抓取连接**不占 worker 的 epoll**，所以不动 `epoll_*` 三键。
+- 抓取**不叫醒任何 worker**（不用 `handoff`/`eventfd`），否则 `event_batches` 与 SLO #2 的空闲 CPU 读数变成仪器造的。
+- 抓取**不在桶表锁里做 O(K) 走查**（`kMaxKeys = 16384`，而每条请求都拿那把锁）；
+  `rate_limit_capped_rejects` 因此改走 limiter 级免锁聚合，代价与取证写在 ADR-24 第三节。
+- 仪器自己的三格 `metrics_scrapes_ok/failed/render_bytes` 只由采集线程写，**不进 `ReactorStats`**。
+
+**键集合的三处例外（ADR-24 第五节，都写在文档里而不是藏在实现里）**：`fd_end` / `rss_end_kib`
+是"析构之前"那一次采样，运行期发同名键等于对名字撒谎，故只发 `fd_open_now` / `rss_kib_now`；
+`event_batches` 是 `run()` 的返回值、不是可跨线程求和的量；每目标那一族的键名含点号
+（`health_t0_127.0.0.1_18081_ejections`）在 text format 0.0.4 的名字法则里非法，按 `main.cc:355`
+注释与 `main.cc:759` 示例**本来就写成的**下划线形态发（`.`/`:` → `_`），不改成 label 形态——
+那是把 10×N 个键并成 10 个族，属于对"键名不许改"的结构性重写。`smoke-s5-01.sh` 阶段 2 把这三处
+差集**逐格判死**：多一格少一格都红。
+
+**一处与名字不符的事实（核对 TYPE 时抓到的）**：`trips_rate` 读起来像比率，底层是
+`TargetHealthSnapshot::rate_trips_total` = **被错误率窗口摘掉的次数**（`health.h:119`，
+`health.cc:115` 每次摘除 +1）。键名一个字母不动，TYPE 记 `counter`，并补一条 `# HELP` 把那句话写给读的人
+（`S5_01_MetricsCatalog.TripsRateIsTypedAsTheCountItReallyIs`）。TYPE 全站这一格，是因为
+Grafana 上 `rate()` 对 gauge 静默出空曲线，而那正是契约要"亲眼看到"的东西。
+
+**本轮被现成断言抓到的一次实现错**：`MetricsServer::stop()` 原先顺手关掉自己的监听 fd 与 eventfd，
+而 `fd_end` 是在 `report_stats` 里才采的——`stop()` 按"先停再打账"跑在打账之前，于是
+`fd_start=12 → fd_end=10`。修法与网关那条既有口径一致：**常驻监听 fd 留到析构**，
+`stop()` 只 join 线程并收掉仍在册的抓取连接。这一格没有新写断言——`fd_start == fd_end` 是九条冒烟
+共用的那条生命周期判据，它本来就在那儿等着。
+
+**边界（读数不许超出这一格）**：运行期那族读数最多滞后一拍（200ms），退出账仍是 join 之后的精确和，
+脚本与 SLO 的判定继续走退出账；`read_disarmed_connections` 在 100k 连接拓扑下的遍历成本**本轮没量**，
+只把它降到每秒至多一次——那条账挂在 S5-07。两臂成本的实测在 `docs/BENCHMARK.md` **B-019**。
+
+
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
 - **C++20 + `CMAKE_CXX_EXTENSIONS OFF`**：我要标准 C++20，不是 GNU 扩展下的"看起来能用"。

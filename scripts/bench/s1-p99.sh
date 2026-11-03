@@ -115,8 +115,10 @@ start_upstream() {
 }
 
 start_gateway() {
+  # `GATEWAY_EXTRA_ARGS`（S5-01 加）：默认空 → 命令行与历史档逐字同形，B-001…B-018 的
+  # 可比性不受影响；给了它就往后面追加（指标面那一臂就是这么注入 `--metrics-port` 的）。
   "$GATEWAY" --serve --listen "127.0.0.1:$GATEWAY_PORT" --upstream "127.0.0.1:$UP_PORT" \
-    --workers "$WORKERS" \
+    --workers "$WORKERS" ${GATEWAY_EXTRA_ARGS:-} \
     > "$OUT/gateway.log" 2>&1 &
   G_PID=$!
   if ! wait_for_line "$G_PID" "$OUT/gateway.log" '\[serve\] 监听'; then

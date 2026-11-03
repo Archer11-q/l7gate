@@ -1083,3 +1083,69 @@ ADR-12 追加二第七节交给 S4-07 的四个数，本轮量到的是（矩阵
 **与 `scripts/bench/` 下三份 b018 模板 + 两份驱动/抽取脚本，`src/` 一字未动**
 （`git diff --name-only | grep -c ^src/` = 0）。
 
+
+
+---
+
+## 20. S5-01 的阳性验证，以及本轮仪器侧抓到的自己人（2026-11-03，ADR-24）
+
+### 20.1 仪器侧：本轮有八处是**我自己的工具**错了，其中三处会伪装成结论
+
+这一节按 S4-08 的 §19 同一立场写：**仪器错了必须在纸上看得见**。这一阶段的判定全靠仪器，
+而下面第 3、5、6 条如果没被抓到，会各自产出一条**比事实更强**的结论——这三条是本节的存在理由。
+
+| # | 错在哪 | 症状 | 怎么被抓到的 | 修法 |
+|---|---|---|---|---|
+| 1 | `MetricsServer::stop()` 里顺手关掉自己的监听 fd 与 eventfd，而 `fd_end` 在 `report_stats` 里才采 | 开启态 `fd 12→10`（首尾不等） | 现成断言：`smoke-s5-01.sh` 阶段 2 那条 `fd_start == fd_end`（九条冒烟共用的生命周期判据） | 常驻 fd 留到析构；`stop()` 只 join 线程 + 收仍在册的抓取连接（与网关"监听 fd 留到析构"同一条口径） |
+| 2 | 冒烟脚本阶段 3 的三条 curl 打在**已经退出**的网关端口上（阶段 2 收尾时 SIGTERM 了） | `curl -w %{http_code}` 给 `000`，被我原来的写法拼成 `000000`，读起来像"网关回了 000" | 三条 ✗ 同时出现而阶段 2 全绿——形态不对就先查臂的存活，不查实现 | 阶段 3 自己起一台；并把"坏请求之后仍要有一次 200"写成下界 |
+| 3 | **`s5-01-metrics-cost.sh` 开头无条件 `rm -rf $OUT`** | 补跑某一臂时，**已合格的其它臂落盘被一起删掉**，判定只剩补跑那一臂 | 判定输出"有效轮数不足"，而我明明跑过四臂 | 只有起跑全新轮次才清空；`ONLY_ROUNDS` / `ARMS` / `SKIP_RUNS` 三条复算路径一律不删 |
+| 4 | `sed -n 's/^Requests/sec: …'` 用 `/` 当分隔符，而模式里就带着 `Requests/sec` | `sed: unknown option to 's'`，QPS 那一列读成 `?` | 表格里只有 QPS 列全 `?`、其它列正常 | 分隔符换 `@`，并把"这行里带 `/`"写进注释 |
+| 5 | **判定用的 awk 把每一行同时塞进 off 与 on 两个数组** | 打印出"跨臂差 +0.000000"——那是**同一个数组和自己相减**，一条真差都没有 | 把逐臂原始行与判定行并排看：四臂 `p50` 互不相等，判定却报差为 0 | 按臂前缀分流（`^off` / `^on-r`）；注释里写明"修的是路由，不是结论" |
+| 6 | 只看取数脚本的 `rc` 判合格性 | `off-r1` 被 `s1-p999.sh` 自己的稳态门判红（经网关窗口 **49,873 ms < 50,000 ms**，脚本还打印了"本轮有 ✗，上面的数字不要用"），**却仍然 `rc=0`** | 逐臂 grep `✗` 才发现：我原来的窗口区间是 `[45,120] s`，把一份被判红的读数放了进来 | 合格性**读取数门自己打的 ✗**，窗口区间只做兜底；那一臂剔出判定并补跑一轮 |
+| 7 | 在成本脚本**正在运行时**编辑它 | bash 从文件偏移继续读，循环之后那段可能执行到改过的文本 | 事后核对：四臂落盘由子进程写、完好；但那份判定用的是旧解析结果 | 结论一律以 `SKIP_RUNS=1` **对落盘重算一遍**为准（这条流程正是 §19「只认落盘输出」的兑现） |
+| 8 | 把 `ratio() { awk '…' }` 压成一行写 | `syntax error: unexpected end of file from '{' command on line 95`——报的错位在文件末尾 | `head -94` 能过、单独取第 95 行也过不去，才定位到 `}' }` 这种连写 bash 5 不认 | 函数体一律多行；把这症状留在注释里，因为它报的行号距真因几百行 |
+
+一条同族的旧账本轮又兑现了一次：**取数的行选错了，比取不到更危险**。`s1-p999.sh` 与 `s1-p99.sh`
+的 summary 里 `经网关` 那一行会出现不止一次（wrk 档 + hey 档 / 直连档 + 经网关档），
+`head -1` 拿到哪个取决于表格顺序。所以三个取值函数全部改成**从原始落盘按锚取**
+（wrk 档读 `proxy.wrk.txt` 的 `50%` 行与 `Requests/sec` 行；p999 档按 `awk $1=="经网关"` 读
+`p50 / 窗口 / QPS`），并在代码注释里写明为什么不读渲染好的表。这是口径⑰那一族的第三次出现。
+
+### 20.2 四处退化全部真打红（能红才叫绿）
+
+本轮新增的断言一共四组，我逐组做一次"故意写坏"，**红的是哪几条用例是跑出来的，不是推出来的**：
+
+| # | 退化 | 预期靶 | 实际红掉的用例（实测名单） |
+|---|---|---|---|
+| M1 | `handle_request` 的 404 分支改成"任意路径都回 exposition"，并把原 200 分支变成不可达 | `BadRequests…` | **#306 `S5_01_MetricsE2E.BadRequestsCountAsFailedScrapesWithoutBreakingTheSurface`**（预期靶，红）**＋ #304 `ScrapesNeverEnterBusinessCounters`**——后者不在预期里：这条退化顺带把 `/metrics` 正路的响应也吞掉了（`c.reply` 留空 → 客户端读超时）。**它是被"正路必须真的通"那半边断言抓到的**，值得留着：说明 #304 不只是在守"计数不动" |
+| M2 | `ReactorGroup::start_listen` 去掉 `observations_enabled_` 判据，**无条件分配观测槽** | 关闭态那条结构断言 | **#305 `S5_01_MetricsE2E.DisabledSurfaceAllocatesAndWritesNoObservationSlots`** 一条红（`loop_observations() == nullptr` 当场不过），其余九条全绿——正中预期：这一格只有那一条守 |
+| M3 | 渲染器**跳过 `# TYPE` 行** | 格式与 E2E 的正文断言 | **4 条红：#172 `FullAssemblyEmitsEveryKeyOnceWithItsOwnTypeLine`、#173 `UnassembledSectionsStayAbsentExactlyLikeTheExitDump`、#175 `TripsRateIsTypedAsTheCountItReallyIs`、#304 `ScrapesNeverEnterBusinessCounters`**（E2E 那条断的是正文里必须有 `# TYPE requests_parsed counter`）。#174 与 #176 不红，是**对的**：#174 只扫样本行的名字合法性、#176 只读 `# HELP`，两者都不依赖 `# TYPE` |
+| M4 | `sanitize_metric_name` 不变换（点号原样发进 metric 名） | 名字法则与清单 | **#172、#174 `DottedAndColonTargetNamesBecomeUnderscores`、#175** 三条红 |
+
+四处退化跑完全部还原，复跑核对：`grep -rn "TEMP-POSITIVE" src/ tests/ scripts/` **0 处**、
+debug 全目标 `cmake --build` rc=0、`ctest` **347/347**。
+
+**一处不算退化、但形状相同的东西写进了用例里**：#304 的第四段——同一条
+`GET /metrics` 字节原样发给**业务端口**，`requests_parsed` 必须 +1。这不是我改出来的坏实现，
+而是"如果观测面走主端口会发生什么"的正面对照：它证明前三段那一串"一动不动"不是因为
+服务不存在（ADR-24 第七节 ② 要求的那条下界）。
+
+### 20.3 本轮的门禁面
+
+**三 preset 各 347/347、非 gtest 警告各 0 条、`tsan` 全量日志 `ThreadSanitizer` 出现 0 次**
+（新增的并发面就是那一条采集线程跨线程读每 worker 的原子槽；槽是 `alignas(64)`、
+`ReactorStats` 本来就是全 worker 共享的原子表，所以这条线程没有碰到任何非原子量——
+`stats.h:25` 那条纪律的合法读法就是这个形状）。
+`scripts/smoke-s5-01.sh`：**26 项 ✓、✗ 计数 0、退出码 0、跳过 1 项**（那一臂没装 `health`，
+所以 `health_ejected_now` 的 HELP 限定语只能由 ctest #176 覆盖；**跳过＝不判，不是通过**）。
+成本那格见 [BENCHMARK B-019](BENCHMARK.md)。证据落盘：`/home/archer/s5-01-foundation.log`
+（改 `src/` 之前的 337/337 基线）、`s5-01-presets.log`、`s5-01-tsan-ctest.log`、
+`s5-01-smoke-r4.log`、`s5-01-cost-p999.log`、`s5-01-storm8.log`、`s5-01-wrk-rejudge.log`。
+
+**本轮 `src/` 改了七个文件、新增七个**：改的是 `src/net/reactor.{h,cc}`、
+`src/net/reactor_group.{h,cc}`、`src/filter/rate_limit.{h,cc}`、`src/main.cc`；
+新增的是 `src/metrics/{metrics_render,metrics_server}.{h,cc}`、`src/net/loop_observation.h`、
+`src/net/proc_sample.{h,cc}`。
+其中**动到被测方热路径的只有两处**，都不在每请求路径上：`TokenBucket::try_acquire` 里
+"夹子咬到"那一格多一个 relaxed `fetch_add`（429 支路），以及循环已有那一拍里多一次
+`snapshot_ != nullptr` 判空（关闭态恒假）。其余全部是新线程与渲染层。

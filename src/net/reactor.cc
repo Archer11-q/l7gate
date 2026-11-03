@@ -331,6 +331,28 @@ std::uint64_t Reactor::run() {
     // S4-01（ADR-21）请求级超时的扫描点：deadline 表为空时是一次判空。
     enforce_upstream_timeouts(monotonic_ms());
 
+    // S5-01（ADR-24 第四节）：把本 worker 独有的那几个非原子观测抄进原子槽，
+    // 让 /metrics 的采集线程**只读原子**——`stats.h:25` 那条「只能在循环线程 join
+    // 之后读」的纪律靠这一步变成"属主线程自己抄，别人从不碰私有内存"。
+    // 三个 epoll 计数是 O(1) 的 store，每拍一次（缺省 200ms）；
+    // `read_disarmed_connections` 要遍历注册表（`reactor.cc` 那个函数本体），
+    // 所以降到每秒至多一次，节拍用时间戳判而不是拍数——探活开着时一拍只有 20ms，
+    // 按拍数会把一次 O(n) 遍历放大到每秒 50 次。
+    // 关闭态（`snapshot_ == nullptr`，即没给 `--metrics-port`）这里一次判空就走掉，
+    // 循环里连那次 clock 读数都不发生——这是验收 ⑤「关掉时代码路径与今天逐字节相同」
+    // 在这一层的落点：时钟读数不新增、store 不新增、一个字节都不写。
+    if (snapshot_ != nullptr) {
+      snapshot_->epoll_registrations.store(epoll_.registrations(), std::memory_order_relaxed);
+      snapshot_->epoll_unregistrations.store(epoll_.unregistrations(), std::memory_order_relaxed);
+      snapshot_->epoll_modifications.store(epoll_.modifications(), std::memory_order_relaxed);
+      const std::int64_t now = monotonic_ms();
+      if (observations_at_ms_ < 0 || now - observations_at_ms_ >= kMetricsSampleEveryMs) {
+        observations_at_ms_ = now;
+        snapshot_->read_disarmed_connections.store(connections_with_read_disarmed(),
+                                                   std::memory_order_relaxed);
+      }
+    }
+
     if (config_.stop_after_requests > 0 &&
         stats_.requests_parsed.load(std::memory_order_relaxed) >= config_.stop_after_requests) {
       // 这条 break **不排水**：它的语义是"解析满 N 条就停循环"，帮助文本一直明写着

@@ -11,6 +11,7 @@ add_executable(l7gate_tests
   filter_chain_test.cc
   framing_test.cc
   health_test.cc
+  metrics_test.cc
   nodes_test.cc
   rate_limit_test.cc
   redis_rate_limit_test.cc

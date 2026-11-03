@@ -142,10 +142,13 @@ add_library(l7gate_core STATIC
   src/filter/rate_limit.cc
   src/filter/redis_rate_limit.cc
   src/filter/route_filter.cc
+  src/metrics/metrics_render.cc
+  src/metrics/metrics_server.cc
   src/net/buffer.cc
   src/net/connection.cc
   src/net/epoll.cc
   src/net/fd.cc
+  src/net/proc_sample.cc
   src/net/reactor.cc
   src/net/reactor_group.cc
   src/net/socket.cc

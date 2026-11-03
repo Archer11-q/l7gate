@@ -31,7 +31,13 @@ namespace l7gate::filter {
 
 class TokenBucket {
  public:
-  TokenBucket(std::uint64_t rate_per_sec, std::uint64_t burst) noexcept;
+  // `limiter_capped`（S5-01，ADR-24 第三节）：可选的 limiter 级聚合槽，只在"夹子咬到"
+  // 那一格跟着 +1。**为什么需要它**：`/metrics` 是 pull 的，而原来这一键只有
+  // `capped_rejects_total()` 那条持桶表锁的全表走查能取到——面板上每次抓取都要在
+  // 每条请求都要拿的那把锁里走 16384 格，那是仪器在被测方身上踩成本。
+  // 传 nullptr 就是不要聚合（单测直接构造裸桶走这条路）。
+  TokenBucket(std::uint64_t rate_per_sec, std::uint64_t burst,
+              std::atomic<std::uint64_t>* limiter_capped = nullptr) noexcept;
 
   // 有令牌就扣一个并返回 true；没有就返回 false。**拒绝不写回状态**——补货是懒的，
   // 下一次调用按同一个 last 重算，结果一样，少一次 CAS。
@@ -64,6 +70,9 @@ class TokenBucket {
   std::atomic<std::uint64_t> cap_milli_{0};
   std::atomic<std::uint64_t> used_total_{0};
   std::atomic<std::uint64_t> capped_rejects_{0};
+  // S5-01：指向上面那只 limiter 级聚合槽（可为空）。裸指针不拥有任何东西，
+  // 生命周期由 `RateLimiter` 的成员声明顺序保证（聚合槽声明在桶表之前，因此晚于它们析构）。
+  std::atomic<std::uint64_t>* limiter_capped_ = nullptr;
 };
 
 class RateLimiter {
@@ -102,10 +111,19 @@ class RateLimiter {
   std::vector<BucketView> snapshot_buckets() const;
   // 降级兜底：把所有桶（含溢出桶）的 cap 放回 `burst`，语义退回 S4-03 的纯本地桶。
   void release_all_caps() noexcept;
-  // 逐桶求和（只在退出报告与用例里调，它要拿桶表的锁）——不在快路径上加一个 limiter 级
-  // 原子，是因为 `try_acquire` 返回 bool、快路径拿不到"被夹住"这个原因，而加一个没人读的
-  // 枚举返回值等于发空头证明。
+  // 逐桶求和（只在退出报告与用例里调，它要拿桶表的锁）。
+  // **这里曾经是"故意不加 limiter 级原子"**（S4-04 的原话：快路径拿不到"被夹住"这个
+  // 原因，加一个没人读的枚举返回值等于发空头证明）。S5-01 把这句话改成现在这样：
+  // pull 模型下"只有退出才有"等于面板上永远没有这一格，而全表走查要在**每条请求都要拿**
+  // 的那把锁里走 16384 格。原理由仍然成立，所以**没有**改 `try_acquire` 的返回类型——
+  // 聚合是在桶内部那个已经知道原因的分支里 +1 的（`rate_limit.cc` 的 `usable < 1000`
+  // 且 `tokens >= 1000` 那一格），快路径一个字没多。代价与取证见 ADR-24 第三节。
   std::uint64_t capped_rejects_total() const;
+  // S5-01（ADR-24 第三节）：同一格的**免锁**读法，给 `/metrics` 用。两条路必须给同一个
+  // 数——`S5_01_RateLimitAccounts` 那条用例就是钉这件事的，走查与聚合一旦漂移它就红。
+  std::uint64_t capped_rejects_now() const noexcept {
+    return capped_rejects_aggregate_.load(std::memory_order_relaxed);
+  }
 
  private:
   // C++20 的异构查找：请求路径上不为"查表"分配一个 std::string。
@@ -124,6 +142,9 @@ class RateLimiter {
 
   const std::uint64_t rate_per_sec_;
   const std::uint64_t burst_;
+  // S5-01：limiter 级聚合。**声明必须在 buckets_ / overflow_ 之前**——桶持它的裸指针，
+  // 成员按逆序析构，声明在前才等于析构在后。
+  std::atomic<std::uint64_t> capped_rejects_aggregate_{0};
   // mutable：`key_count()` 是 const 观测接口，但它要读表。
   mutable std::mutex mu_;
   std::unordered_map<std::string, std::unique_ptr<TokenBucket>, KeyHash, KeyEqual> buckets_;

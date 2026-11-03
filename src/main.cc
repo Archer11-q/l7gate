@@ -27,6 +27,8 @@
 #include "filter/rate_limit.h"
 #include "filter/redis_rate_limit.h"
 #include "filter/route_filter.h"
+#include "metrics/metrics_server.h"
+#include "net/proc_sample.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
 #include "route/nodes.h"
@@ -47,6 +49,7 @@ void usage(std::FILE* out) {
       "               [--upstream-connect-timeout-ms MS] [--upstream-head-timeout-ms MS]\n"
       "               [--upstream-body-idle-timeout-ms MS]\n"
       "               [--redis-db <host:port>] [--redis-settle-ms MS] [--redis-timeout-ms MS]\n"
+      "               [--metrics-port PORT]\n"
       "\n"
       "--serve 的透传路径（S1-04 + S1-05）：epoll 边缘触发单线程循环，下游请求原样\n"
       "搬到上游，上游响应原样搬回来，keep-alive 复用同一条回源连接；带 Connection:\n"
@@ -70,6 +73,14 @@ void usage(std::FILE* out) {
       "仍然只走命令行，两边之间没有「谁覆盖谁」这回事。给了 --config 就不必给 --upstream，两个都给会被\n"
       "拒绝——两个来源同时存在时，「哪一份是真相」这件事本身就是一份会漂移的配置。\n"
       "解析或校验不过一律退出码 2 并指出是哪一项，不退回默认值继续跑。\n"
+      "--metrics-port PORT（S5-01，ADR-24）：在 PORT 上开一个**纯文本 /metrics**（Prometheus\n"
+      "text format 0.0.4），把退出账那 77 个键在运行期也发一遍。**不给这个标志就是不开**：\n"
+      "不起线程、不建监听 fd、循环里一个字节都不抄。0 = 由内核选端口（测试用，与 --listen\n"
+      "的端口同一约定）。绑定地址跟着 --listen 走，不另开旋钮；它是部署事实所以不进 --config。\n"
+      "为什么单独一个端口而不是主端口上一条特殊路径：走主端口就会被 catch-all 路由命中、\n"
+      "进限流键、给「每请求成本」那本账掺进一条额外路径，也不该让业务客户端摸到观测面。\n"
+      "抓取连接不是 Connection——它碰不到那个唯一的 requests_parsed 自增点，所以一次抓取\n"
+      "一条业务请求都不许多计（这条写在 ctest 里，不是注释）。\n"
       "路由：前缀取最长命中、正则全串锚定且优先于前缀，匹配原始 origin-form（含 query、不解码、不规范化）；\n"
       "无匹配回 404 并关连接。balance 只认 round_robin / least_conn / consistent_hash。\n"
       "不给 --config 时一个 filter 都不装，链是空的，行为与 S2-06a 逐字节同形。\n"
@@ -101,35 +112,9 @@ void usage(std::FILE* out) {
 }
 
 // --- /proc 自报 ---------------------------------------------------------
-// 冒烟脚本要的是「10000 请求之后 fd 回到基线、每连接内存是多少」，而这两个数
-// 只有进程自己看 /proc 才拿得准：外部工具在别的时刻看，看到的可能是别的连接。
-// 读不到就报 -1，绝不拿 0 冒充"没有泄漏"。
-std::int64_t count_open_fds() {
-  DIR* dir = ::opendir("/proc/self/fd");
-  if (dir == nullptr) return -1;
-  std::int64_t n = 0;
-  while (const dirent* entry = ::readdir(dir)) {
-    if (entry->d_name[0] == '.') continue;
-    ++n;
-  }
-  ::closedir(dir);
-  return n;
-}
-
-std::int64_t current_rss_kib() {
-  std::FILE* file = std::fopen("/proc/self/status", "r");
-  if (file == nullptr) return -1;
-  char line[256];
-  std::int64_t rss = -1;
-  while (std::fgets(line, sizeof(line), file)) {
-    if (std::strncmp(line, "VmRSS:", 6) == 0) {
-      rss = std::strtoll(line + 6, nullptr, 10);
-      break;
-    }
-  }
-  std::fclose(file);
-  return rss;
-}
+// S5-01（ADR-24 第四节）：`count_open_fds()` 与 `current_rss_kib()` 原样搬进了
+// `net/proc_sample.h`——运行期的 `/metrics` 也要读同一对数，复制一份就等于造出
+// 第二个会各自漂移的真相。本文件的调用点全部改成限定名，函数体一字未动。
 
 // --- 停止信号 -----------------------------------------------------------
 // 冒烟脚本要在 curl 收完最后一条响应之后让网关**自己**收尾：kill -TERM 的默认
@@ -244,8 +229,8 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
                   const l7gate::route::HealthTable* health = nullptr,
                   const std::vector<std::string>& target_names = {},
                   const l7gate::route::NodesPublisher* nodes = nullptr) {
-  const std::int64_t fd_now = count_open_fds();
-  const std::int64_t rss_now = current_rss_kib();
+  const std::int64_t fd_now = l7gate::net::count_open_fds();
+  const std::int64_t rss_now = l7gate::net::current_rss_kib();
   // 一行一个 key=value，键名用 ASCII。理由不是审美：这份输出是冒烟脚本的输入，
   // 一旦一行里塞两个数，脚本就只能靠"哪个中文标签先出现"去猜，而猜出来的解析
   // 在中文标签改字的那一天会静悄悄地把错数字读走。人类可读的分组版留给文档抄写。
@@ -431,6 +416,18 @@ void report_redis(const l7gate::filter::RedisSettler* settler,
               static_cast<unsigned long long>(limiter->capped_rejects_total()));
 }
 
+// S5-01（ADR-24 第三节第 5 条）：仪器自己的账。**只在开了观测面时出现**——关闭态的
+// 退出账键集合必须与今天逐字节相同（验收 ⑤ 那一格靠的就是"多一个键都不行"，
+// 冒烟脚本拿 golden 清单 diff 这一条）。这三键只由采集线程写，永不进 `ReactorStats`。
+void report_metrics(const l7gate::metrics::MetricsServer& metrics) {
+  std::printf("[serve] metrics_scrapes_ok=%llu\n",
+              static_cast<unsigned long long>(metrics.scrapes_ok()));
+  std::printf("[serve] metrics_scrapes_failed=%llu\n",
+              static_cast<unsigned long long>(metrics.scrapes_failed()));
+  std::printf("[serve] metrics_render_bytes=%llu\n",
+              static_cast<unsigned long long>(metrics.render_bytes()));
+}
+
 int serve(int argc, char** argv) {
   l7gate::net::Reactor::Config config;
   std::size_t stop_after_requests = 0;
@@ -441,6 +438,10 @@ int serve(int argc, char** argv) {
   // 一起看；它必须 ≥ S4 的响应头超时（默认 10000），S4-01 的启动校验兑现这条约定，
   // S4-02 把默认值从 5000 对齐到 10000（S2-05 裁定原文允许"要么调大"）。
   long long drain_timeout_ms = 10000;
+  // S5-01（ADR-24 第二节）：指标暴露面的端口。**-1 = 不开**（默认形态）。
+  // 它是部署事实不是流量策略，所以与 `--nodes-schema`、`--redis-db` 同一条切分：
+  // **不进 `--config`**。
+  int metrics_port = -1;
   bool have_listen = false;
   bool have_upstream = false;
   std::vector<UpstreamEndpoint> upstream_endpoints;
@@ -622,6 +623,17 @@ int serve(int argc, char** argv) {
         return 2;
       }
       drain_timeout_ms = n;
+      ++i;
+    } else if (flag == "--metrics-port" && value != nullptr) {
+      // S5-01（ADR-24 第二节）：**标志缺席 = 关闭**，所以"关闭"不占用 0 这个值——
+      // 0 在本仓库里已经是"由内核选端口"（`Reactor::Config::listen_port` 那条约定，
+      // 测试全靠它避免端口撞车），再造一个"0 表示关"就是给同一份文档发两个互相冲突的定义。
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 65535) {
+        std::fprintf(stderr, "参数错误: --metrics-port 要的是 0..65535，收到 %s\n", value);
+        return 2;
+      }
+      metrics_port = static_cast<int>(n);
       ++i;
     } else {
       std::fprintf(stderr, "参数错误: 无法识别的选项 %s\n", std::string(flag).c_str());
@@ -841,6 +853,53 @@ int serve(int argc, char** argv) {
     });
   }
 
+  // --- S5-01（ADR-24）：指标暴露面 ------------------------------------------
+  // **两条装配路径共用这一份构造**，所以运行期的键集合只有一处定义，不会和退出账分叉。
+  // 没给 `--metrics-port` 时这里一个对象都不造：不起线程、不建监听 fd、不建 eventfd，
+  // 而 worker 侧的快照指针保持 `nullptr`（ADR-24 第二节那条"关闭态"的结构保证）。
+  std::atomic<std::int64_t> serve_started_at_ms{0};
+  std::unique_ptr<l7gate::metrics::MetricsServer> metrics;
+  auto start_metrics = [&](l7gate::net::ReactorStats& stats,
+                           const l7gate::net::LoopObservation* loop, std::size_t loop_count,
+                           int worker_loops, bool multi_worker_arm) -> bool {
+    if (metrics_port < 0) return true;
+    l7gate::metrics::Dependencies deps;
+    deps.base.stats = &stats;
+    deps.base.loop = loop;
+    deps.base.loop_count = loop_count;
+    deps.base.health = health_table.get();
+    deps.base.target_names = &health_target_names;
+    deps.base.workers = worker_loops;
+    deps.base.expose_workers_key = multi_worker_arm;
+    deps.base.started_at_ms = &serve_started_at_ms;
+    deps.rate_limiter = rate_limiter.get();
+    deps.redis_settler = redis_settler.get();
+    deps.nodes = nodes_publisher.get();
+    l7gate::metrics::MetricsServer::Config mc;
+    // 绑定地址跟着 `--listen` 走，不另开旋钮（ADR-24 第二节）：缺省 127.0.0.1 时观测面
+    // 只在本机可见，容器里部署方把 --listen 写成 0.0.0.0 时它才随之对外。
+    mc.bind_address = config.listen_address;
+    mc.port = static_cast<std::uint16_t>(metrics_port);
+    metrics = std::make_unique<l7gate::metrics::MetricsServer>(mc, std::move(deps));
+    int merror = 0;
+    if (!metrics->start_listen(&merror)) {
+      std::fprintf(stderr, "指标端口 %d 绑定失败: errno=%d (%s)\n", metrics_port, merror,
+                   std::strerror(merror));
+      metrics.reset();
+      return false;
+    }
+    if (!metrics->start(&merror)) {
+      std::fprintf(stderr, "指标端口 %d 起线程失败: errno=%d (%s)\n", metrics_port, merror,
+                   std::strerror(merror));
+      metrics.reset();
+      return false;
+    }
+    std::printf("[serve] metrics=on addr=%s:%d path=/metrics\n", mc.bind_address.c_str(),
+                metrics->port());
+    std::fflush(stdout);
+    return true;
+  };
+
   // --- 多 Reactor 路径（S2-01，workers ≥ 2）-------------------------------
   if (workers >= 2) {
     l7gate::net::ReactorGroup::Config gconfig;
@@ -867,6 +926,9 @@ int serve(int argc, char** argv) {
 
     l7gate::net::ReactorGroup group(gconfig);
     int error = 0;
+    // S5-01：观测槽只能在 `start_listen` **之前**开——槽地址在 worker 构造时分派下去，
+    // 而 `vector` 之后 resize 会搬家（`reactor_group.cc` 那里写的就是这件事）。
+    if (metrics_port >= 0) group.enable_loop_observation();
     if (!group.start_listen(&error)) {
       std::fprintf(stderr, "监听 %s:%u 失败: errno=%d (%s)\n", gconfig.listen_address.c_str(),
                    gconfig.listen_port, error, std::strerror(error));
@@ -876,11 +938,21 @@ int serve(int argc, char** argv) {
     std::signal(SIGINT, on_stop_signal);
     std::signal(SIGTERM, on_stop_signal);
 
+    // S5-01（ADR-24 第四节那条硬前置）：指标监听 fd 必须在下面那次 `count_open_fds()`
+    // **之前**建好——这样 `fd_start` 与 `fd_end` 两侧都包含这个常驻项，
+    // "首尾相等"判的仍然只是"连接 fd 有没有漏"。顺序写反了的表现为九条冒烟里那条
+    // fd 断言当场红，不是静默偏差，所以这里值得把理由留在原地而不只是留在 ADR。
+    if (!start_metrics(group.stats(), group.loop_observations(),
+                       group.loop_observation_count(), workers, true)) {
+      return 1;
+    }
+
     // fd_start 在 start_listen 之后量：此刻监听 fd + accept 侧 epoll/eventfd +
     // N×(worker epoll/eventfd) 都已打开，与 fd_end（析构之前量）同一视野，
     // 所以"首尾相等"判的仍然是"连接 fd 有没有漏"，常驻项两边都抵消。
-    const std::int64_t fd_start = count_open_fds();
-    const std::int64_t rss_start = current_rss_kib();
+    const std::int64_t fd_start = l7gate::net::count_open_fds();
+    const std::int64_t rss_start = l7gate::net::current_rss_kib();
+    if (metrics != nullptr) metrics->set_start_baseline(fd_start, rss_start);
     std::printf("[serve] 监听 %s:%d（workers=%d backlog=%d max_connections_per_worker=%zu "
                 "upstream=%s upstream_endpoints=%zu stop_after_requests=%zu wait_timeout_ms=%d "
                 "high_water_mark=%zu drain_timeout_ms=%lld）\n",
@@ -940,6 +1012,11 @@ int serve(int argc, char** argv) {
     std::fflush(stdout);
 
     const auto started = std::chrono::steady_clock::now();
+    // S5-01（ADR-24 第四节）：把这一格同时交给运行期的 `/metrics`，两处 `elapsed_ms`
+    // 量的才是同一段时长。原点只写一次，之后没人改它。
+    serve_started_at_ms.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(started.time_since_epoch()).count(),
+        std::memory_order_relaxed);
     const std::uint64_t batches = group.run();
     g_group_for_signal.store(nullptr, std::memory_order_relaxed);
     nodes_stop.store(true, std::memory_order_relaxed);
@@ -947,6 +1024,9 @@ int serve(int argc, char** argv) {
     // 结算线程先停再打账：否则最后一拍的 `settled_keys` 与业务的 allowed/rejected
     // 会互相插队，读者看到的是一笔对不上的中间态。
     if (redis_settler != nullptr) redis_settler->stop();
+    // S5-01：采集线程同一条规矩，而且它还有一层必要——它读的是**正在跑的** worker 的
+    // 原子槽，停在打账之前等于保证退出账读到的是一笔收尾后的账，而不是抓取中途的切面。
+    if (metrics != nullptr) metrics->stop();
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
@@ -959,6 +1039,7 @@ int serve(int argc, char** argv) {
     report_redis(redis_settler.get(), rate_limiter);
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
+    if (metrics != nullptr) report_metrics(*metrics);
     return 0;
   }
 
@@ -974,7 +1055,12 @@ int serve(int argc, char** argv) {
   // 同一条构造期纪律：健康表在 Reactor 构造之前进 config（Reactor 存 config 的副本）。
   config.health = health_table;
   config.nodes = nodes_publisher;
+  // S5-01：单 Reactor 这一臂的观测槽。**声明必须在 Reactor 之前**——它比循环活得短
+  // 的话，worker 拿着的就是一个已经析构的地址（与 `ReactorGroup` 里 `stats_` 那条
+  // 声明顺序规矩同一条命）。没开指标面时它一个字节都不会被写。
+  l7gate::net::LoopObservation single_obs;
   l7gate::net::Reactor reactor(config);
+  if (metrics_port >= 0) reactor.set_loop_observation(&single_obs);
   // 链只能在 run() 之前改（S1-08 那条时序纪律：链在循环线程里被逐条读、没有锁）。
   // **S4-03 起链首是限流**（ADR-21 第二节第 3 条：限的是"进门"，路由决定"去哪"）；
   // 顺序 = 限流 → 路由 → 均衡——路由读的是本 worker 的默认目标外唯一能写组下标的一环，
@@ -1003,8 +1089,15 @@ int serve(int argc, char** argv) {
   std::signal(SIGINT, on_stop_signal);
   std::signal(SIGTERM, on_stop_signal);
 
-  const std::int64_t fd_start = count_open_fds();
-  const std::int64_t rss_start = current_rss_kib();
+  // S5-01（ADR-24 第四节那条硬前置，与多 Reactor 臂同一条）：先开观测面，再量 fd_start。
+  if (!start_metrics(reactor.stats(), metrics_port >= 0 ? &single_obs : nullptr,
+                     metrics_port >= 0 ? 1u : 0u, 1, false)) {
+    return 1;
+  }
+
+  const std::int64_t fd_start = l7gate::net::count_open_fds();
+  const std::int64_t rss_start = l7gate::net::current_rss_kib();
+  if (metrics != nullptr) metrics->set_start_baseline(fd_start, rss_start);
   // 横幅里那个 `upstream=127.0.0.1:PORT` 打的是**默认目标**——单端点配置下它与 S2 时代
   // 逐字节相同（`s1-p99.sh` 与四个冒烟脚本都 grep 这一行，键名与值的形状都不能动）。
   const l7gate::net::Reactor::Config::Target& shown_target =
@@ -1061,11 +1154,17 @@ int serve(int argc, char** argv) {
   std::fflush(stdout);
 
   const auto started = std::chrono::steady_clock::now();
+  // S5-01：`elapsed_ms` 的原点，与退出账同一个（见多 Reactor 臂处那条注释）。
+  serve_started_at_ms.store(
+      std::chrono::duration_cast<std::chrono::milliseconds>(started.time_since_epoch()).count(),
+      std::memory_order_relaxed);
   const std::uint64_t batches = reactor.run();
   g_reactor_for_signal.store(nullptr, std::memory_order_relaxed);
   nodes_stop.store(true, std::memory_order_relaxed);
   if (nodes_reload_thread.joinable()) nodes_reload_thread.join();
   if (redis_settler != nullptr) redis_settler->stop();
+  // S5-01：先停采集线程再打账（与多 Reactor 臂同一条时序）。
+  if (metrics != nullptr) metrics->stop();
   const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - started)
                               .count();
@@ -1079,6 +1178,7 @@ int serve(int argc, char** argv) {
   report_rate_limit(rate_limiter);
   report_redis(redis_settler.get(), rate_limiter);
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
+  if (metrics != nullptr) report_metrics(*metrics);
   return 0;
 }
 

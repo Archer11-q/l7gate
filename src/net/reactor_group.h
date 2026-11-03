@@ -11,6 +11,7 @@
 #include "net/connection.h"
 #include "net/epoll.h"
 #include "net/fd.h"
+#include "net/loop_observation.h"  // loop_obs_ 是本文件直接持有的类型
 #include "net/reactor.h"
 #include "net/stats.h"
 #include "filter/rate_limit.h"
@@ -159,6 +160,21 @@ class ReactorGroup {
   ReactorStats& stats() noexcept { return *stats_; }
   const ReactorStats& stats() const noexcept { return *stats_; }
 
+  // S5-01（ADR-24 第四节）：打开每 worker 的运行期观测槽。**必须在 start_listen()
+  // 之前调用**（槽地址在 worker 构造时分派，vector 之后 resize 会搬家）。
+  // 不调用 = 每个 worker 的 `snapshot_` 恒为 nullptr = 循环里一个字节都不抄，
+  // 这是验收 ⑤「关掉时代码路径与今天逐字节相同」的结构保证，也是验收 ④ 那条
+  // ctest（关闭态跑完 N 条请求后槽仍全 0）读的地方。
+  void enable_loop_observation() noexcept { observations_enabled_ = true; }
+  bool loop_observation_enabled() const noexcept { return observations_enabled_; }
+  // 采集线程读的地方。与上面那族聚合观测（`epoll_registrations()` 等）的分工差别
+  // 就一条：**这个可以在循环还转着的时候读**，因为它读的是原子。
+  // 为什么是 `unique_ptr<T[]>` 而不是 `vector<LoopObservation>`：`vector` 要求元素
+  // 可搬移，而 `std::atomic` 既不可拷也不可搬——编译期就替我挡住了"搬家把 worker 手里
+  // 的槽地址换掉"那类 bug（同一件事在 `stats_` 那条声明顺序规矩里是靠注释守的）。
+  const LoopObservation* loop_observations() const noexcept { return loop_obs_.get(); }
+  std::size_t loop_observation_count() const noexcept { return loop_obs_count_; }
+
   // --- 聚合观测：每 worker 各一份的非原子量求和。**只在 run() 返回之后调用** ------
   // （worker 循环线程已 join，此时读它们的 Epoll 计数器与注册表才合法，见 stats.h
   // 第 25 行那条纪律。在循环还转着的时候读这些是 S1-08 抓过的那类 race。）
@@ -189,6 +205,11 @@ class ReactorGroup {
   //      按逆序（threads_ → workers_ → stats_）unwind，所以 joinable 的线程不会
   //      在 Reactor 还活着时被拆掉。
   std::unique_ptr<ReactorStats> stats_;
+  // S5-01：观测槽与 `stats_` 同一条命——**必须在 workers_ 之前声明**，worker 持裸指针，
+  // 槽不能比它先死。没开指标面时它是空的（一个字节都不分配）。
+  bool observations_enabled_ = false;
+  std::unique_ptr<LoopObservation[]> loop_obs_;
+  std::size_t loop_obs_count_ = 0;
   UniqueFd listener_;
   Epoll accept_epoll_;
   UniqueFd accept_wake_fd_;
