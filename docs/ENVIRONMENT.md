@@ -202,6 +202,10 @@ Redis / MySQL / Prometheus / Grafana / Nginx 基线全部走 Docker（契约 9.3
 | WSL → 容器 bridge IP（`172.17.0.2:80`） | `000` | bridge IP 从 WSL 侧不可路由 |
 | WSL → `127.0.0.1:发布端口`（`-p`） | **200** | 唯一可测的入口就是端口发布 |
 | 容器 → `$(WSL eth0 IP):上游端口` | **200 + 1024 字节** | 出向要走容器→WSL 那一跳；上游因此必须绑 `0.0.0.0`（绑 `127.0.0.1` 容器够不到） |
+| 容器（`prom/prometheus:v2.51.2`，busybox `wget`）→ `host.docker.internal:宿主端口`，加 `--add-host=host.docker.internal:host-gateway` | **取回 `# HELP elapsed_ms`** | S5-03 新增的这条路：抓取面在**宿主机**上（网关 `--metrics-port` 与 exporter），所以入库的 `deploy/prometheus/prometheus.yml` 两个 target 都写成 `host.docker.internal:<port>`；被测方必须绑 `0.0.0.0`，理由与上一行同一个 |
+| 容器 → `172.17.0.1:宿主端口` | `Connection refused` | Docker Desktop 这台机器上 `172.17.0.1` 不是宿主网关；别把它当 `host-gateway` 的替代写法（我第一轮试过） |
+
+> 同一条路上我还测到过 `10.255.255.254` 超时——**那一条不作数**：我的取地址命令 `ip -4 -o addr show scope global` 把 `lo` 上那个 `/32` 当成了第一个"全局地址"，所以那一次打的是回环地址而不是 eth0。上面第 4 行（2026-10-30 那次）与这一轮对 eth0 的读法并不冲突，冲突的是我那一行的取数方式。
 
 于是 **#3 的「同机、同参数」在网络这一维上做不齐**：nginx 的客户端 leg 多一次端口发布（DNAT/userland proxy）、上游 leg 多一次容器出向，而网关两侧都是原生回环。方向上这是**拖累 nginx**，所以拿它算出来的 `QPS_网关/QPS_nginx` 对**我**偏乐观——B-005 的比值和结论都带着这条声明，#3 是否算"达标"由项目所有人裁，我不给自己发这张证明。另外两条同场记下的不齐项：nginx 容器用的是它自己镜像的 libc/分配器（契约要求「同一分配器记录」，这一条没满足）；镜像默认 `worker_processes auto` = 16 worker，而 S1 按 ADR-03 就是单 Reactor（多线程是 S2 的内容）——所以 B-005 额外跑了「关 access_log」与「单 worker」两个**只差一个变量的对照组**，用来把"日志写盘"和"并发分摊"这两维从差值里拆出来。
 

@@ -283,7 +283,7 @@ scripts/bench/s1-p999.sh                  # SLO #1 的 p999 半边：1000 并发
 
 ## 可观测面与调试界面
 
-三个数字最终要能被**看见**，不是只存在于压测报告里。这一节是 S5 的交付物形状；**S5-01 已经交出第一格**（运行期指标面），其余三格仍未实现（[docs/SLO.md](docs/SLO.md) 的 #2/#3 测量条件就是面板上的格子）。
+三个数字最终要能被**看见**，不是只存在于压测报告里。这一节是 S5 的交付物形状；**S5-01（运行期指标面）、S5-02（配置热重载）、S5-03（Prometheus 抓取 + Grafana 六格）已交出**，WebSocket 调试页（S5-04）与 `docker compose` 一键起全套（S5-05）仍未实现（[docs/SLO.md](docs/SLO.md) 的 #2/#3 测量条件就是面板上的格子）。
 
 **⓪ 运行期指标面 `--metrics-port PORT`——已实现（S5-01，[ADR-24](docs/adr/ADR-24-metrics-exposition.md)）**
 
@@ -291,16 +291,38 @@ scripts/bench/s1-p999.sh                  # SLO #1 的 p999 半边：1000 并发
 
 **默认关闭**：不给 `--metrics-port` 就不起线程、不建监听 fd、worker 循环里一个字节都不抄——这句不是自述，`scripts/smoke-s5-01.sh` 阶段 1 拿**修前二进制**跑同一组参数、把两边的 `[serve]` 键名清单逐行 diff 判死。**抓取一条业务请求都不许多计**：观测面走独立线程、独立 epoll，那条 socket 根本不是 `Connection`，所以 `requests_parsed` 那个唯一自增点对它结构上不可达（`S5_01_MetricsE2E` 钉这条，用例里带一条阳性对照——同一条字节发给业务端口时计数确实 +1，否则"一动不动"可能只是因为服务根本没起来）。
 
-**① Grafana 面板「网关总览」——六个格子，就是三个数字的落地形态（未实现，S5-03）**
+**① Grafana 面板「网关总览」——已实现（S5-03，[ADR-25](docs/adr/ADR-25-bench-percentile-exporter.md)）**
 
-| 格子 | 来源 | 说明 |
+六格按契约 4.2 那六格来，入库的是 [deploy/grafana/dashboards/gateway-overview.json](deploy/grafana/dashboards/gateway-overview.json)（provisioning 出来的，不是我手工点出来的）。每格指到的键名：
+
+| 格子 | 键名（面板表达式原文） | 说明 |
 |---|---|---|
-| 吞吐（QPS） | Prometheus counter | 对应 SLO #3 |
-| 转发延迟 p99 / p999 | 直方图分位 | 对应 SLO #1；**p999 那一格的取数方案已裁决**：由自研 C100K 客户端的 HDR 分位统计供数（当前 wrk/hey 只到 99%） |
-| 活跃连接 | gauge | 配 `每连接内存` 才能看 SLO #2 是否守住 20 KB |
-| 熔断状态 | 三态机当前态 + 触发次数 | S4 的熔断是否真的在开合 |
-| 上游健康度 | `health_ejected_now` / 每目标读数 | 配合摘除比例安全阀（ADR-12）看"误摘"；**措辞必须带 ARCHITECTURE 1.31 边界⑥ 的限定**：只装 `health` 且探活会答而业务恒 5xx 的成员是**摘不掉**的（S4-07 臂 9c 实测 `ejections=0`），所以 `health_ejected_now=0` 不能读成"没有坏后端"。这句限定已经在 `/metrics` 那条 `# HELP` 里出现一次，面板与 README 有出处可指 |
-| 状态码分布 | 200 / 429 / 503 占比 | **429 那一栏是限流真的在生效的直接证据**——没有它，"限流已实现"只是一句自述 |
+| 1 吞吐 | `sum(rate(requests_parsed[1m]))` | `requests_parsed` 是网关自报的整数计数；`1m` 只是这一格的展示窗口，**SLO 判定读的仍是落盘摘要** |
+| 2 转发尾延迟 p99 / p999 | `l7gate_bench_increment_microseconds{quantile="p99"}` / `="p999"` / `l7gate_bench_observer_cores` | **这一格不是网关自报**：网关 `/metrics` 那 101 个键全是整数计数、没有一格是时延（ADR-24 裁「分位由客户端自己算」）。数由 `tools/l7gate_bench_exporter` 从 `build/bench/<batch>/s1-p99{,9}.summary.txt` 搬来：p99 出自 wrk 4.1.0（它的分位表只到 99%），p999 出自 `l7gate_c100k` 的 HDR 桶，**本档分辨率 ≈128 µs/请求**；每条 series 自带 `canonic`/`conns`/`batch`，`canonic=0` 的批次不得当 SLO 判定读；**1000 并发那档的 p999 判「取不到」**（B-009，卡点是观察者单核饱和——所以观察者那一列与分位同格发） |
+| 3 活跃连接 | `live_connections`、`sum(increase(downstream_accepted[1m]))` | `live_connections` 数的是 `Connection` 对象；SLO #2 的分母已裁成「连接对」（1 客户端 + 1 回源），读成连接对要除以 2 |
+| 4 熔断状态 | `health_ejected_now`、`circuit_half_open_now`、`health_ejections_blocked_by_valve`、`health_all_denied_fallback` | 装配熔断时 `health_ejected_now` 的口径 = 摘除 + 半开（ADR-12 追加二）；`blocked_by_valve` 非零就是安全阀在挡摘除 |
+| 5 上游健康度 | `{__name__=~"health_t.*_ejections"}` / `_probe_fail` / `_recoveries` / `_trips_rate` | **两条限定必须连着读**：① `health_ejected_now=0` 不能读成「没有坏后端」（ARCHITECTURE 1.31 边界⑥，S4-07 臂 9c 实测 `ejections=0` 而该台自报接了 20/40 条 503 且永不停——只装 `health` 且探活会答、业务恒 5xx 的成员摘不掉，管这一形状要装 `circuit`）；② 逐目标键 `health_t<i>_<addr>_<port>_*` **只覆盖首装那批成员**，配置重载带进来的新成员会正常路由/摘除/恢复，但要进这些键得重启（S5-02 的边界）。另：`trips_rate` 是计数不是比率（ADR-24 第五节） |
+| 6 状态码分布 | `responses_completed`、`rate_limit_rejected`、`gateway_replies_connect_failed`、`gateway_replies_all_ejected`、`gateway_replies_over_capacity` | **429 那一格画的就是 `rate_limit_rejected` 本身**，面板不另算一遍；S5-03 验收要的「仪器与被测方互背书」是这两个数逐数相等（本轮实测静置臂 34==34、扰动臂 49==49，两边取数通道不同：一边是我直接抓 `:18522/metrics`，一边是 Prometheus 的 `:19090/api/v1/query`） |
+
+另有一格**附注**（不是第七格）：`rss_kib_now`，标题与描述写明它是「**含热重载的预留槽位容量**」——arm 了配置热重载的网关把健康表按 `kMaxUpstreamTarget + 1` = 65,535 槽开容量，实测常驻 **+19.1 MiB**（B-020），不许画成「网关自己吃内存」。
+
+一键起（网关与 exporter 在 WSL 里跑，Prometheus/Grafana 走 Docker，契约锁的 tag）：
+
+```bash
+build/release/l7gate --serve --listen 0.0.0.0:18080 --config deploy/gateway-circuit.json --metrics-port 18522 &
+build/release/tools/l7gate_bench_exporter --root build/bench --listen 0.0.0.0:18090 &
+docker run -d --name l7gate-prometheus --add-host=host.docker.internal:host-gateway \
+  -p 127.0.0.1:19090:9090 -v "$PWD/deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+  prom/prometheus:v2.51.2 --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus
+docker run -d --name l7gate-grafana --add-host=host.docker.internal:host-gateway \
+  -p 127.0.0.1:13000:3000 -e GF_SECURITY_ADMIN_PASSWORD=l7gate-demo \
+  -v "$PWD/deploy/grafana/provisioning:/etc/grafana/provisioning:ro" \
+  -v "$PWD/deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro" grafana/grafana:10.4.2
+```
+
+`--add-host=host.docker.internal:host-gateway` 不是可选项：本发行版下容器不共享 WSL 网络命名空间，容器只能经**宿主上被发布的端口**出去（实测这条路抓得到 `18522/metrics`，而 `172.17.0.1` 那一路是 `Connection refused`）。所以 `--listen` 要给 `0.0.0.0`，观测面跟着 `--listen` 走、不另开旋钮。验证脚本：`scripts/smoke-s5-03.sh`（40 项判定，含"六格逐格非空"用的是面板自己那 20 条表达式、以及上面那两条逐数等式）。
+
+**面板是眼睛，不是账本**：三个数字的判定读的仍是 `docs/BENCHMARK.md` 里的落盘读数与 `scripts/bench/` 的原始档；Grafana 上的曲线不进入任何达标结论。
 
 **② WebSocket 调试页——只有三块：地址栏、消息流、输入框**
 
@@ -308,7 +330,7 @@ scripts/bench/s1-p999.sh                  # SLO #1 的 p999 半边：1000 并发
 
 **③ 故障注入的现场**：配合 `tc netem` 注入延迟与丢包，同一页面上能亲眼看到限流返回 429、熔断把后端摘掉。`netem` 在本机 6.18 WSL2 内核上**尚未验证可用**（记在 ENVIRONMENT 第 7 节），所以这一条的落地前提是它可用，否则按契约 8.2 先写 ADR 再换手段。
 
-> 已作为待拆任务记入 [TASKS.md](TASKS.md) 的 S5 行与 [docs/ROADMAP.md](docs/ROADMAP.md) 的 S5 门禁条件。面板与页面都属 S5，不在 S1–S4 的授权范围内，我不会提前动手。
+> S5 的拆解已经过项目所有人确认（2026-11-02，五条岔路逐条按推荐裁定＝已裁第 ⑨ 条）；上面 ② ③ 两格分别落在 S5-04 与 S5-05/S5-06，`tc netem` 在本机 6.18 WSL2 内核上仍未验证可用（S5-06 的第一件事是给可用性判据）。
 
 ---
 

@@ -1,0 +1,28 @@
+# S5-03：Prometheus 抓取配置（契约 9.1 锁 `prom/prometheus:v2.51.2`，禁 `latest`）。
+#
+# 两个 target 都是**宿主机上的端口**，不是容器网络里的服务名。理由是本机的实测事实：
+# 本发行版下容器不共享 WSL 网络命名空间（ENVIRONMENT 第 5 节），但容器经
+# `--add-host=host.docker.internal:host-gateway` 能读到宿主上绑 `0.0.0.0` 的端口
+# —— 本会话实测：抓回 `# HELP elapsed_ms` 那行；`172.17.0.1` 那一路是 `Connection refused`。
+# S5-05 的 compose 里必须带上那条 `extra_hosts`，否则这两个 target 一起变成假目标。
+#
+# 网关侧那两个端口都不是业务端口：`18522` 是 `--metrics-port`（观测面独立端口，已裁第 ⑨ 条
+# 第 2 项；业务客户端摸不到它，抓取连接也进不了 `requests_parsed`）；`18090` 是
+# `l7gate_bench_exporter`（ADR-25，分位那一格的来源——网关自己不产分位）。
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    env: local-demo
+
+scrape_configs:
+  - job_name: l7gate
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:18522']
+
+  - job_name: l7gate-bench-percentiles
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:18090']

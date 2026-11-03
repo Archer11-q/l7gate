@@ -1,0 +1,121 @@
+{
+  "uid": "l7gate-gateway-overview",
+  "title": "L7Gate 网关总览（S5-03 六格）",
+  "tags": ["l7gate", "s5-03"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 0,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "annotations": { "list": [] },
+  "links": [],
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "1 吞吐 · rate(requests_parsed[1m])",
+      "description": "requests_parsed 是网关自报的整数计数（不是工具侧 QPS）。1m 窗口只是这一格的展示口径；SLO #3 的判定读的仍是落盘摘要，面板不是账本。键名不许改这件事写在 ADR-24 第五节。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(requests_parsed[1m]))", "legendFormat": "requests_parsed/s" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "2 转发尾延迟 · 增量 p99 / 增量 p999",
+      "description": "这一格不是网关自报：网关 /metrics 那 101 个键全是整数计数、没有一格是时延（ADR-24 裁「分位由客户端自己算」）。数由 l7gate_bench_exporter 从 build/bench/&lt;batch&gt; 的落盘摘要搬来（ADR-25）。谁产的分位：p99 = wrk 4.1.0（它的分位表只到 99%），p999 = l7gate_c100k 的 HDR 桶，**本档分辨率 ≈128 µs/请求**。多少并发/什么窗口：每条 series 自带 canonic 与 conns 标签，SLO #1 写死的那档是 1000 并发闭环 60 s 稳态（canonic=1）；而 1000 并发那一档的 p999 已判「取不到」——卡点是观察者单核饱和（B-009），带 observer_cores≈1.0 的读数只能当下界，别读成网关的上界。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "showPoints": "auto" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "l7gate_bench_increment_microseconds{quantile=\"p99\"}", "legendFormat": "增量p99 {{tool}}/{{batch}} canonic={{canonic}}" },
+        { "refId": "B", "expr": "l7gate_bench_increment_microseconds{quantile=\"p999\"}", "legendFormat": "增量p999 {{tool}}/{{batch}} canonic={{canonic}}" },
+        { "refId": "C", "expr": "l7gate_bench_observer_cores", "legendFormat": "观察者占单核 {{batch}}/{{arm}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "3 活跃连接 · live_connections",
+      "description": "live_connections 数的是 Connection 对象。SLO #2 的分母已裁成「连接对」（1 客户端 + 1 回源 = 1 个计费单位，已裁第 ④ 条），要读成连接对得除以 2；空闲长连接场景里回源那一半根本没建（outbound_buffers_created=0），所以这一格在空闲档读的是下游对象数。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "live_connections", "legendFormat": "Connection 对象" },
+        { "refId": "B", "expr": "sum(increase(downstream_accepted[1m]))", "legendFormat": "近 1m 新受理" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "4 熔断状态 · health_ejected_now / circuit_half_open_now",
+      "description": "装配熔断时 health_ejected_now 的口径 = 摘除 + 半开（ADR-12 追加二第二节）：量的是容量损失，不是状态名。health_ejections_blocked_by_valve 非零 = 最多摘除比例安全阀在挡摘除，被挡的那台继续接流量并继续失败——那是 ADR-12 要的「故意保留一段错误」，不是 bug。health_all_denied_fallback 非零 = 全员被摘时回退全员（1.25 第三节）。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "showPoints": "auto", "drawStyle": "steps" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "health_ejected_now", "legendFormat": "摘除+半开" },
+        { "refId": "B", "expr": "circuit_half_open_now", "legendFormat": "半开在位" },
+        { "refId": "C", "expr": "health_ejections_blocked_by_valve", "legendFormat": "被安全阀挡下" },
+        { "refId": "D", "expr": "health_all_denied_fallback", "legendFormat": "全员回退" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "5 上游健康度 · 逐目标摘除/探活/错误率窗口",
+      "description": "措辞限定（必须连着读）：① **health_ejected_now=0 不能读成「没有坏后端」**——只装 health 且开着探活时，探活判活会把连续失败计数清零（health.cc:145），一台「探活会答、业务恒 5xx」的成员在业务失败比探活稀疏的流量下摘不掉（S4-07 9c 实测：ejections=0、probe_ok=40、这台自报接了 20/40 条 503 且永不停；同一配置换成突发档摘 6 次，所以这条边界是节奏而不是「从不摘除」）。管这一形状只能装 circuit。出处 ARCHITECTURE 1.31 边界⑥。② 逐目标键 health_t&lt;i&gt;_&lt;addr&gt;_&lt;port&gt;_* **只覆盖首装那批成员**：配置重载带进来的新成员会被正常路由/摘除/恢复，但要进这些键得重启（S5-02 的边界）。键名里那个 trips_rate 底层是「被错误率窗口摘掉的次数」，是 counter 不是比率（ADR-24 第五节）。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "showPoints": "auto", "drawStyle": "steps" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "{__name__=~\"health_t.*_ejections\"}", "legendFormat": "摘除 {{__name__}}" },
+        { "refId": "B", "expr": "{__name__=~\"health_t.*_probe_fail\"}", "legendFormat": "探活失败 {{__name__}}" },
+        { "refId": "C", "expr": "{__name__=~\"health_t.*_recoveries\"}", "legendFormat": "恢复 {{__name__}}" },
+        { "refId": "D", "expr": "{__name__=~\"health_t.*_trips_rate\"}", "legendFormat": "错误率窗口摘除次数 {{__name__}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "6 状态码分布 · 429 = rate_limit_rejected 本身",
+      "description": "429 那一格画的就是网关自报的 rate_limit_rejected，面板不另算一遍——S5-03 验收句② 要的「仪器与被测方互背书」是这两个数逐数相等，不许拿面板自己的读数替代网关自报。其余各格同为自报计数：responses_completed = 代理到上游并完整收完的响应；gateway_replies_connect_failed = 502；gateway_replies_all_ejected / gateway_replies_over_capacity = 503（回源连不上与本地容量满两条自产表态路径）。gateway_replies_sent 是这几格的合计那一层，不重复画。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "showPoints": "auto" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "responses_completed", "legendFormat": "2xx/3xx/4xx 代理完成" },
+        { "refId": "B", "expr": "rate_limit_rejected", "legendFormat": "429 rate_limit_rejected" },
+        { "refId": "C", "expr": "gateway_replies_connect_failed", "legendFormat": "502 connect failed" },
+        { "refId": "D", "expr": "gateway_replies_all_ejected", "legendFormat": "503 全员被摘" },
+        { "refId": "E", "expr": "gateway_replies_over_capacity", "legendFormat": "503 本地容量满" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "附 · 常驻内存 rss_kib_now（不是第七格，六格是契约 4.2 那六格）",
+      "description": "这一格引用 B-020 那笔账：**arm 了配置热重载的网关，健康表按全下标空间 kMaxUpstreamTarget+1 = 65,535 槽开容量，实测常驻 +19.1 MiB**（两臂各自组内极差 <0.3 MiB，约 303 B/槽）。它是「含热重载的预留槽位容量」，**不是「网关自己吃内存」**；SLO #2 那 17.47 KiB/连接对讲的是另一件事（每连接对象，B-007/B-011）。",
+      "datasource": { "type": "prometheus", "uid": "l7gate-prom" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "kbytes", "custom": { "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "expr": "rss_kib_now", "legendFormat": "VmRSS KiB（含热重载的预留槽位容量）" }
+      ]
+    }
+  ]
+}

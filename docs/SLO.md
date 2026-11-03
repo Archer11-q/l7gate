@@ -35,6 +35,7 @@
 - 工具：wrk（`--latency`）与 hey 交叉验证
   - **这套第三方工具的覆盖范围到 99% 为止**：wrk 4.1.0 的 `--latency` 只打 50/75/90/99 四行，hey 0.1.4 的分位表只到 99%。所以 p999 ≤ 5.0 ms 这半边**在 2026-10-28 之前是无法判定的**——不是没跑，是取不到那个分位。
   - **p999 的取数方案已于 2026-10-26 裁决、并于 2026-10-28（S2-06）落地**：在**自研 C100K 长连接客户端**里做 HDR 分位统计（SLO #2 本来就要自研这个客户端，见契约 1.3 唯一允许自研压测客户端的场景），不引入 wrk2/vegeta 之类第三方依赖。落地形态：`l7gate_c100k --requests-per-conn N`（**闭环请求形态**，每连接一次只在飞一条，量的是**每请求**转发延迟；默认的隧道空闲形态量的是握手，两者不是同一个物理量，别拿后者填这一格）。记录已就位（B-006 结果三），**判定仍要等 S2-07 按取样规程出增量、1000 并发、≥2 轮**那一份。方案记录在 `docs/adr/ADR-17-c100k-hdr-measurement.md`。
+- **演示面上那一格 p99/p999 从哪儿来（S5-03，`docs/adr/ADR-25-bench-percentile-exporter.md`）**：网关自己不产分位——`/metrics` 那 101 个键全是整数计数，没有一格是时延（ADR-24 裁「分位由客户端自己算」）。Grafana 第 2 格读的是 `tools/l7gate_bench_exporter` 从 `build/bench/<批>/s1-p99.summary.txt`（wrk，只到 p99）与 `s1-p999.summary.txt`（`l7gate_c100k` 的 HDR 桶，≈128 µs/请求）搬来的**已落盘读数**，每条 series 带 `canonic`/`conns`/`batch`/`observer_cores`。**这一格只是把上面那两条线搬到眼睛前面，不新增测量条件、不产生判定**：#1 的达标判定读的仍是本节写死的五条参数与 BENCHMARK 的落盘记录；`canonic=0` 的批次在图上可区分，不得当判定读。
 - 环境前置：CPU 绑核方案、内存分配器、全部组件版本号（见 ENVIRONMENT.md 第 7 节）
   - B-001 的落实：分配器已记录（glibc，`LD_PRELOAD` 空）、组件版本号已由 `scripts/bench/env-snapshot.sh` 一次性落盘、**绑核未做**（WSL 下 cpufreq 接口不可读，方案按 ENVIRONMENT 第 7 节留到 S4）——这条偏差在 BENCHMARK.md 里显式声明过，不是遗漏
 

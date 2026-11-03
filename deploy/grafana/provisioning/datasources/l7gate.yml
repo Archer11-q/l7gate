@@ -1,0 +1,18 @@
+# S5-03：Grafana 的数据源（契约 9.1 锁 `grafana/grafana:10.4.2`，禁 `latest`）。
+#
+# URL 走的是本会话实测过的那条通路：容器 → 宿主上被 `-p` 发布出来的端口。
+# 不写 `prometheus:9090` 那种服务名——那假设容器之间能按名字解析，而这台机器上
+# 「容器不共享 WSL 网络命名空间」是实测事实（ENVIRONMENT 第 5 节），S5-05 的 compose
+# 要用哪一种拓扑，得由它自己那一条的实测决定，不在这里预先承诺。
+apiVersion: 1
+
+datasources:
+  - name: L7Gate-Prometheus
+    uid: l7gate-prom
+    type: prometheus
+    access: proxy
+    url: http://host.docker.internal:19090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s

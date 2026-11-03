@@ -23,7 +23,7 @@ for p in debug asan-ubsan tsan; do
   if (( rc != 0 )); then fail=1; continue; fi
   out=$(ctest --preset "$p" 2>&1)
   rc=$?
-  printf '%s\n' "$out" | grep -E 'tests passed|tests failed' | sed 's/^/   /'
+  printf '%s\n' "$out" | grep -E 'tests passed|tests failed|Test #.*Failed|\*\*\*' | sed 's/^/   /'
   (( rc == 0 )) || fail=1
 done
 

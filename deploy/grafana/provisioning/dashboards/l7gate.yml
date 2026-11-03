@@ -1,0 +1,14 @@
+# S5-03：面板入库走 provisioning（不落 Grafana 的数据库，不把面板做成"我手工点出来的东西"）。
+# JSON 是唯一真相：`scripts/smoke-s5-03.sh` 从这份文件里逐格取出 `expr`，
+# 拿**同一串表达式**去问 Prometheus——所以「面板画的」与「脚本断的」不可能分家（ADR-25 第八节 E2）。
+apiVersion: 1
+
+providers:
+  - name: L7Gate
+    orgId: 1
+    folder: L7Gate
+    type: file
+    disableDeletion: true
+    allowUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

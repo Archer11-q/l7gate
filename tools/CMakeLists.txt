@@ -31,3 +31,9 @@ endif()
 # 另一份东西了。hiredis 由 l7gate_core 传递带进来（根 CMakeLists 的 find_library REQUIRED）。
 add_executable(l7gate_redis_probe redis_probe_main.cc)
 target_link_libraries(l7gate_redis_probe PRIVATE l7gate_core)
+
+# S5-03 / ADR-25：把已落盘的压测摘要发成 Prometheus gauge，喂面板上「p99/p999」那一格
+# （网关那 101 个键全是整数计数，没有一格是时延——ADR-24 裁的就是「分位由客户端自己算」）。
+# **刻意不链 l7gate_core**：这个进程与产品代码零共享，"仪器不进被测方"在这里是链接期的事实，
+# 不是我在文档里的一句承诺。它只读 build/bench 下的摘要，不产生负载、不读被测方内存。
+add_executable(l7gate_bench_exporter bench_exporter_main.cc)
