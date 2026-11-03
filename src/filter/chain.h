@@ -11,6 +11,13 @@
 #include "http/request_parser.h"
 #include "route/router.h"
 
+// S5-02（ADR-10 追加节第四节）：链上要说的是"这一条请求读哪一代策略"，而那一代长什么样
+// 是 `route/config_snapshot.h` 的事。这里**只**前向声明——链不许因为一个指针字段就把自己
+// 编译进策略层的细节里（`RequestFilter` 的每个实现各自去 include 它真正要读的那部分）。
+namespace l7gate::route {
+struct ConfigSnapshot;
+}  // namespace l7gate::route
+
 // S1-08：filter 链的**骨架**。限流、熔断归 S4（`TASKS.md`）；S3-01 在这里起了**第一个
 // 业务 filter**（路由）。骨架要交付的是三件事，一件比一件容易被后来的改动磨掉：
 //   一、顺序 = 配置顺序，而且这件事能被单测断言（不是"我记得是正序"）；
@@ -51,6 +58,16 @@ struct RequestInfo {
   std::span<const http::HeaderEntry> headers;
   std::size_t request_bytes = 0;  // 整条请求的原始字节数（含 body 区）
   int downstream_fd = -1;         // 这条请求来自哪条下游连接（S1 的身份就是 fd）
+
+  // --- S5-02（ADR-10 追加节第四节）：这一条请求读的那**一代**策略 -------------------
+  // 由调用方（`Reactor`）在跑链之前取一次世代指针，`shared_ptr` 钉在调用帧里，链跑完就
+  // 放。它和上面那四个 view 一样是借的——**不许存进 filter 的成员**，同一条纪律。
+  // nullptr = 这台网关没 arm 配置重载（缺省），filter 于是回落到自己构造时拿到的那份表，
+  // 行为与 S5-02 之前逐字节相同。
+  // 为什么字段在 `RequestInfo` 而不是每环各取一次发布器：那会让一条请求的"路由"与
+  // "这一组里选哪台"分属两代（换代恰好落在两环之间时，路由指过去的那个组下标可能在新表里
+  // 根本不存在，或者更坏——存在但是别人的成员）。一次读取 = 一次决定。
+  const l7gate::route::ConfigSnapshot* config = nullptr;
 
   // --- S3-01（ADR-18）+ S3-02（ADR-19）：写回字段。读者是 reactor 与链上的下一环 -------
   // 上游**组**的下标。S3-02 把路由的返回从"端点"改成"一组后端"：路由说"这条请求属于哪一组"，

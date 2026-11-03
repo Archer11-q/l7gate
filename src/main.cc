@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "config/config_reloader.h"
 #include "config/gateway_config.h"
 #include "config/nodes_store.h"
 #include "core/build_info.h"
@@ -31,6 +32,7 @@
 #include "net/proc_sample.h"
 #include "net/reactor.h"
 #include "net/reactor_group.h"
+#include "route/config_snapshot.h"
 #include "route/nodes.h"
 #include "route/router.h"
 
@@ -43,7 +45,7 @@ void usage(std::FILE* out) {
       "      l7gate --serve --listen <ipv4:port> --upstream <ipv4:port>[,<ipv4:port>...]\n"
       "               [--serve-requests N] [--max-connections N]\n"
       "               [--high-water-mark BYTES] [--workers N] [--drain-timeout-ms MS]\n"
-      "               [--config <path>]\n"
+      "               [--config <path>] [--config-reload-ms MS]\n"
       "               [--nodes-db <host:port>] [--nodes-user U] [--nodes-password P]\n"
       "               [--nodes-schema DB] [--nodes-reload-ms MS] [--nodes-timeout-ms MS]\n"
       "               [--upstream-connect-timeout-ms MS] [--upstream-head-timeout-ms MS]\n"
@@ -84,6 +86,12 @@ void usage(std::FILE* out) {
       "路由：前缀取最长命中、正则全串锚定且优先于前缀，匹配原始 origin-form（含 query、不解码、不规范化）；\n"
       "无匹配回 404 并关连接。balance 只认 round_robin / least_conn / consistent_hash。\n"
       "不给 --config 时一个 filter 都不装，链是空的，行为与 S2-06a 逐字节同形。\n"
+      "--config-reload-ms MS（S5-02，ADR-10 落地追加节）：配置热重载的节拍。缺省 0 = 不重载，\n"
+      "那时与 S5-02 之前逐字节相同。> 0 时由 0 号 worker 的循环每 MS 毫秒 stat 一次 \n"
+      "--config 那个文件，内容哈希变了才解析→校验→装配→一次原子发布；坏配置保留上一代继续服务、\n"
+      "拒载有账（config_rejects_*）。改的是配置不是进程：不换二进制、不 fork、不传监听 fd、\n"
+      "不关任何连接（那叫热重启，本项目不做）。定义域外的变化一律拒载并点名：限流参数、\n"
+      "段的出现/消失、命令行来源的参数、source=mysql 的组。\n"
       "--nodes-*（S3-04，ADR-20）：节点表的 MySQL 来源。文件里声明了 \"source\": \"mysql\"\n"
       "的组，其成员从 <schema>.l7gate_nodes 表读取（组名/address/port/health_path），\n"
       "每 --nodes-reload-ms（默认 5000，0 = 只在启动时读一次）reload 一次。reload 失败\n"
@@ -373,6 +381,41 @@ void report_stats(l7gate::net::ReactorStats& stats, std::uint64_t epoll_registra
   }
 }
 
+// S5-02（ADR-10 追加节第五节）：配置重载的账。**一行一键、且只在 arm 时打**：
+// 关闭态那 60 格 golden（`scripts/golden/serve-keys-off.txt`，与修前二进制逐行相同那条判据）
+// 因此一个字节都不动。"一行一键"不是排版洁癖而是取数代数——S4-05 记过的那一格（一行多键 +
+// 行首锚 = 其余几格静默读成空串，而空串在判定里长得像 0）我在本任务的冒烟第一轮又踩了一次：
+// 判定读 `config_publishes` 读出空，红的却是我的取数方式。
+void report_config_reload(const std::shared_ptr<const l7gate::route::ConfigPublisher>& publisher,
+                          const l7gate::config::ConfigReloader* reloader) {
+  if (publisher == nullptr) return;
+  auto put = [](std::string_view key, long long value) {
+    std::printf("[serve] %.*s=%lld\n", static_cast<int>(key.size()), key.data(), value);
+  };
+  put("config_gen", static_cast<long long>(publisher->generation()));
+  put("config_checks", static_cast<long long>(publisher->checks()));
+  put("config_publishes", static_cast<long long>(publisher->publishes()));
+  put("config_rejects", static_cast<long long>(publisher->rejects()));
+  put("config_rejects_syntax", static_cast<long long>(publisher->rejects_syntax()));
+  put("config_rejects_scope", static_cast<long long>(publisher->rejects_scope()));
+  put("config_snapshots_constructed",
+      static_cast<long long>(l7gate::route::ConfigSnapshot::constructed()));
+  put("config_snapshots_destructed",
+      static_cast<long long>(l7gate::route::ConfigSnapshot::destructed()));
+  put("config_snapshots_live",
+      static_cast<long long>(l7gate::route::ConfigSnapshot::live()));
+  put("config_last_publish_epoch_ms",
+      static_cast<long long>(publisher->last_publish_epoch_ms()));
+  put("config_last_publish_duration_ms",
+      static_cast<long long>(publisher->last_publish_duration_ms()));
+  if (reloader != nullptr && !reloader->last_reject_reason().empty()) {
+    // 分类计数回答"拒了几次、哪一类"，这一格回答"到底是哪个字段"。两个都要，
+    // 缺后者就只能靠人去猜为什么没生效（口径：拒绝必须点名）。
+    std::printf("[serve] config_last_reject=%s\n", reloader->last_reject_reason().c_str());
+  }
+  std::fflush(stdout);
+}
+
 // S4-03（ADR-21）：限流的启动横幅与退出账。**共用一份桶表**的两种装配路径
 // （单 Reactor / ReactorGroup）都要打同一组键，冒烟/报告只认这一份口径。
 std::string rate_limit_key_text(const l7gate::config::RateLimitSection& section) {
@@ -454,6 +497,9 @@ int serve(int argc, char** argv) {
   bool have_nodes_schema = false;
   l7gate::config::NodesDbParams nodes_params;
   long long nodes_reload_ms = 5000;
+  // S5-02（ADR-10 追加节第二节）：配置重载的节拍。0 = 不重载（缺省，关闭态零行为差异）。
+  // 它是命令行来源——重载不许成为已裁②那条切分（`--config` 只装策略）的例外。
+  long long config_reload_ms = 0;
   // S4-01（ADR-21）：请求级超时三格。0 = 关闭该格。
   long long upstream_connect_timeout_ms = 3000;
   long long upstream_head_timeout_ms = 10000;
@@ -513,6 +559,14 @@ int serve(int argc, char** argv) {
         return 2;
       }
       nodes_reload_ms = n;
+      ++i;
+    } else if (flag == "--config-reload-ms" && value != nullptr) {
+      long long n = 0;
+      if (!parse_number(value, &n) || n < 0 || n > 86400000) {
+        std::fprintf(stderr, "参数错误: --config-reload-ms 要的是 0..86400000，收到 %s\n", value);
+        return 2;
+      }
+      config_reload_ms = n;
       ++i;
     } else if (flag == "--nodes-timeout-ms" && value != nullptr) {
       long long n = 0;
@@ -744,6 +798,73 @@ int serve(int argc, char** argv) {
           UpstreamEndpoint{node->address, node->port, node->health_path});
     }
   }
+  // --- S5-02（ADR-10 落地追加节）：配置世代与重载的节拍 ---------------------------
+  // 缺省 0 = 不重载时，下面这一整段被一次判空跳过：发布点是空的、worker 拿到 nullptr、
+  // 每条请求的 `RequestInfo::config` 也是 nullptr。于是"关闭态与 S5-02 之前逐字节相同"
+  // 不是一句承诺，是这一格的形状（同 `nodes.h` 那条「nullptr = 不跑 reload」的口径）。
+  std::shared_ptr<l7gate::route::ConfigPublisher> config_publisher;
+  // 只留首代里**那一格策略**的针（给健康表），不留整份首代快照：留着它，第一代就永远
+  // 不会被释放，`config_snapshots_live` 会永远读成 2 而不是 1——这一格是验收句② 的判据，
+  // 而冒烟第一轮真的把它读成了 2，抓到的就是这个持有者。
+  std::shared_ptr<const l7gate::route::HealthPolicy> first_policy;
+  std::uint64_t first_hash = 0;
+  if (config_reload_ms > 0) {
+    std::string why;
+    if (config_path.empty()) {
+      std::fprintf(stderr, "参数错误: --config-reload-ms 需要 --config（没有文件就没有可重载的东西）\n");
+      return 2;
+    }
+    if (!mysql_group_names.empty()) {
+      std::fprintf(stderr,
+                   "配置错误: 有组声明 source=mysql 又给了 --config-reload-ms（两条发布路径不叠加："
+                   "节点表 reload 与文件重载各自有节拍，叠在一起就是两份真相往同一个下标空间写，"
+                   "见 ADR-10 追加节第一节第 7 条与已裁第 ② 条的理由）\n");
+      return 2;
+    }
+    if (!l7gate::config::ConfigReloader::file_content_hash(config_path, &first_hash, &why)) {
+      std::fprintf(stderr, "配置错误: %s（来自 %s）\n", why.c_str(), config_path.c_str());
+      return 2;
+    }
+    // 首装那一代也走 ever-seen 注册表：静态端点先 intern，它们的下标必须与文件端点表
+    // 一一对应（0..E-1），新地址的追加从这之后开始——与 mysql 那条路径同一个做法。
+    for (const l7gate::config::Endpoint& endpoint : gateway_config.endpoints()) {
+      nodes_registry->intern(
+          l7gate::route::NodeTarget{endpoint.address, endpoint.port, endpoint.health_path});
+    }
+    std::shared_ptr<const l7gate::route::ConfigSnapshot> first_snapshot =
+        l7gate::config::build_config_snapshot(gateway_config, first_hash, 1u,
+                                              *nodes_registry, &why);
+    if (first_snapshot == nullptr) {
+      std::fprintf(stderr, "配置错误: 首代快照装配失败: %s（来自 %s）\n", why.c_str(),
+                   config_path.c_str());
+      return 2;
+    }
+    // 下标对齐是**硬前置**：对不上就是"文件说 3 号是 A、注册表说 3 号是 B"，
+    // 那条请求会安静地发到一台没人配置过的后端上——这种错必须在启动时退出，
+    // 不能留到运行期由一次压测替我发现。
+    if (first_snapshot->nodes->targets.size() != gateway_config.endpoints().size()) {
+      std::fprintf(stderr, "配置错误: 首代目标表 %zu 行与文件端点表 %zu 行不等长（装配漏检）\n",
+                   first_snapshot->nodes->targets.size(), gateway_config.endpoints().size());
+      return 2;
+    }
+    for (std::size_t i = 0; i < gateway_config.endpoints().size(); ++i) {
+      const l7gate::route::NodeTarget& seen = first_snapshot->nodes->targets[i];
+      const l7gate::config::Endpoint& declared = gateway_config.endpoints()[i];
+      if (seen.address != declared.address || seen.port != declared.port) {
+        std::fprintf(stderr,
+                     "配置错误: 下标 %zu 上两份表说的不是同一台（文件 %s:%u vs 注册表 %s:%u）\n",
+                     i, declared.address.c_str(), static_cast<unsigned>(declared.port),
+                     seen.address.c_str(), static_cast<unsigned>(seen.port));
+        return 2;
+      }
+    }
+    config_publisher = std::make_shared<l7gate::route::ConfigPublisher>();
+    config_publisher->publish(first_snapshot);
+    // 首代的策略单独留一根针（健康表要用），整份首代快照不留：发布点就是它唯一的持有者，
+    // 之后每换一代它就该被释放（`config_snapshots_live` 的读法依赖这一点）。
+    first_policy = first_snapshot->health;
+  }
+
   // 单 Reactor 路径（workers < 2）只有一条循环。它的默认目标是第 0 个端点；装了路由/均衡
   // 就会按请求连到策略指的那个。不给它做"一个 worker 自己轮换多端点"的机制照旧成立——
   // 轮换就是没有理由的选择，理由是策略给的，不是循环自己编的。
@@ -761,18 +882,37 @@ int serve(int argc, char** argv) {
     // 节点表启用时健康表按**下标空间全量**开容量（ever-seen：新成员只"启用"新槽位，
     // 不 resize 共享表——ADR-20 第四节）。纯文件配置维持"容量 = 成员数"的现状，
     // 一字节不多花。
+    // S5-02：文件重载 arm 时同样是 ever-seen 增员（新地址随时可能进表），所以那一臂
+    // 也按全下标空间开容量——代价（常驻内存）量在 BENCHMARK，不是"应该不贵"。
     const std::size_t capacity =
-        nodes_publisher != nullptr
+        (nodes_publisher != nullptr || config_publisher != nullptr)
             ? static_cast<std::size_t>(l7gate::route::kMaxUpstreamTarget) + 1
             : 0;
     health_table = std::make_shared<l7gate::route::HealthTable>(
-        upstream_endpoints.size(), gateway_config.health().policy, capacity);
+        upstream_endpoints.size(), gateway_config.health().policy, capacity,
+        /*policy_reloadable = */ config_publisher != nullptr);
   }
   // 逐目标健康计数器的键名后缀（health_t0_127_0_0_1_18081_ejections=…）。
   std::vector<std::string> health_target_names;
   health_target_names.reserve(upstream_endpoints.size());
   for (const UpstreamEndpoint& endpoint : upstream_endpoints) {
     health_target_names.push_back(endpoint.address + "_" + std::to_string(endpoint.port));
+  }
+
+  // S5-02：节拍钩子的实现。它比两条装配路径都活得久（在 `main` 的作用域里），
+  // 而 worker 循环只在 0 号那一拍调它——钩子内部自己判到点，没到点一次整数比较。
+  std::unique_ptr<l7gate::config::ConfigReloader> config_reloader;
+  if (config_publisher != nullptr) {
+    config_reloader = std::make_unique<l7gate::config::ConfigReloader>(
+        config_path, config_reload_ms, config_publisher, health_table, nodes_registry,
+        gateway_config);
+    // 登记首代来自的那份内容：不登记的话第一次 tick 会把"文件根本没变"读成
+    // "有一次变更待发布"，于是白装配一次、还会多出一条根本不存在的发布账。
+    config_reloader->note_published(first_hash);
+    if (health_table != nullptr && first_policy != nullptr) {
+      // 首代策略也走那一根针：读者与世代同源，`policy_` 那份只是关闭态的借读。
+      health_table->set_policy(first_policy);
+    }
   }
 
   // S4-03（ADR-21）：限流桶表只建一次，两条装配路径拿同一个 `shared_ptr`。
@@ -875,6 +1015,7 @@ int serve(int argc, char** argv) {
     deps.rate_limiter = rate_limiter.get();
     deps.redis_settler = redis_settler.get();
     deps.nodes = nodes_publisher.get();
+    deps.config = config_publisher.get();  // S5-02：没 arm 时是 nullptr，那一族键一个不发
     l7gate::metrics::MetricsServer::Config mc;
     // 绑定地址跟着 `--listen` 走，不另开旋钮（ADR-24 第二节）：缺省 127.0.0.1 时观测面
     // 只在本机可见，容器里部署方把 --listen 写成 0.0.0.0 时它才随之对外。
@@ -912,6 +1053,10 @@ int serve(int argc, char** argv) {
     gconfig.groups = has_groups ? &gateway_config.groups() : nullptr;
     gconfig.health = health_table;
     gconfig.nodes = nodes_publisher;
+    // S5-02：世代发布器下发给每条 worker（每请求 load 自己那一代），
+    // 节拍钩子只给 0 号（`ReactorGroup` 里按 worker_index 分派）。
+    gconfig.config_pub = config_publisher;
+    gconfig.config_reload_hook = config_reloader.get();
     gconfig.rate_limiter = rate_limiter;
     gconfig.rate_key = rate_key;
     gconfig.listen_backlog = config.listen_backlog;
@@ -1008,6 +1153,12 @@ int serve(int argc, char** argv) {
                     nodes_params.database.c_str(), nodes_params.host.c_str(), nodes_params.port,
                     nodes_reload_ms, static_cast<long long>(nodes_params.timeout_ms), mysql_group_names.size());
       }
+      if (config_publisher != nullptr) {
+        // S5-02：把"这台网关 arm 了配置重载、节拍多快、当前第几代"打在启动横幅里——
+        // 冒烟与运维都要在**任何一次重载之前**就知道这三格，否则"没生效"读不出是没到点还是没装配。
+        std::printf("[serve] config_reload=on path=%s interval_ms=%lld gen=%u\n",
+                      config_path.c_str(), config_reload_ms, config_publisher->generation());
+      }
     }
     std::fflush(stdout);
 
@@ -1036,6 +1187,7 @@ int serve(int argc, char** argv) {
                  rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                  health_target_names, nodes_publisher.get());
     report_rate_limit(rate_limiter);
+    report_config_reload(config_publisher, config_reloader.get());
     report_redis(redis_settler.get(), rate_limiter);
     std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
     std::printf("[serve] workers=%d\n", workers);
@@ -1055,6 +1207,10 @@ int serve(int argc, char** argv) {
   // 同一条构造期纪律：健康表在 Reactor 构造之前进 config（Reactor 存 config 的副本）。
   config.health = health_table;
   config.nodes = nodes_publisher;
+  // S5-02：单 Reactor 这一臂那条循环就是 watcher（worker_group_size = 1）。
+  config.config = config_publisher;
+  config.config_reload_hook = config_reloader.get();
+  config.is_config_watcher = config_reloader.get() != nullptr;
   // S5-01：单 Reactor 这一臂的观测槽。**声明必须在 Reactor 之前**——它比循环活得短
   // 的话，worker 拿着的就是一个已经析构的地址（与 `ReactorGroup` 里 `stats_` 那条
   // 声明顺序规矩同一条命）。没开指标面时它一个字节都不会被写。
@@ -1150,6 +1306,12 @@ int serve(int argc, char** argv) {
                   nodes_params.database.c_str(), nodes_params.host.c_str(), nodes_params.port,
                   nodes_reload_ms, static_cast<long long>(nodes_params.timeout_ms), mysql_group_names.size());
     }
+    if (config_publisher != nullptr) {
+      // S5-02：把"这台网关 arm 了配置重载、节拍多快、当前第几代"打在启动横幅里——
+      // 冒烟与运维都要在**任何一次重载之前**就知道这三格，否则"没生效"读不出是没到点还是没装配。
+      std::printf("[serve] config_reload=on path=%s interval_ms=%lld gen=%u\n",
+                    config_path.c_str(), config_reload_ms, config_publisher->generation());
+    }
   }
   std::fflush(stdout);
 
@@ -1176,6 +1338,7 @@ int serve(int argc, char** argv) {
                rss_start, static_cast<long long>(elapsed_ms), health_table.get(),
                health_target_names, nodes_publisher.get());
   report_rate_limit(rate_limiter);
+  report_config_reload(config_publisher, config_reloader.get());
   report_redis(redis_settler.get(), rate_limiter);
   std::printf("[serve] event_batches=%llu\n", static_cast<unsigned long long>(batches));
   if (metrics != nullptr) report_metrics(*metrics);

@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "http/request_parser.h"
+#include "route/config_snapshot.h"
 
 namespace l7gate::filter {
 namespace {
@@ -73,9 +74,14 @@ Decision LoadBalanceFilter::on_request(RequestInfo& info) {
   // 节点表 reload（S3-04，ADR-20 第四节）：有发布器且已有快照时，**每请求 load 一根
   // 指针**——组表读的是当前快照，不是构造给的那份。快照的下标顺序 = 文件顺序
   // （build_nodes_view 的保证），所以 `upstream_group` 的值在换表前后是同一个组。
+  // S5-02（ADR-10 追加节第四节）：文件重载 arm 时这条请求已经带着一整个世代了，
+  // 组表就读那个世代——**一次读取 = 一次决定**，路由与均衡不会分属两代。两条发布器
+  // 由启动时那条互斥保证只可能有一个非空（mysql 组 + arm 文件重载 = 启动拒绝）。
   const route::GroupTable* current_table = &table_;
   std::shared_ptr<const route::NodesView> snapshot;
-  if (nodes_ != nullptr) {
+  if (info.config != nullptr) {
+    current_table = &info.config->nodes->groups;
+  } else if (nodes_ != nullptr) {
     snapshot = nodes_->load();
     if (snapshot != nullptr) current_table = &snapshot->groups;
   }

@@ -117,9 +117,16 @@ class LbState {
   std::size_t advance_rr(std::uint16_t group, std::size_t member_count) noexcept;
 
   // S3-04（ADR-20）：ever-seen 增员后由 **owner worker** 在对账 tick 里扩容配对账。
-  // 只能在 owner 循环线程调用（与 note_paired 同一条纪律）；resize 保住已有账目，
-  // 新槽位记 0（新成员没有历史配对）。组数不扩：组是文件的静态段，reload 不改它。
+  // 只能在 owner 循环线程调用（与 `note_paired` 同一条纪律）；resize 保住已有账目，
+  // 新槽位记 0（新成员没有历史配对）。
   void ensure_capacity(std::size_t target_count) noexcept;
+
+  // S5-02（ADR-10 追加节第一节第 2 条）：**组数也会扩**了。原来那句"组数不扩：组是文件的
+  // 静态段，reload 不改它"在配置热重载落地之后不再成立——重载可以新增一个上游组，
+  // 而 `rr_cursor_` 是按组下标索引的（`advance_rr` 直接 `rr_cursor_[group]`），
+  // 不扩就是越界写。同一个纪律：只在 owner 循环线程调用，resize 保住已有游标，
+  // 新组从 0 开始轮；组数变少不缩（游标多留几格没有后果，缩它反而要在读侧再判一次界）。
+  void ensure_group_capacity(std::size_t group_count) noexcept;
 
   std::size_t target_count() const noexcept { return target_pairings_.size(); }
 

@@ -314,7 +314,7 @@ S1-07 交的是**动作**：撞停读线之后摘掉这条 fd 的 EPOLLIN，水�
 
 **「新增 filter 不修改转发主路径的任何一行代码」这句验收在测试里的可执行形式**不是数源码行数，而是同一套流量在"空链"与"两条放行 filter"下逐项相等：`PassThroughFiltersChangeNothingInTheForwardingPath` 比响应内容（状态行 + body 逐段拼接），也比 `requests_parsed`/`bytes_down_to_upstream`/`responses_completed`/`upstream_opened`/`epoll_registrations`/`epoll_modifications`/`high_water_hits`。**只比响应字节不够**——多一个 filter 就多一串 syscall 的话，主路径已经被动了，而客户端看不出来。反过来说，这条断言能成立的前提是策略本来就在 reactor 而不在 Connection：S1-04 起 `net/connection.h` 顶部就写着"它不做路由、不做转发决策、不碰 epoll"，那时这句话是给 S1-08 留的地基，现在它有了第一个读者。
 
-**`RequestInfo` 里全是借用的 view，规矩写在类型注释上、也写在用例里。** `method`/`target`/`headers` 指向下游入向缓冲，`Connection::finish_request` 一消费就作废（S1-03 定的 view 生命周期、S1-04 落成"下一次读之前取用完毕"）。所以 filter 不许把 `RequestInfo` 或它里面的任何 `string_view` 存进成员——要跨请求记住东西，记连接身份（`downstream_fd`）和 filter 自己的状态。`ReactorMarkerFilter` 只在"递给它的确实是一条真请求的可见面"（方法、目标、至少一个头、`request_bytes > 0`、fd ≥ 0）时才计数，否则"主路径把 ParsedRequest 递给链"这一步可以是个空壳而没人发现。
+**`RequestInfo` 里全是借用的东西，规矩写在类型注释上、也写在用例里。**（S5-02 起除了那三个 view，还多一个借来的 `const ConfigSnapshot*`：同一条纪律——针由调用方的栈帧钉着，链跑完就作废，**不许存进 filter 的成员**。） `method`/`target`/`headers` 指向下游入向缓冲，`Connection::finish_request` 一消费就作废（S1-03 定的 view 生命周期、S1-04 落成"下一次读之前取用完毕"）。所以 filter 不许把 `RequestInfo` 或它里面的任何 `string_view` 存进成员——要跨请求记住东西，记连接身份（`downstream_fd`）和 filter 自己的状态。`ReactorMarkerFilter` 只在"递给它的确实是一条真请求的可见面"（方法、目标、至少一个头、`request_bytes > 0`、fd ≥ 0）时才计数，否则"主路径把 ParsedRequest 递给链"这一步可以是个空壳而没人发现。
 
 **运行期不许改链，这不是保守而是时序。** `add_request_filter` 只在 `run()` 之前有效：链在循环线程里被逐条读，没有任何加锁，运行中 push 就是一场 data race（S2 的线程模型落地后这条更贵）。测试侧因此没有直接调 `reactor()->add_request_filter()`，而是在 `Harness::start()` 里、spawn 循环线程**之前**搬进去——测试不能自己先违反它要证的那条规矩。S5 要热更新的话，安全形状是"整条链换一根指针"，不是往 vector 里塞。
 
@@ -1378,6 +1378,76 @@ Grafana 上 `rate()` 对 gauge 静默出空曲线，而那正是契约要"亲眼
 **边界（读数不许超出这一格）**：运行期那族读数最多滞后一拍（200ms），退出账仍是 join 之后的精确和，
 脚本与 SLO 的判定继续走退出账；`read_disarmed_connections` 在 100k 连接拓扑下的遍历成本**本轮没量**，
 只把它降到每秒至多一次——那条账挂在 S5-07。两臂成本的实测在 `docs/BENCHMARK.md` **B-019**。
+
+
+### 1.35 配置世代与热重载（S5-02，ADR-10 落地追加节）：一次原子 store、每请求一次读取、旧世代被引用计数延命
+
+这一节写的是**已经存在的代码**长什么样（不是规划）。它回答的问题是："改 `--config` 那个文件
+而进程不动"这件事在这台网关里由哪些对象承担，以及为什么"存量请求走完旧表"不需要给请求挂一个
+配置对象。
+
+**一个类型、一个发布点、一次 store。** `route::ConfigSnapshot`（`src/route/config_snapshot.h`）
+是不可变的世代对象：`RouteTable`（正则已编译）+ `std::shared_ptr<const NodesView>`（组表 +
+ever-seen 目标列表，环已建好）+ `std::shared_ptr<const HealthPolicy>` + 内容哈希 + 世代号。
+`route::ConfigPublisher` 是 `atomic<shared_ptr<const ConfigSnapshot>>`——与 `nodes.h:109`
+那个节点表发布点同一家形状、同一对 memory order（acquire/release）。**全仓库"配置换代"只有
+`publish()` 这一处 store**，写者只有一个（watcher 那一拍），worker 一律 `load`。
+"半套生效"不是被我避免的，是**没有代码路径**：校验与装配全部发生在新对象里，任何一步失败就
+把它丢掉，而在册那一代连被触碰都没有。
+
+**节拍在循环里，实现在 `config/`。** `Reactor::Config::config_reload_hook` 是一个只有
+`reload_tick(now_ms)` 的虚接口（`route::ConfigReloadHook`），实现是
+`config::ConfigReloader`：`net/` 因此既不知道 JSON 也不知道字段清单，它只负责"到点了问一句"。
+`now_ms` 传的是循环自己已经读过的那把单调钟（`reactor.cc:332`），所以**没到点一个 syscall 都不发**。
+到点了三件事：`stat` 比 (mtime 纳秒, size) → 变了才读文件算 FNV-1a 内容哈希 → 哈希相同就当没发生
+（`touch` 不算一次重载，`config_checks` 与 `config_publishes` 因此是两格，口径来自 ADR-20 第五节）。
+只有 `worker_index == 0` 那条循环挂着钩子（`reactor_group.cc` 里按 worker 分派），别的 worker
+只做对账不做装配。`--config-reload-ms` 缺省 **0 = 不重载**，那一整段被一次判空跳过。
+
+**一次请求只认一代，靠的是一个借用指针。** `Reactor::forward_pending_requests_body` 在跑链之前
+`load` 一次世代（`shared_ptr` 钉在本帧），把裸指针放进 `RequestInfo::config`；`RouteFilter`
+与 `LoadBalanceFilter` 读的都是这同一份，帧结束就放（`lb_filter.cc:73-82` 那套"每请求 load
+一根快照指针"的形状，S3-04 已经跑过）。为什么不"整条链换一根指针"（`reactor.h:212-220`
+那句 S5 预告的形状）：**本轮链的形状不变**——段的存在性属于装配、不在重载定义域；链上三个
+filter 持有的活态（`LbState`/`HealthTable`/`RateLimiter`）本来就该跨代存活，被换掉的只有策略。
+那条注释真正禁止的事（往正在被循环读的 vector 里 push）没有发生。
+
+**"存量请求走完旧表"是三条性质的合取**（不是数响应条数）：① 读取窗口只在链那一段同步；
+② 窗口之外请求只带 `upstream_target` 这个**ever-seen 下标**，下标→端点的解析表只追加、
+从不替换（改一个成员 = 新下标 = 新成员，删一个 = 槽位留着但退出候选集，ADR-20 第四节裁过的
+语义在文件重载上同样成立）；③ reload 不关任何连接、不迁 fd、不重置池。所以后面那几步
+（建连、配对账、响应记账）**不需要新配置也能走完**。冒烟阶段 3 把这三条钉成实测：一台会压
+500 ms 才回的上游挂着三条在飞请求，那一刻改路由指向，三条都拿到完整的**旧后端** 192 字节体。
+
+**旧世代的释放判据是测出来的。** `ConfigSnapshot` 的构造/析构各打一次数（文件作用域的两个
+原子，与 `stats.h:40-41` 那对 `connections_constructed` 同一口径：**在册 = 构造 − 析构**）。
+`S5_02_Publisher.OldGenerationIsNotFreedUntilTheLastReferenceGivesItUp` 钉住一根针、发布下一代、
+断言析构数不动且在册 = 2，放开那根针、断言析构 +1 回到 1。这条判据第一轮就抓到过一个真错：
+`main` 里留着一根首代快照的针，于是 `config_snapshots_live` 永远读成 2——修法是只留首代那格
+**策略**的针（健康表要用），整份快照不留。
+
+**策略没有第二份真相。** `HealthTable` 构造期那份 `policy_` 保留给关闭态；arm 之后读的是
+`live_policy_` 那根 `atomic<shared_ptr<const HealthPolicy>>`，而它指向的就是当前快照里的
+`health` 成员（同一根针，不是抄本；用例断的就是指针相等）。读取经 `PolicyView`：
+**没 arm 时一次分支借构造期那份、零原子**，arm 时才付一次引用计数。`bucket_ms_` 那个派生成员
+被删了——`window_ms` 变成可重载的东西之后，派生值再存一份就是两份真相，改它必须同步。
+一处混合世代是明知而留着的：失败记账发生在链窗口之外，读的是记账那一刻的参数（替它的做法是
+给 `Connection` 挂 `shared_ptr`，+16 B/连接且要动 `sizeof(Connection)==528` 那条 static_assert，
+而 SLO #2 的每连接预算正按这个尺寸讲）。
+
+**定义域外的变化一律拒载并点名**（`ConfigReloader::in_scope`）：限流段任何变化、段的出现/消失、
+命令行来源的键、`source: mysql` 的组、文件 > 1 MiB（那格上界与 `load_gateway_config` 本来就有的
+那一条同一个数，不是新立的规矩）。**mysql 组 + arm 是启动就拒**（退出码 2），不是运行期才发现——
+两条发布路径叠在同一台网关上会有两个节拍往同一个下标空间写，那正是已裁② 拒绝的"合并规则"。
+拒载分两格记（`config_rejects_syntax` / `config_rejects_scope`），外加一行
+`config_last_reject=<具体是哪一项>`：分类回答"哪一类"，那一格回答"哪个字段"。
+
+**worker 侧没有第二套对账。** 快照里那半张上游表就是 `NodesView` 形状，所以增员走 S3-04 已经
+在跑的 `apply_nodes_view`（`sync_nodes_snapshot` 与 `sync_config_snapshot` 共用它，四个 owner
+私有面 + 共享健康表启用数一次对齐）。**新增一处**：`LbState::ensure_group_capacity`——轮询游标
+按组下标索引，而 `balance.h` 原来那句"组数不扩：组是文件的静态段，reload 不改它"在配置重载落地后
+不再成立（新增一个组可以复用已有端点、目标数不变），所以那次扩容不能挂在 `apply_nodes_view` 的
+"目标数没变就空转返回"之后，必须在世代变化时无条件做一次。
 
 
 ## 2. 构建契约（这几条是有理由的，不是风格）

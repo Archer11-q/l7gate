@@ -10,6 +10,7 @@
 #include "net/epoll.h"
 #include "net/fd.h"
 #include "net/socket.h"
+#include "route/config_snapshot.h"
 #include "route/nodes.h"
 
 namespace l7gate::filter {
@@ -40,6 +41,8 @@ struct Dependencies {
   const l7gate::filter::RateLimiter* rate_limiter = nullptr;
   const l7gate::filter::RedisSettler* redis_settler = nullptr;
   const l7gate::route::NodesPublisher* nodes = nullptr;
+  // S5-02：配置世代的账（nullptr = 没 arm，那一整族键一个不发）。
+  const l7gate::route::ConfigPublisher* config = nullptr;
 };
 
 // 暴露面本体。三拍状态机（读请求 → 写响应 → 关），没有会话状态、没有 keep-alive：

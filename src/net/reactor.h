@@ -15,6 +15,7 @@
 #include "net/loop_observation.h"
 #include "net/stats.h"
 #include "route/balance.h"
+#include "route/config_snapshot.h"
 #include "route/health.h"
 #include "route/nodes.h"
 
@@ -92,6 +93,18 @@ class Reactor {
     // 新目标在本 worker 线程里追加进 `upstream_targets` / 池桶 / 配对账 /
     // 探活槽位（四个面都是 owner 线程私有的，扩容无竞争）。
     std::shared_ptr<const l7gate::route::NodesPublisher> nodes;
+
+    // S5-02（ADR-10 追加节第三、四节）：配置世代发布器。**nullptr = 不跑配置重载**，
+    // 于是每条请求的 `RequestInfo::config` 恒空、两个读表的 filter 各自回落到构造时那份——
+    // 与 S5-02 之前逐字节相同（"没装配"是实现位置，不是一条 if 的形状，`nodes.h` 同一条口径）。
+    // 与上面那个 `nodes` **互斥**：首装有 mysql 组的网关在启动时就被拒绝 arm 文件重载，
+    // 所以一台网关只有一个策略发布点。
+    std::shared_ptr<const l7gate::route::ConfigPublisher> config;
+    // 重载的节拍钩子（实现住在 `config/ConfigReloader`，它才知道文件长什么样）。
+    // 只有 `is_config_watcher` 那一格为真的那条循环会调它——多个 worker 各自 stat 会把
+    // 同一个文件读 N 遍、还会让"哪一代生效"有两个发起者。nullptr = 不跑。
+    l7gate::route::ConfigReloadHook* config_reload_hook = nullptr;
+    bool is_config_watcher = false;
 
     int listen_backlog = 1024;
     // fd 预算。超过就直接把新连接关掉而不是排队：一个网关在 fd 耗尽时的正确
@@ -515,6 +528,13 @@ class Reactor {
   // （upstream_targets / 池桶 / 配对账 / 探活槽位）+ 共享健康表的启用数。
   // 空转成本 = 一次原子 load + 一次长度比较，没有新成员时为零。
   void sync_nodes_snapshot() noexcept;
+  // S5-02：文件世代的对账。换发了新世代就把那一代的**上游表**推进本 worker 那四个私有面
+  // （与上面那条同一个 `apply_nodes_view`，不新增第二套扩容形状）。
+  void sync_config_snapshot() noexcept;
+  // ever-seen 增员的唯一落点：把一份视图里的目标数对齐到本 worker 的四个私有面 +
+  // 共享健康表的启用数。两个对账入口（节点表 / 配置世代）共用它——同一个"扩容"动作
+  // 有两个实现，迟早一边改了另一边没改。
+  void apply_nodes_view(const l7gate::route::NodesView& view) noexcept;
   // 为对账后新出现的目标追加探活槽（延续 build_probe_slots 的分派规则）。
   void grow_probe_slots(std::size_t from_target, std::size_t to_target) noexcept;
 
@@ -584,6 +604,10 @@ class Reactor {
   void arm_write(const std::shared_ptr<Connection>& conn) noexcept;
 
   Config config_;
+  // S5-02：本 worker 已经对账到的那一代（owner 线程私有，只在循环 tick 与懒对账处读写，
+  // 所以不需要原子也不需要锁——与 `upstream_pool_` 同一类归属）。它存在的意义只是
+  // "指针变了没变"这一次比较：没有它，每一拍都要把整张视图的长度重新对齐一遍。
+  std::shared_ptr<const l7gate::route::ConfigSnapshot> config_gen_;
   // worker 模式（S2-01，ADR-14）下多个 Reactor 共享一份 ReactorStats；单 Reactor
   // 模式自己拥有一份。owned_stats_ 非空即"自持"，stats_ 恒绑定到生效的那一份
   // （*owned_stats_ 或外部共享的）。**声明顺序要紧**：owned_stats_ 必须在 stats_

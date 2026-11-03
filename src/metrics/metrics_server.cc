@@ -1,5 +1,6 @@
 #include "metrics/metrics_server.h"
 
+#include "route/config_snapshot.h"
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -388,6 +389,23 @@ std::string MetricsServer::render_once(std::int64_t now_ms) {
     nodes.last_publish_epoch_ms = deps_.nodes->last_publish_epoch_ms();
   }
   sources.nodes = nodes;
+
+  ConfigAccounts config;
+  if (deps_.config != nullptr) {
+    config.present = true;
+    config.generation = deps_.config->generation();
+    config.checks = deps_.config->checks();
+    config.publishes = deps_.config->publishes();
+    config.rejects = deps_.config->rejects();
+    config.rejects_syntax = deps_.config->rejects_syntax();
+    config.rejects_scope = deps_.config->rejects_scope();
+    config.snapshots_constructed = l7gate::route::ConfigSnapshot::constructed();
+    config.snapshots_destructed = l7gate::route::ConfigSnapshot::destructed();
+    config.snapshots_live = l7gate::route::ConfigSnapshot::live();
+    config.last_publish_epoch_ms = deps_.config->last_publish_epoch_ms();
+    config.last_publish_duration_ms = deps_.config->last_publish_duration_ms();
+  }
+  sources.config = config;
 
   ProcSample proc;
   proc.fd_open_now = l7gate::net::count_open_fds();

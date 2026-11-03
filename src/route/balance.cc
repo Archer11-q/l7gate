@@ -139,6 +139,12 @@ void LbState::ensure_capacity(std::size_t target_count) noexcept {
   if (target_count > target_pairings_.size()) target_pairings_.resize(target_count, 0u);
 }
 
+void LbState::ensure_group_capacity(std::size_t group_count) noexcept {
+  // S5-02：文件重载可以新增一个上游组，而游标按组下标索引——不扩就是越界写。
+  // 只扩不缩的理由与"新组从 0 开始轮"的语义都写在 `balance.h` 那条声明旁边。
+  if (group_count > rr_cursor_.size()) rr_cursor_.resize(group_count, 0u);
+}
+
 std::uint64_t fnv1a64(std::string_view text) noexcept {
   std::uint64_t hash = kFnvOffsetBasis;
   for (const char c : text) {

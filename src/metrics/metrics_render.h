@@ -59,6 +59,24 @@ struct NodeAccounts {
   std::int64_t last_publish_epoch_ms = 0;
 };
 
+// S5-02（ADR-10 追加节第五节）：配置热重载的账。**只有 arm 了才 present**，
+// 与退出账那一行同一个条件——观测面的键集合不许因为一个没装配的功能而多出一格
+// （S5-01 验收 ⑤ 的那条"关掉时逐字节相同"在这里继续成立）。
+struct ConfigAccounts {
+  bool present = false;
+  std::uint32_t generation = 0;
+  std::uint64_t checks = 0;
+  std::uint64_t publishes = 0;
+  std::uint64_t rejects = 0;
+  std::uint64_t rejects_syntax = 0;
+  std::uint64_t rejects_scope = 0;
+  std::uint64_t snapshots_constructed = 0;
+  std::uint64_t snapshots_destructed = 0;
+  std::uint64_t snapshots_live = 0;
+  std::int64_t last_publish_epoch_ms = 0;
+  std::int64_t last_publish_duration_ms = 0;
+};
+
 // 一次进程内采样（`/proc` 读的那两格）。放在这里是为了让渲染保持纯函数：
 // 谁来读 /proc 是采集线程的事，不是格式的事。
 struct ProcSample {
@@ -79,6 +97,7 @@ struct Sources {
   RateLimitAccounts rate_limit;
   RedisAccounts redis;
   NodeAccounts nodes;
+  ConfigAccounts config;
   // 业务 worker 条数。**指标暴露面自己那条线程不进这一格**——它不是 worker
   // （ADR-24 第六节：`workers` 的口径不变，否则 B-008/B-018 那些按 worker 数归因的
   // 历史读数会在这里读成另一个数）。

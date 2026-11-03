@@ -295,8 +295,8 @@ std::uint64_t Reactor::run() {
     // 时候做，200ms 的默认上限会把"每 20ms 一拍"的探活拖成每 200ms 一拍（B-014
     // 阶段 2 实测 25 s 只跑了 189 轮，就是被这个上限拉长的）。只在探活启用时夹，
     // 空闲路径（SLO #2 那些场景探活不装配）一分钟都不多醒。
-    if (config_.health && config_.health->policy().probe_interval_ms > 0 && !draining) {
-      const std::int64_t interval = config_.health->policy().probe_interval_ms;
+    if (config_.health && config_.health->policy_view()->probe_interval_ms > 0 && !draining) {
+      const std::int64_t interval = config_.health->policy_view()->probe_interval_ms;
       const int cap = static_cast<int>(std::min<std::int64_t>(interval, 200));
       wait_ms = std::min(wait_ms, cap > 0 ? cap : 1);
     }
@@ -321,12 +321,23 @@ std::uint64_t Reactor::run() {
     if (config_.health) {
       const std::int64_t now = monotonic_ms();
       config_.health->sweep_expired(now, wall_ms());
-      if (config_.health->policy().probe_interval_ms > 0) health_tick(now);
+      if (config_.health->policy_view()->probe_interval_ms > 0) health_tick(now);
     }
 
     // S3-04 节点表对账（ADR-20 第四节）：reload 发布的新成员在这里进入本 worker。
     // 无发布器时是空转前的一次判空，成本为零。
     sync_nodes_snapshot();
+
+    // S5-02（ADR-10 追加节第二节）：配置重载的节拍。三件事按这个顺序做，顺序是有讲究的：
+    // ① 只有 watcher 那一格调钩子（stat / 读文件 / 校验 / 装配 / 发布，全部在它的循环里，
+    //    别的 worker 一条都不做）；② 每个 worker 各自把"已经对账到第几代"推进；
+    //    ③ 上面那次 `sync_nodes_snapshot` 管的是 mysql 节点表那条路径，与这里互斥。
+    // `now_ms` 用循环自己那把单调钟（与下面那次超时扫描同一个时间源），到没到点在钩子里判：
+    // 没到点一个 syscall 都不发。
+    if (config_.config_reload_hook != nullptr && config_.is_config_watcher) {
+      config_.config_reload_hook->reload_tick(monotonic_ms());
+    }
+    sync_config_snapshot();
 
     // S4-01（ADR-21）请求级超时的扫描点：deadline 表为空时是一次判空。
     enforce_upstream_timeouts(monotonic_ms());
@@ -719,7 +730,9 @@ Reactor::UpstreamPick Reactor::ensure_upstream(
   if (upstream_target >= config_.upstream_targets.size()) {
     // S3-04：filter 可能拿到了比对账 tick 更新的快照（发布发生在两次 tick 之间）。
     // 先懒对账一次再判——对账在 owner 线程做，没有竞争；仍然越界才是真的装配漏检。
+    // S5-02 的世代同理：请求读的是发布点上的当前代，而本 worker 的对账还停在上一个 tick。
     sync_nodes_snapshot();
+    sync_config_snapshot();
   }
   if (upstream_target >= config_.upstream_targets.size()) {
     return {};  // 装配漏检：当作"这一轮拿不到上游"，请求留在下游缓冲里，
@@ -884,12 +897,12 @@ void Reactor::note_health_success(std::uint16_t target) noexcept {
 }
 
 void Reactor::build_probe_slots() noexcept {
-  if (config_.health == nullptr || config_.health->policy().probe_interval_ms <= 0) return;
+  if (config_.health == nullptr || config_.health->policy_view()->probe_interval_ms <= 0) return;
   grow_probe_slots(0, config_.upstream_targets.size());
 }
 
 void Reactor::grow_probe_slots(std::size_t from_target, std::size_t to_target) noexcept {
-  if (config_.health == nullptr || config_.health->policy().probe_interval_ms <= 0) return;
+  if (config_.health == nullptr || config_.health->policy_view()->probe_interval_ms <= 0) return;
   const std::size_t group = config_.worker_group_size == 0 ? 1 : config_.worker_group_size;
   for (std::size_t t = from_target; t < to_target && t < config_.upstream_targets.size(); ++t) {
     if (t % group != config_.worker_index % group) continue;
@@ -957,12 +970,38 @@ void Reactor::sync_nodes_snapshot() noexcept {
   if (config_.nodes == nullptr) return;
   const std::shared_ptr<const route::NodesView> view = config_.nodes->load();
   if (view == nullptr) return;
-  const std::size_t seen = view->targets.size();
-  if (seen <= config_.upstream_targets.size()) return;  // 空转：一次原子 load + 一次比较
+  apply_nodes_view(*view);
+}
+
+// S5-02（ADR-10 追加节第四节）：配置世代的对账。
+// 换代的判据是**指针相等**而不是内容比较——同一代永远同一根 `shared_ptr`（发布点只在
+// watcher 那一拍 store 一次），所以这根针变了就是真的换了世代，没变就是空转。
+// 空转成本 = 一次原子 load + 一次指针比较。
+void Reactor::sync_config_snapshot() noexcept {
+  if (config_.config == nullptr) return;
+  const std::shared_ptr<const route::ConfigSnapshot> snap = config_.config->load();
+  if (snap == nullptr || snap == config_gen_) return;
+  config_gen_ = snap;
+  // 那一代的**上游表**要进本 worker 的四个私有面；策略那半边不需要对账——
+  // `HealthTable` 的策略槽由唯一的写者（watcher）在发布之前换好，读者各自钉住自己那一代。
+  if (snap->nodes != nullptr) {
+    apply_nodes_view(*snap->nodes);
+    // 游标的组数容量**不能**放在 `apply_nodes_view` 里：那个函数在"目标数没变"时直接空转返回，
+    // 而"新增一个组、成员复用已有端点"正好是目标数不变、组数变多的一种。
+    if (config_.lb_state != nullptr) {
+      config_.lb_state->ensure_group_capacity(snap->nodes->groups.size());
+    }
+  }
+}
+
+// ever-seen 增员的唯一落点（节点表与配置世代共用它，见 reactor.h 那条注释）。
+void Reactor::apply_nodes_view(const route::NodesView& view) noexcept {
+  const std::size_t seen = view.targets.size();
+  if (seen <= config_.upstream_targets.size()) return;  // 空转：一次长度比较
   // ever-seen 只增：新目标在本 worker 线程里追加进四个私有面 + 共享健康表的启用数。
   const std::size_t prev = config_.upstream_targets.size();
   for (std::size_t t = prev; t < seen; ++t) {
-    const route::NodeTarget& node = view->targets[t];
+    const route::NodeTarget& node = view.targets[t];
     Config::Target target;
     target.address = node.address;
     target.port = node.port;
@@ -993,7 +1032,7 @@ void Reactor::start_probe(std::size_t slot, std::int64_t now_ms) noexcept {
   const std::size_t index = probe_targets_[slot];
   if (index >= config_.upstream_targets.size() || p.phase != Probe::Phase::kIdle) return;
   const Config::Target& target = config_.upstream_targets[index];
-  probe_next_due_ms_[slot] = now_ms + config_.health->policy().probe_interval_ms;
+  probe_next_due_ms_[slot] = now_ms + config_.health->policy_view()->probe_interval_ms;
 
   // 请求一次成型。Connection: close 让响应边界等于"头读完即完"，探活不需要 body。
   std::size_t len = 0;
@@ -1022,7 +1061,7 @@ void Reactor::start_probe(std::size_t slot, std::int64_t now_ms) noexcept {
   }
   p.fd = std::move(outcome.fd);
   p.phase = Probe::Phase::kConnecting;
-  p.deadline_ms = now_ms + config_.health->policy().probe_timeout_ms;
+  p.deadline_ms = now_ms + config_.health->policy_view()->probe_timeout_ms;
   int error = 0;
   void* tag = reinterpret_cast<void*>((static_cast<std::uintptr_t>(slot) << 1) | 1u);
   if (!epoll_.add(p.fd.get(), EPOLLOUT, tag, &error)) {
@@ -1513,12 +1552,19 @@ Reactor::ForwardOutcome Reactor::forward_pending_requests_body(
       // S3-01：这个对象不再是 const——它是链唯一的写通道（upstream_target / reject_status），
       // 下面两行就是那两个字段各自的第一个读者。**字段和读者同批进来**这条纪律（1.16 的债）
       // 在这里兑现：删掉任何一个读者，另一个就得写不进去。
+      // S5-02（ADR-10 追加节第四节）：世代在这一次取，钉在本帧里（`shared_ptr` 随帧释放）。
+      // 一次读取 = 一次决定：链上的路由与均衡读的都是同一个 `*gen`，换代恰好落在两环之间
+      // 那种事在这里结构上不可能发生。没 arm 重载时这根针恒空 → `.config` 是 nullptr →
+      // 两个读表的 filter 各自回落到构造时那份，关闭态多出来的只有下面这一次判空。
+      std::shared_ptr<const route::ConfigSnapshot> gen;
+      if (config_.config != nullptr) gen = config_.config->load();
       filter::RequestInfo info{
           .method = pending->method,
           .target = pending->target,
           .headers = pending->headers,
           .request_bytes = pending->consumed,
           .downstream_fd = downstream->fd(),
+          .config = gen.get(),
       };
       if (request_filters_.run(info) == filter::Decision::kStop) {
         if (info.reject_status != 0) {

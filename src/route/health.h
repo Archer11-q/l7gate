@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -124,6 +125,39 @@ struct TargetHealthSnapshot {
   std::uint64_t half_open_reopened_total = 0;  // 半开期内失败或到期未决而回摘的次数
 };
 
+// 一次策略读取（S5-02，ADR-10 追加节第四节末）。
+//
+// 为什么要有这么个东西而不是把 `policy_` 直接换成原子：熔断与摘除的阈值参数是文件重载
+// 定义域内的东西（验收句① 括号里的 "circuit 参数"），而这张表被同组全部 worker 共享、
+// 事件路径上每条请求都要读它——把策略换成运行期可换的东西，就必须同时回答
+// "关闭态凭什么和今天逐字节相同"。答案是这根针：
+//   · **重载没 arm**（`live_policy_` 为空）→ 借构造期那一份，一次分支、零原子操作。
+//   · **arm 了** → 把当前世代的策略对象钉在返回对象里（一次原子 `shared_ptr` 读 + 一次
+//     引用计数），引用在 view 的存活期内有效；换代由唯一的写者（watcher 那一拍）做，
+//     读者永远拿到的是**整份**策略，不会读到"新窗口配旧半开门"那种拼出来的东西。
+// 代价量在 B-020（arm vs 不 arm 两臂，主尺是每请求整数等式，不是 p99）。
+class HealthTable;
+
+class PolicyView {
+ public:
+  const HealthPolicy& operator*() const noexcept { return *policy_; }
+  const HealthPolicy* operator->() const noexcept { return policy_; }
+
+ private:
+  // 只有 `HealthTable::policy_view()` 能造它：针要么由表内那份构造期策略借来（未 arm），
+  // 要么由当前世代钉住（arm），两种都必须是表的私有判断，不能让调用方自己拼一个出来。
+  // （构造函数私有而不是公开字段聚合初始化，是因为聚合要求成员全 public——那样谁都
+  // 能造出一根没钉住任何东西的针。）
+  friend class HealthTable;
+  PolicyView(const HealthPolicy* policy, std::shared_ptr<const HealthPolicy> pin) noexcept
+      : policy_(policy), pin_(std::move(pin)) {}
+
+  const HealthPolicy* policy_ = nullptr;
+  // 只有 arm 那一格非空。它指向的对象就是当前那份 `ConfigSnapshot` 里的策略成员——
+  // 钉住策略就等于钉住世代，没有第二份抄本。
+  std::shared_ptr<const HealthPolicy> pin_;
+};
+
 class HealthTable {
  public:
   // 窗口的分桶数是内部常量（ADR-12 追加二第一节：多一个旋钮只是多一类配置错误）。
@@ -133,8 +167,12 @@ class HealthTable {
   // 空间里"启用"，不能让它运行期 resize——这张表被同组全部 worker 共享，运行期
   // 变长就是数据竞争）。0 = 容量与 target_count 相同（静态文件配置的现状形状，
   // 一字节不多花）。`target_count` 是**初始启用数**。
+  //
+  // `policy_reloadable`（S5-02）：true 时才允许 `set_policy`，读侧也才走那根针。
+  // 它由装配方（`main.cc`）按"有没有 arm 文件重载"一次性定死，运行期不再变——
+  // 所以关闭态那条分支是可预测的一次判断，不是一次原子读。
   HealthTable(std::size_t target_count, HealthPolicy policy,
-              std::size_t capacity = 0) noexcept;
+              std::size_t capacity = 0, bool policy_reloadable = false) noexcept;
 
   // 失败判据成立时调用（被动：业务请求撞上失败；主动：探活判死，`source = kProbe`）。
   // `now_ms` 是单调毫秒（决策纯靠它，测试可以喂任意时间线）；`epoch_ms` 是墙钟毫秒，
@@ -190,8 +228,16 @@ class HealthTable {
 
   // 安全阀：可摘除上限 = floor(成员数 × max_ejection_percent / 100)。
   std::size_t max_ejected_count() const noexcept;
+  // 读这一代的策略（见 `PolicyView` 那段：关闭态借构造期那份、零原子）。
+  // 原来那个 `const HealthPolicy& policy()` 被它取代：返回引用在一个"策略可能已经换代"
+  // 的表上是会悬垂的，而悬垂的方式正好是重载那一拍之后——留着一个只在关闭态安全的
+  // 接口名，等于给后来人挖一条只有跑压测才会踩的坑。
+  PolicyView policy_view() const noexcept;
 
-  const HealthPolicy& policy() const noexcept { return policy_; }
+  // 换代：唯一的写者是 watcher 那一拍（`ConfigReloader`），它在发布新世代**之前**调这一句，
+  // 于是任何读到新世代的读者也一定能读到新策略。传进来的 `pin` 必须与快照里那份是同一个
+  // 对象（同一根 `shared_ptr`），否则策略与表就又是两份真相。
+  void set_policy(std::shared_ptr<const HealthPolicy> pin) noexcept;
   // 当前启用的目标数（valve 分母、sweep 范围、一切越界检查的界）。
   std::size_t target_count() const noexcept {
     return active_.load(std::memory_order_relaxed);
@@ -239,26 +285,36 @@ class HealthTable {
   static std::int64_t deadline_of(std::int64_t state) noexcept { return state >> 1; }
 
   struct Entry;
-  // 窗口的一次记账（只有 `circuit.enabled` 时才发生）。出参是记账之后窗口内的
+  // 一次窗口记账（只有 `circuit.enabled` 时才发生）。出参是记账之后窗口内的
   // (请求数, 失败数)——判据要的就是这两个数，调用方不必再读第二次（读了也不是同一瞬间）。
+  // 带 `policy` 入参而不是自己再读一次世代（S5-02）：一次判据里"窗口宽 = 哪一代"与
+  // "阈值 = 哪一代"必须是同一个答案，否则换代的恰好那一刻会拼出一张没人配过的策略。
   void window_record(std::uint16_t target, std::int64_t now_ms, bool failure,
-                     std::uint64_t* requests, std::uint64_t* failures) noexcept;
-  void window_clear(std::uint16_t target, std::int64_t now_ms) noexcept;
+                     std::uint64_t* requests, std::uint64_t* failures,
+                     const HealthPolicy& policy) noexcept;
+  void window_clear(std::uint16_t target, std::int64_t now_ms,
+                    const HealthPolicy& policy) noexcept;
+  // 窗口分桶宽 = ⌊window_ms / 8⌋ 且 ≥1（ADR-12 追加二第一节）。熔断没装配时这个值不参与
+  // 任何计算——窗口那条路整个被 `circuit.enabled` 挡在门外，一字节不多做。
+  // 它从入参算而不是存成成员：S5-02 让 `window_ms` 成了可重载的东西，派生值再存一份
+  // 就是第二份真相（`bucket_ms_` 那个成员因此被删掉，不是"留着不用"）。
+  static std::uint64_t bucket_ms_of(const HealthPolicy& policy) noexcept;
+  std::size_t max_ejected_count_for(const HealthPolicy& policy) const noexcept;
 
   // 摘除的 CAS。`from_half_open` 为真时是"半开期内回摘"：阀位已经占着，不再++，
   // 也不受安全阀阻挡（安全阀限的是**账本余额**，不是同一个成员的状态来回）。
   // 赢家负责计数器与 `last_ejection_epoch_ms`；输家不做账（S3-03 的纪律一字未动）。
   bool try_mark_ejected(std::uint16_t target, std::int64_t now_ms, std::int64_t epoch_ms,
-                        bool from_half_open) noexcept;
+                        bool from_half_open, const HealthPolicy& policy) noexcept;
   // 摘除到期 → 半开（CAS 赢家负责：清连续计数、清半开周期计数、`window_clear`）。
   bool try_enter_half_open(std::uint16_t target, std::int64_t expected_state,
-                           std::int64_t now_ms) noexcept;
-  // 半开 → 全量恢复（CAS 赢家负责 `ejected_now_--`，因为这一台重新开始接全量流量了）。
+                           std::int64_t now_ms, const HealthPolicy& policy) noexcept;
+  // 摘除 → 全量恢复（CAS 赢家负责 `ejected_now_--`，因为这一台重新开始接全量流量了）。
   bool try_mark_healthy(std::uint16_t target, std::int64_t expected_state) noexcept;
   // 半开门：预算内抢到一个名额返回 true（低 32 位 = 已放行，高 32 位 = 成功证据）。
-  bool try_take_probe_slot(std::uint16_t target) noexcept;
+  bool try_take_probe_slot(std::uint16_t target, const HealthPolicy& policy) noexcept;
   // 记一条半开期内的业务成功；攒满 K 时由本函数尝试转健康（CAS 赢家才计恢复数）。
-  void note_half_open_success(std::uint16_t target) noexcept;
+  void note_half_open_success(std::uint16_t target, const HealthPolicy& policy) noexcept;
 
   struct WindowBucket {
     std::uint64_t seq = 0;       // 这一格代表的绝对桶号（单调毫秒 / bucket_ms）
@@ -293,7 +349,12 @@ class HealthTable {
   };
 
   HealthPolicy policy_;
-  std::size_t bucket_ms_ = 1;  // = max(1, circuit.window_ms / 8)，构造期算好
+  // S5-02：当前世代的策略（只有 arm 了文件重载才会非空）。它指向的就是那份
+  // `ConfigSnapshot` 里的 `health`——同一根 `shared_ptr`，不是抄本。
+  // 写者只有 watcher 那一拍，且排在发布新世代之前；读者经 `policy_view()` 钉住它。
+  std::atomic<std::shared_ptr<const HealthPolicy>> live_policy_{nullptr};
+  // 一次性定死的开关（构造期由装配方给）：false 时 `policy_view()` 连那次原子读都不做。
+  bool policy_reloadable_ = false;
   std::vector<Entry> entries_;  // 容量 = 构造期上界；[0, active_) 才是被启用的目标
   std::atomic<std::size_t> active_;
   std::atomic<std::uint32_t> ejected_now_{0};

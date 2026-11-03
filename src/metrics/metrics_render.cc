@@ -242,6 +242,33 @@ std::string render(const Sources& sources, const ProcSample& proc, std::int64_t 
     e.gauge("nodes_last_publish_epoch_ms", sources.nodes.last_publish_epoch_ms);
   }
 
+  // --- 配置热重载（S5-02，只在 arm 时存在）------------------------------------------------
+  if (sources.config.present) {
+    // `config_checks` 与 `config_publishes` 是两个数，不许合并成一格：查了一遍不等于
+    // 发布了一次（ADR-20 第五节那对 `nodes_reloads_*` 立的口径在这里原样适用）。
+    e.gauge("config_gen", sources.config.generation,
+            "当前生效的配置世代号，只在成功发布时 +1；拒载不动");
+    e.counter("config_checks", sources.config.checks, "到点做的那次 stat 检查的次数");
+    e.counter("config_publishes", sources.config.publishes,
+              "成功换代的次数 = 全仓库唯一那次原子 store 的次数");
+    e.counter("config_rejects", sources.config.rejects,
+              "被拒的 reload 轮次总数（= syntax + scope），旧世代继续服务");
+    e.counter("config_rejects_syntax", sources.config.rejects_syntax, "JSON 语法错那一类");
+    e.counter("config_rejects_scope", sources.config.rejects_scope,
+              "字段越界 / 定义域外（限流参数、段出现消失、命令行来源、mysql 组）/ 超大 那一类");
+    e.counter("config_snapshots_constructed", sources.config.snapshots_constructed,
+              "ConfigSnapshot 构造次数");
+    e.counter("config_snapshots_destructed", sources.config.snapshots_destructed,
+              "ConfigSnapshot 析构次数（最后一个引用释放之后）");
+    e.gauge("config_snapshots_live", static_cast<std::int64_t>(sources.config.snapshots_live),
+            "在册世代数 = constructed - destructed。稳态 1；换代排水期短暂为 2 —— "
+            "它就是「旧快照在最后一个引用释放前不回收」那句的可断言形态");
+    e.gauge("config_last_publish_epoch_ms", sources.config.last_publish_epoch_ms,
+            "最后一次成功换代的墙钟毫秒（与脚本时间线同一根轴，B-015 那两格同法）");
+    e.gauge("config_last_publish_duration_ms", sources.config.last_publish_duration_ms,
+            "那一次从读到发布的耗时，全在 watcher 那一拍里");
+  }
+
   // --- 限流：`report_rate_limit` 那一行的四键，一行一键 ----------------------------------
   if (sources.rate_limit.present) {
     e.counter("rate_limit_allowed", sources.rate_limit.allowed);

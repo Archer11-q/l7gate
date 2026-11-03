@@ -1152,3 +1152,56 @@ debug 全目标 `cmake --build` rc=0、`ctest` **347/347**。
 其中**动到被测方热路径的只有两处**，都不在每请求路径上：`TokenBucket::try_acquire` 里
 "夹子咬到"那一格多一个 relaxed `fetch_add`（429 支路），以及循环已有那一拍里多一次
 `snapshot_ != nullptr` 判空（关闭态恒假）。其余全部是新线程与渲染层。
+
+## 21. S5-02 的阳性验证，以及配置热重载在真进程里抓到的东西（2026-11-03，ADR-10 落地追加节）
+
+### 21.1 五处退化，其中两处第一版 0 红（改用例之外的东西才叫修）
+
+按 §20.2 的同一立场：红的是哪几条用例是**跑出来的**，不是推出来的。每处改的是 `src/`，
+临时标记 `TEMP-POSITIVE`，跑完逐处还原并核对残留 0 处，再复跑 `S5_02_*` 17/17。
+
+| # | 退化（改坏的地方） | 实际红掉的用例（实测名单） | 备注 |
+|---|---|---|---|
+| H1 | **半套发布**：`build_config_snapshot` 里上游表建完就 `return snapshot`，路由那一半还没装进去 | **4 条红：`S5_02_Snapshot.RouteReplayKeepsOrderPatternsAndGroupIndexes`、`S5_02_Reloader.GoodReloadSwapsRoutesHealthPolicyAndMemberTableTogether`、`S5_02_Reloader.SyntaxErrorKeepsTheOldGenerationServing`、`S5_02_Publisher.OldGenerationIsNotFreedUntilTheLastReferenceGivesItUp`** | **第一版 0 红**：退化本来打在 `snapshot == nullptr` 那一格（"装配失败也 publish"），而六类拒绝**全都到不了那里**（语法/字段/越界/形状/超大都在装配之前就返回了）——打一条没人走的分支等于给自己的判定发空头证明。改打在装配的中途才有红。第四名是意外收获：`OldGeneration…` 断的是"钉住时不析构"，多一根半套快照的针就把在册数改了，说明它守的不止自己那格 |
+| H2 | **引用计数漏一格**：`ConfigPublisher::publish` 顺手把新世代另存进一个静态 `vector` | **2 条红：`S5_02_Publisher.OldGenerationIsNotFreedUntilTheLastReferenceGivesItUp`、`S5_02_ReloadE2E.InFlightRequestsFinishOnTheOldGenerationWhileNewOnesUseTheNewOne`** | **第一版 0 红**：退化加在 `ConfigReloader::reload_tick` 里，而断引用计数的两条用例是**直接调 `publish()`** 的。改打在发布点本身——那才是"所有写者都走这一处"的那个位置，也是这条性质唯一的守门人 |
+| H3 | **换代时把在册连接关掉**（那才是热重启的形状）：`sync_config_snapshot` 里遍历注册表逐个 `close_connection` | **1 条红：`S5_02_ReloadE2E.…`**（在飞那三条当场被截断） | 这条是"reload 不关任何连接"那句的唯一读者。它红了才说明那三条不是"恰好没连上" |
+| H4 | **越界也生效**：`in_scope` 闸门短路（`if (false && !in_scope(...))`） | **5 条红：`RateLimitParametersAreOutOfScopeAndRefusedByName`、`RateLimitKeyChangeIsRefusedByName`、`SectionAppearingOrVanishingIsRefusedBecauseItIsChainShape`、`MysqlGroupIsRefused…`、`RejectLedgerIsConserved`** | 定义域那一族的账是守恒式（`rejects == syntax + scope`），闸门一坏守恒先红——这条红得最有说服力 |
+| H5 | **世代不进请求**：链调用点把 `.config = gen.get()` 写成 `nullptr`（两个 filter 退回构造时那份兜底表） | **1 条红：`S5_02_ReloadE2E.…`** | "一次读取 = 一次决定"这条的落点。红的方式是"新请求没换表"，不是崩溃 |
+
+一处**没测**（写在纸上，不留成口头保证）：追加节第六节末那条"失败的一轮可能已经把新端点 intern 进
+ever-seen、烧掉几个没人引用的槽位"——本轮**造不出触发它的输入**。校验器与 1 MiB 上界把
+`build_config_snapshot` 的失败面挡在外面（成员下标越界在 `build_gateway_config` 那一步就先拒了），
+所以 intern-then-fail 这条路径今天只有代码形状、没有实测读数。要量它得能造出"装配中途失败"的输入，
+归 S5 之后；不拿"逻辑上到不了"当作已经验过。
+
+### 21.2 仪器侧：本轮有六处是**我自己的工具**错了
+
+| # | 错在哪 | 症状 | 怎么被抓到的 | 修法 |
+|---|---|---|---|---|
+| 1 | **退出账把 11 个 `config_*` 打在了一行里**，而冒烟用行首锚取数 | `config_publishes=` 与 `config_snapshots_live=` 都读成空 → "总账对不上"和"世代没释放"两格同时红 | 打开 `gateway.log` 看那一行：11 格在**同一行**里，只有行首那一格能被行首锚命中。这是 S4-05 记过的同一格（一行多键 + 行首锚 = 其余几格静默读成空串，而空串在判定里长得像 0）——**同一条坑第三次踩** | `report_config_reload` 改成一 key 一行（与 `report_stats` 同一形状），理由写在函数头上；**不改判定脚本去迁就我写歪的账** |
+| 2 | `date +%s%3N` 在本机**不截断**，给的是 19 位纳秒 | 生效延迟读成 `143794952 ms` 与 `-1614335120784833846 ms`（第二轮是负的），区间判断一起红 | 红得太荒谬：一个 200 ms 节拍的机制不可能量出 1.4 亿毫秒。**先怀疑取数方式，不先改判据** | `now_ms() { echo $(( $(date +%s%N) / 1000000 )); }`，并在脚本里写明"轴上的单位必须是毫秒"。修正后的实测是 **156 ms / 193 ms**（节拍 200 ms） |
+| 3 | 在飞那格的"上游自报数"在**停上游之前**读 | `slow_served=?`，而客户端三条确实各拿到 192 字节体——一格红一格绿，形态不对 | 那一句是 `l7gate_test_upstream` **退出时**打的，我把读它放在了 `kill` 之前 | 先 `kill -TERM` + `wait` 再读日志。与 §20.1 第 7 条同族：**读一台进程的账，要在它把账写完之后** |
+| 5 | 取 wrk 的 QPS 用 `sed -n 's/^Requests\/sec: \([0-9.]*\).*/\1/p'`，而 wrk 打的是**两个**空格 | 四行 QPS 全读成 `?`，而同一段代码里按字段取的 p50 有数——**一格空、隔壁那格正常**就是这类模式的指纹 | 判定表里只有 QPS 那一列全 `?`（§20.1 第 4 条同一形态） | 改 `awk '/^Requests\/sec:/ {print $2}'`，并**对已落盘的 `$dir.wrk.txt` 重取数**，不重跑负载（判定只认落盘输出） |
+| 6 | 脚本头注释承诺了 `ONLY_ROUNDS` / `ARMS` / `SKIP_RUNS` 三个补跑旋钮，循环里**没实现** | 我按 `ONLY_ROUNDS=3` 起跑，实际把三轮全跑了一遍（6 次 45 s 负载） | 补跑的日志里出现了 r1/r2 两行——注释里有旋钮而代码不读它，只能从「它跑了我以为不会跑的轮」看出来 | 三个旋钮本轮补实现，含「补跑路径一律不删目录」那格守卫。这条是 `max_header_count` 那条雷的形状：**写了没人读就是空头证明** |
+| 4 | `cleanup()` 末尾那句 `wait` 把脚本退出码盖成 0 | 冒烟打印 `SMOKE-S5-02 FAIL` 而 `SMOKE_RC=0`——判定与退出码分家，正是 B-016 那两条"带着看不见的 ✗ 的臂"的形状 | 我按 `SMOKE_RC` 读结论时发现与屏幕上的 FAIL 矛盾，才去核对 trap | trap 里 `local rc=$?` → 收尾 `exit "$rc"`。脚本的 FAIL 必须让 rc 也红，否则判定等于没跑 |
+
+另有**一条不属于仪器、是被测方**的：`main` 里留着一根首代快照的 `shared_ptr`（为了把策略交给健康表），
+于是 `config_snapshots_live` 永远读成 2 而不是 1。这条是判据抓到的（第 21.2 节第 1 条修好之后才看得见），
+修法是只留**那一格策略**的针、整份快照不留。写在这里是因为它证明"引用计数那一格不是装饰"：
+它守的正是我自己会犯的那种错。
+
+### 21.3 本轮的门禁面
+
+三 preset 各 **364/364**（347 → 364，+17 条新用例）、非 gtest 警告各 **0** 条、`tsan` 日志
+`ThreadSanitizer` **0** 次；**十一条冒烟**全绿（九条不依赖 Docker 的 + `smoke-s3-04` / `smoke-s4-04` 两条真容器，逐条 rc=0 且 ✗=0）；新增的 `scripts/smoke-s5-02.sh` 是**十一阶段 40 项 ✓、✗ 0、rc=0**，其中阶段 11 是 `--workers 4` 那条多 worker 臂（四个 worker 都换到第二代、而 `config_publishes` 只有 1 次）。
+警告那一格本轮先在 clang 那两个 preset 上各多 1 条（`metrics_render.cc` 把 `uint64_t` 喂给吃
+`int64_t` 的 gauge，`-Wsign-conversion`），GCC 的 debug preset 不报——**同一条代码在三个 preset 里
+警告数可以不一样**，所以"非 gtest 警告 0 条"必须三个 preset 各数一遍，不能拿 debug 那一格代表全部门禁。
+
+动到被测方的地方：`src/net/reactor.{h,cc}`（世代发布点、每请求一次 `load`、对账 tick 与钩子调用点）、
+`src/filter/chain.h`（`RequestInfo` 多一个借用指针）、`src/filter/{route_filter,lb_filter}.cc`
+（读世代、回落构造）、`src/route/{health,balance}.{h,cc}`（策略槽 + 组容量）、`src/main.cc`、
+`src/metrics/*`（新增一族键，只在 arm 时发）。`src/config/gateway_config.cc` 一字未动——
+**重载用的就是启动那一条校验路径**，没有第二份。
+**每请求热路径上新增的只有一件事**：arm 时那一次 `atomic<shared_ptr>` 的 `load`（与 S3-04 每请求取
+节点表快照同一格）；关闭态多的是一次判空。成本与常驻两臂的读数在 BENCHMARK **B-020**。

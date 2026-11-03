@@ -6786,5 +6786,151 @@ TEST(S5_01_MetricsE2E, BadRequestsCountAsFailedScrapesWithoutBreakingTheSurface)
   harness.shutdown_all();
 }
 
+// ===========================================================================
+// S5-02（ADR-10 落地追加节第四节）：换代那一刻，在飞的请求走完旧的那一代
+// ===========================================================================
+//
+// 这条用例的主语不是"重载能不能生效"（那半在 `config_reload_test.cc` 与冒烟里），而是
+// 验收句① 的后半句与验收句②：切换瞬间已经在飞的每一条请求，每一条都要拿到**完整**的响应，
+// 而且响应来自它当初被路由到的那台后端——不是"看起来通了"，是靠两台后端各自的
+// 响应体长度（64 / 128）把"哪一代把它送到了哪台"钉成可断言的数字。
+//
+// 为什么三条各用自己的连接而不是同一条连接上发三条：`TestUpstream` 是在**开始压响应之前**
+// 记 `requests_served` 的，所以"三条都到了后端"就是"三条都已经过完链、下过目标决定"的
+// 直接证据。用一条连接发三条时，第三条可能还没被解析就换代了，那条用例就会随机地
+// 把"实现没错"读成"在飞的被改道了"。
+//
+// 世代是这里手工造的（`build_config_snapshot` 那条文件路径由 config_reload_test.cc 与
+// 冒烟负责）：本用例要验的是运行期的**持有与换代**，不是解析器。
+namespace {
+
+// 造一代：`/a` 指向哪个组由参数决定，两个组各一台成员（下标 0 = first，1 = second）。
+std::shared_ptr<l7gate::route::ConfigSnapshot> make_reload_generation(
+    std::uint32_t generation, std::uint16_t group_for_a, const TwoTargets& targets) {
+  auto snapshot = std::make_shared<l7gate::route::ConfigSnapshot>();
+  snapshot->generation = generation;
+  snapshot->routes.add_prefix("/a", group_for_a);
+  snapshot->routes.add_prefix("/b", 1);
+
+  auto view = std::make_shared<l7gate::route::NodesView>();
+  std::uint16_t group_a = 0;
+  std::uint16_t group_b = 0;
+  EXPECT_TRUE(view->groups.add_group("a", l7gate::route::Balance::kRoundRobin, &group_a));
+  EXPECT_TRUE(view->groups.add_group("b", l7gate::route::Balance::kRoundRobin, &group_b));
+  EXPECT_TRUE(view->groups.add_member(group_a, 0));
+  EXPECT_TRUE(view->groups.add_member(group_b, 1));
+  view->targets.push_back(l7gate::route::NodeTarget{"127.0.0.1",
+                                                   static_cast<std::uint16_t>(targets.first.port()),
+                                                   "/"});
+  view->targets.push_back(l7gate::route::NodeTarget{"127.0.0.1",
+                                                   static_cast<std::uint16_t>(targets.second.port()),
+                                                   "/"});
+  snapshot->nodes = view;
+  snapshot->health = std::make_shared<l7gate::route::HealthPolicy>();
+  return snapshot;
+}
+
+}  // namespace
+
+TEST(S5_02_ReloadE2E, InFlightRequestsFinishOnTheOldGenerationWhileNewOnesUseTheNewOne) {
+  std::string why;
+  TwoTargets targets;
+  ASSERT_TRUE(targets.start(&why)) << why;
+  // 把"在飞"造出来：后端收到请求后压 250 ms 才回。三条各占一条上游连接，互不排队。
+  targets.first.set_delay_before_response_ms(250);
+
+  auto publisher = std::make_shared<l7gate::route::ConfigPublisher>();
+  std::shared_ptr<const l7gate::route::ConfigSnapshot> gen1 =
+      make_reload_generation(1u, /*group_for_a = */ 0, targets);
+  std::shared_ptr<const l7gate::route::ConfigSnapshot> gen2 =
+      make_reload_generation(2u, /*group_for_a = */ 1, targets);
+  publisher->publish(gen1);
+
+  // 链上的两个 filter 拿的是**兜底表**（`info.config == nullptr` 时才读）。本用例每条请求
+  // 都带着世代，所以这两张空表一次都不会被读——它们存在的意义就是把"关闭态走老路径"这件事
+  // 留在类型上，而不是留在一句注释里。
+  l7gate::route::RouteTable fallback_routes;
+  l7gate::route::GroupTable fallback_groups;
+  auto lb_state = std::make_shared<l7gate::route::LbState>(2u, 2u);
+
+  Harness harness;
+  Harness::Options options = default_options();
+  targets.fill(&options);
+  options.config.config = publisher;
+  options.config.lb_state = lb_state;
+  harness.add_filter(std::make_unique<l7gate::filter::RouteFilter>(fallback_routes));
+  harness.add_filter(std::make_unique<l7gate::filter::LoadBalanceFilter>(
+      fallback_groups, lb_state));
+  ASSERT_TRUE(harness.start(options, &why)) << why;
+  ReactorStats& stats = harness.reactor()->stats();
+
+  constexpr int kInFlight = 3;
+  Client in_flight[kInFlight];
+  for (int i = 0; i < kInFlight; ++i) {
+    ASSERT_TRUE(in_flight[i].connect_to(harness.port(), &why)) << why;
+    ASSERT_TRUE(in_flight[i].write_all(get_request("/a/x")));
+  }
+  // 换代点之前的**下界证据**：三条都已经到达后端 0（那里正压着响应）。这一步没做到的话，
+  // 后面"三条都是 64 字节"可能只是因为三条都还没被路由——那条用例就会是假绿。
+  ASSERT_TRUE(wait_until([&] { return targets.first.requests_served() == kInFlight; }, 3000))
+      << "三条在飞请求没有真的落到旧后端上：served=" << targets.first.requests_served();
+
+  // 换代就发生在这个点上：`/a` 从组 0（后端 0，64 字节体）改指组 1（后端 1，128 字节体）。
+  const std::uint64_t died_before = l7gate::route::ConfigSnapshot::destructed();
+  std::shared_ptr<const l7gate::route::ConfigSnapshot> held = publisher->load();
+  publisher->publish(gen2);
+  gen1.reset();  // 用例不再引用第一代；只剩 `held` 这根针
+
+  // 一、存量三条：逐条**完整**（能读到一条 200 + 完整体，不是被关断的连接），且都来自旧后端。
+  for (int i = 0; i < kInFlight; ++i) {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(in_flight[i].read_response(&status, &body, &why))
+        << "第 " << i << " 条在飞请求被换代截断了：" << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << status;
+    EXPECT_EQ(body.size(), 64u)
+        << "换代把一条已经在飞的请求改送到了新后端——那它走的就不是当初那张表";
+  }
+  EXPECT_EQ(targets.second.requests_served(), 0u)
+      << "在飞那三条里有任何一条去了后端 1";
+
+  // 二、新请求用新表，而且**用的是换代前就开着的那条连接**：reload 不关连接、不 drain、
+  // 不迁 fd（追加节第四节第 3 条那句"它和热重启差的那一层"在这里是可断言的）。
+  ASSERT_TRUE(in_flight[0].write_all(get_request("/a/x")));
+  {
+    std::string status;
+    std::string body;
+    ASSERT_TRUE(in_flight[0].read_response(&status, &body, &why)) << why;
+    EXPECT_EQ(status, "HTTP/1.1 200 OK") << status;
+    EXPECT_EQ(body.size(), 128u) << "新请求没有用新表（还是旧后端 64 字节体）";
+  }
+  EXPECT_EQ(targets.second.requests_served(), 1u);
+  EXPECT_EQ(targets.first.requests_served(), 3u) << "换代后旧后端又接到了一条——那条不该再来";
+
+  // 网关自己那一侧的"零截断"：四条请求都解析了、四条响应都完整发出（换代没吞掉任何一条）。
+  EXPECT_EQ(stats.load(stats.requests_parsed), 4u);
+  ASSERT_TRUE(wait_until([&] { return stats.load(stats.responses_completed) == 4u; }, 2000))
+      << "有一条响应没记成完整发出：completed=" << stats.load(stats.responses_completed);
+
+  // 三、旧世代的析构时机：`gen1` 已经放开，但 `held` 还钉着 → 不析构；放开 `held` → 析构。
+  EXPECT_EQ(l7gate::route::ConfigSnapshot::destructed(), died_before)
+      << "还有一个持有者就析构了——那句「最后一个引用释放前不回收」在这里就是假的";
+  EXPECT_GE(l7gate::route::ConfigSnapshot::live(), 1u);
+  held.reset();
+  EXPECT_EQ(l7gate::route::ConfigSnapshot::destructed() - died_before, 1u)
+      << "最后一个引用放手之后旧世代没回收：引用计数在别处漏了一格";
+
+  for (int i = 0; i < kInFlight; ++i) in_flight[i].close();
+  harness.stop_loop();
+  harness.shutdown_all();
+  targets.stop();
+  // 验收句② 里 `constructed == destructed` 那一格**不在这里断**：夹具的 `Reactor` 连同它自持
+  // 的那份 `ReactorStats` 一起析构，析构之后没有读者；而"最后一个池里的连接对象被回收"恰恰
+  // 发生在析构里。留在这里断只会读到停在半路的账（本轮实测：7 建 3 析，那 4 条是池里还活着的
+  // 上游连接与还没处理完的 FIN，不是漏）。真进程退出账在 `report_stats` 之前已经把池排完，
+  // 那一格由 `scripts/smoke-s5-02.sh` 阶段 3 断。
+}
+
+
 }  // namespace l7gate::net
 

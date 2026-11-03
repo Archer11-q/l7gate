@@ -120,6 +120,11 @@ bool ReactorGroup::start_listen(int* error) noexcept {
     // `target % N == i` 切——探活流量不随 worker 数放大。
     wc.health = config_.health;
     wc.nodes = config_.nodes;
+    // S5-02：世代发布器每个 worker 都要（每条请求 load 自己那一代），节拍钩子只给 0 号。
+    // 同样是"构造前进 wc"那条教训——Reactor 存的是 config 的副本，构造之后写等于没写。
+    wc.config = config_.config_pub;
+    wc.config_reload_hook = i == 0 ? config_.config_reload_hook : nullptr;
+    wc.is_config_watcher = i == 0 && config_.config_reload_hook != nullptr;
     wc.worker_index = static_cast<std::size_t>(i);
     wc.worker_group_size = static_cast<std::size_t>(n);
     // 均衡状态必须**在 Reactor 构造之前**就进 wc：Reactor 存的是 config 的一份副本，

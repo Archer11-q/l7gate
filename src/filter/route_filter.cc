@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "route/config_snapshot.h"
+
 namespace l7gate::filter {
 namespace {
 
@@ -20,7 +22,11 @@ RouteFilter::RouteFilter(const route::RouteTable& table) noexcept : table_(table
 filter::Decision RouteFilter::on_request(RequestInfo& info) {
   // 匹配的是解析器给的**原始 origin-form target**（含 query，不解码、不规范化）。
   // 这里不复制、不改写它：info.target 是借来的 view，本函数只读它一次。
-  const std::optional<std::uint16_t> hit = table_.match(info.target);
+  // S5-02（ADR-10 追加节第四节）：这条请求带着世代时读**那一代**的表——正则是编译好放在
+  // 快照里的，读世代就是读"这一条请求被哪套规则判定"这个唯一答案。`info.config == nullptr`
+  // 是本任务之前唯一的形状（没 arm 重载），于是回落到构造时引用着的那份。
+  const route::RouteTable& table = info.config != nullptr ? info.config->routes : table_;
+  const std::optional<std::uint16_t> hit = table.match(info.target);
   if (!hit.has_value()) {
     // kStop + reject_status：交给主路径上那条"有表态的停止"（S1-06 的 fail_pair_with_reply）。
     // 注意**不写 upstream_group 之外的任何字段**：upstream_group 保持哨兵、upstream_target 也

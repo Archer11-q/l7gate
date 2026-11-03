@@ -101,6 +101,12 @@ class ReactorGroup {
     // 都从它 load 当前快照。
     std::shared_ptr<const l7gate::route::NodesPublisher> nodes;
 
+    // S5-02（ADR-10 落地追加节）：配置世代发布器 + 重载节拍钩子。两者 nullptr = 不跑重载，
+    // 与上面 `nodes` 同一条"没装配是实现位置"的口径。钩子**只**给 0 号 worker 装
+    // （多个 worker 各自 stat 会把同一个文件读 N 遍，还会让"哪一代生效"有 N 个发起者）。
+    std::shared_ptr<const l7gate::route::ConfigPublisher> config_pub;
+    l7gate::route::ConfigReloadHook* config_reload_hook = nullptr;
+
     int listen_backlog = 1024;
     // worker 线程数 N。契约 SLO #3 的前提是本机 16 vCPU；默认取一个保守值，
     // 由 main.cc 的 --workers 覆盖（缺省仍走单 Reactor，见 ADR-14 后果段）。
