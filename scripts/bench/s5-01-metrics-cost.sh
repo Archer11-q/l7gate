@@ -30,7 +30,9 @@ WORKERS="${WORKERS:-1}"
 ROUNDS="${ROUNDS:-2}"
 SHAPE="${SHAPE:-p999}"
 METRICS_PORT="${METRICS_PORT:-18522}"
-OUT="build/bench/s5-01-metrics-cost-$SHAPE"
+# `BATCH`：同一 SHAPE 下的**不同定标批次**必须分开落盘——18,000 与 20,000 两批的 p50 混在一个
+# 判定池里就是口径混读（每请求整数等式不受影响，分位数受影响）。默认留空＝沿用老目录。
+OUT="build/bench/s5-01-metrics-cost-$SHAPE${BATCH:+-$BATCH}"
 # 只在**起跑全新的一轮**时清空。补跑（给了 ONLY_ROUNDS/ARMS）或 SKIP_RUNS=1 复算时绝不删——
 # 删掉就把已合格的臂一起抹了，判定只剩补跑那一臂可用（本轮就是这么自毁过一次数据的）。
 if [[ -z "${ONLY_ROUNDS:-}" && -z "${ARMS:-}" && "${SKIP_RUNS:-0}" != "1" ]]; then
@@ -47,7 +49,7 @@ fi
 
 # ── 形状参数 ────────────────────────────────────────────────────────────────
 if [[ "$SHAPE" == "p999" ]]; then
-  CONNS=100; REQ_DIRECT=120000; REQ_PROXY=18000; STEADY_MIN_MS=50000
+  CONNS=100; REQ_DIRECT=120000; REQ_PROXY=20000; STEADY_MIN_MS=50000
   WIN_LO=50000; WIN_HI=120000; WIN_UNIT=ms; P50_UNIT=µs
   RESOLUTION="本档分辨率是一个 HDR 桶 ≈128 µs/请求（p50 这一列就是从 HDR 分位里取的，读数全是 128 的整数倍），比 B-008 的 8.7 µs 大一个数量级以上——所以这句只排除「掉进 µs 级的悬崖」，不排除个位数 µs，**读不出「指标面免费」"
 else
@@ -181,6 +183,10 @@ else
       fi
       run_arm "$dir" "$extra"
       rc=$?
+      # 退出码**落盘**，不从日志里 grep：本轮我就是用 `grep -o "rc=[0-9]*"` 去 run.log 里找退出码，
+      # 命中的却是生命周期行里的 `gw_rc=0`，于是把一条本来正确退出了 1 的脚本读成了"判红却不失败"，
+      # 还据此写进三处文档。取码这件事的正确答案是：自己写文件，别在别人的输出里找。
+      echo "$rc" > "$dir.rc"
       [[ "$arm" == "storm" ]] && for i in $(seq 1 "${STORM_PARALLEL:-1}"); do stop_storm "${STORM_PIDFILE}.$i"; done
       [[ $rc -eq 0 ]] || echo "  ！$arm-r$r 的取数脚本 rc=$rc（这一臂按不合格处理，见 $dir.run.log）"
     done
@@ -216,14 +222,25 @@ for ((r = 1; r <= ROUNDS; r++)); do
         verdict="✗风暴没打到观测面（metrics_scrapes_ok=${storm_ok:-空}）"
       fi
     fi
-    # **合格性读的是取数脚本自己的门，不是我另设的一个窗口区间**：本轮实测到
-    # `off-r1` 被 `s1-p999.sh` 的稳态门判红（proxy 窗口 49,873 ms < 50,000 ms，脚本自己
-    # 还打印了"本轮有 ✗，上面的数字不要用"），**但它仍然 rc=0**。所以只看 rc 会收下一份
-    # 被判红的读数——这一条与待裁⑥ 那条"旧二进制会冒充通过"是同族，只是发生在取数侧。
-    if [[ "$verdict" == "ok" && -f "$dir.run.log" ]] && grep -q '✗' "$dir.run.log"; then
-      verdict="✗被取数门判红（$(grep -o '实际稳态窗口 [0-9]*ms < [0-9]*ms' "$dir.run.log" | head -1)）"
-    elif [[ "$win" == "-1" ]] || (( $(awk -v w="$win" -v lo="$WIN_LO" -v hi="$WIN_HI" 'BEGIN{print (w+0<lo+0 || w+0>hi+0) ? 1 : 0}') )); then
-      # 窗口还是得兜一道：本轮见过 60 s 的档被环境压成 27 分钟（1998 次 socket 超时 + 640 QPS），
+    # **合格性读取数门自己的判定**（退出码优先，✗ 文本兜底），不是我另设的窗口区间。
+    # 本轮在这里犯过两笔，都写下来免得下一个人再犯：
+    #   ① 我把窗口区间设成 45–120 s，于是 49,873 ms 那臂被判成"合格"放了进去——门明明在 50 s。
+    #   ② 我用 `grep -o "rc=[0-9]*"` 去 run.log 里找取数脚本的退出码，命中的却是生命周期行里的
+    #      `gw_rc=0`，据此在文档里写了一句"`s1-p999.sh` 判红却 rc=0"。**那句是错的**：它末尾就是
+    #      `exit "$FAILED"`，`off-r1` 实实在在退了 1、父脚本也记了 `！`。教训是**别在别人的输出里
+    #      找自己的数**，所以现在退出码由本脚本写成 `$dir.rc`。
+    if [[ "$verdict" == "ok" ]]; then
+      if [[ -f "$dir.rc" ]]; then
+        if [[ "$(cat "$dir.rc")" != "0" ]]; then
+          verdict="✗取数脚本 rc=$(cat "$dir.rc")（被它自己的门判红，剔除）"
+        fi
+      elif [[ -f "$dir.run.log" ]] && grep -q '✗' "$dir.run.log"; then
+        # 改法之前跑出来的历史臂没有 .rc，退回读 ✗ 文本（两者说的是同一件事）。
+        verdict="✗被取数门判红（$(grep -o '实际稳态窗口 [0-9]*ms < [0-9]*ms' "$dir.run.log" | head -1)）"
+      fi
+    fi
+    if [[ "$verdict" == "ok" ]] && { [[ "$win" == "-1" ]] || (( $(awk -v w="$win" -v lo="$WIN_LO" -v hi="$WIN_HI" 'BEGIN{print (w+0<lo+0 || w+0>hi+0) ? 1 : 0}') )); }; then
+      # 窗口仍兜一道：本轮见过 60 s 的档被环境压成 27 分钟（1998 次 socket 超时 + 640 QPS），
       # 那不是"网关慢"，是整台机器在别的东西上排队。剔掉这件事要在纸上看得见。
       verdict="✗窗口 ${win}$WIN_UNIT 不合格"
     fi
