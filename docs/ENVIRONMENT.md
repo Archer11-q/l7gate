@@ -169,6 +169,26 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 **抬 `kernel.perf_event_paranoid` 属环境侧决定，我没动**：抬到 1/0/-1 能换来 `-a` 系统级与内核态帧，
 代价是本机任何进程都能读全系统事件。这不是我能替项目所有人决定的事，所以这里只把"今天这个设置下
 能测什么"记全。如果 S5 需要内核态火焰图，那是先写 ADR 再改环境，不是先改了环境再找理由。
+
+### 4.2 S5-07 把上面第 ③ 条（「nginx 对照臂同法」）当成判据现测了一次：**在容器这一侧不通**
+
+上面那句「两边的取法必须一样」是 2026-11-02 写下的**计划**，不是一条被验证过的能力。
+S5-07 本轮把它当判据量了（探针 `/home/archer/s5-07-perf-probe.sh`，全部带 timeout）：
+
+| 路 | 读数 | 结论 |
+|---|---|---|
+| 宿主原生，由 perf 直接拉起被测进程 | `perf record -e cpu-clock -F 99 -g -- …` 在 wrk 满负荷的网关上出 **3K 样本**、`perf report --stdio` 有符号（`Samples: 3K of event cpu-clock:u`） | 4.1 那一种形态**在 HEAD 上复现成立**，这是本轮归因段的证据来源 |
+| `nginx:1.25.4` 镜像里有没有 perf | `docker run --rm --entrypoint sh nginx:1.25.4 -c 'command -v perf'` → **`NO_PERF_IN_IMAGE`**（同一发里 `curl=/usr/bin/curl`、`wget=无`） | 基线镜像自带不了 perf，"同法"不能靠镜像本身 |
+| 宿主 perf + 它的依赖库挂进 `ubuntu:26.04`（与宿主 glibc 同代） | 带 `--cap-add=CAP_PERFMON --security-opt seccomp=unconfined`：record **能跑、能落盘**（只警告 `kptr_restrict` 限制了内核符号）；**不带 cap**：`Failure to open any events for recording` | 容器里 `perf_event_open` 的开关是 **caps**，不是内核；glibc 同代是第二个必要条件 |
+| 宿主 perf 挂进 `nginx:1.25.4`（Debian 12 / glibc 2.36） | `/probe/perf: symbol lookup error: /probe/perflib/libc.so.6: undefined symbol: __tunable_is_initialized, version GLIBC_PRIVATE` | **ADR-27 第一节那条"挂一半 glibc 比不挂更糟"在同一批镜像上原样复现**——这条路直接堵死 |
+| `nginx:1.25.4` 里 apt 装 perf | 未执行：那要给**基线镜像加层**，属契约 9.1 的镜像内容变更 + 禁令三，归项目所有人裁 | 唯一剩下的"同法"路径，我没自己走 |
+
+**所以对 #3 差值归因的诚实口径是**：网关侧的用户态火焰图有（上面第一行），
+**nginx 侧的用户态火焰图在这台机器上取不到**，原因是两条实测（镜像里没有 perf；宿主 perf 挂进去因
+glibc 不同代而 `symbol lookup error`），而不是"没做"。要么动基线镜像（归他裁），要么这一格的 nginx 侧
+只能用**结构对照**代替——本轮用的就是它：`worker_processes auto`（16）对 `--workers 16`、
+关 `access_log` 那一档、单 worker 那一档、以及每请求 `epoll_ctl` 的整数等式（B-013/B-016/B-018/B-019）。
+这条限制进 BENCHMARK 的 #3 归因段，不进火焰图那一格冒充已取到。
 **2026-11-02 项目所有人裁定：不抬，保持 `paranoid=2`**，S5 的火焰图就按上面那一种形态取
 （由 perf 直接拉起被测进程、只有用户态栈，nginx 对照臂同法）——这条不再是待决项。
 
@@ -318,12 +338,23 @@ qdisc 自己数 `Sent 200 pkt (dropped 63, overlimits 0 requeues 0)`——两处
 |---|---|---|
 | 18520 / 18521 | `scripts/smoke-s5-01.sh` 的网关 / 假上游 | 脚本启动前逐端口探活，被占就 `die` 而不是带着它往下跑 |
 | 18522 | 同一脚本的 `--metrics-port`；也是 `scripts/bench/s5-01-metrics-cost.sh` 的观测端口 | 避开上面那几条冒烟已经在用的 18500–18509 |
+| 18183 / 18184 / 18199 | `scripts/bench/s5-07-qps-symmetric.sh`（#3 的对称档）：网关容器发布口 / nginx 容器发布口 / 原生上游 | 两侧都只走 `-p` 到 `127.0.0.1`——**这一档的全部意义就是让两侧多同一次端口发布**；上游绑 `0.0.0.0`，两个容器都从 bridge 出去打它 |
+| 18188 / 18189 | `scripts/bench/s5-07-flamegraph.sh` 的被测网关与它的上游（火焰图档，perf 直接拉起被测进程） | 该档不做 SLO 判定，只产归因证据；nginx 分支另占 18198，但那一臂本轮**取不到**（原因见 4.2） |
 
 另外两条与端口有关、容易被当成可自由决定的事实：**观测面的绑定地址跟着 `--listen` 走**（缺省 `127.0.0.1`，容器里部署方写 `0.0.0.0` 时它才对外，S5-05 编排要按这条摆 `-p`），**`--metrics-port 0` 不是"关闭"**——`0` 在这台机器上已经是"内核给端口"（本轮实测：拿到 34387 并抓取成功），关闭的形态是"标志缺席"。
 
 S5-05 的编排占的是**同一批端口**（18080/18522/18090/19090/13000，容器内部 18081/18082 不发布），
 所以它与 `smoke-s5-01/02/03/05` 不能同时跑；那张表的读数与"谁占哪个口"写在 **5.3**，这里只留指路不留第二份真相。
 `scripts/smoke-s5-05.sh` 阶段 0 逐端口探活，被占就 `die` 而不是带着它往下跑。
+
+S5-07 的两条新脚本另开一条**容器对照带**，为的是能与上面所有东西同时存在、不抢编排的口径：
+
+| 端口 | 谁在用 | 备注 |
+|---|---|---|
+| 18199 | `scripts/bench/s5-07-qps-symmetric.sh` 的原生上游（绑 `0.0.0.0`） | 两个代理容器都从这条打它；启动前逐端口探活 |
+| 18183 / 18184 | 同一脚本里**网关容器 / nginx 容器**的发布端口（容器内 18080 / 80） | 两侧都只走 `-p` 到 `127.0.0.1`，这就是这一档"拓扑对称"的全部内容 |
+| 18188 / 18189 | `scripts/bench/s5-07-flamegraph.sh` 的被测网关与它的上游 | 火焰图档：wrk 满负荷 60 s 期间由 perf 直接拉起被测进程 |
+| 18198 | 同一脚本 `ARM=nginx` 那一分支的 nginx 发布端口 | 本轮该分支**取不到证据**，原因在 4.2；端口留着是因为拒跑也要占位才测得出通路 |
 
 ## 7. 尚未确定的环境项
 
