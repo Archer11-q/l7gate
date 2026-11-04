@@ -89,6 +89,11 @@ ctest --preset debug              # 376/376（asan-ubsan / tsan 里各有 2 条 
 ./build/debug/l7gate --self-check # version / compiler / gtest / sanitizers / build_type / malloc
 ```
 
+想一把把演示面起起来（网关 + 两台上游 + 旁路 exporter + Redis + MySQL + Prometheus + Grafana，八件）：
+`docker compose -f deploy/compose/docker-compose.yml up -d --build`——**先构建再上栈**，
+而且**这一栈只服务演示面**：三个数字的判定仍走上面的裸进程与 `scripts/bench/` 的落盘摘要。
+形状与它的四条实测通路写在[可观测面与调试界面](#可观测面与调试界面)那一节与 [ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)。
+
 **命令行总览**（`--upstream` 与 `--config` 二选一；给 `--self-check` 只打印构建指纹）：
 
 ```
@@ -272,6 +277,32 @@ docker run -d --name l7gate-grafana --add-host=host.docker.internal:host-gateway
 ```
 
 `--add-host=host.docker.internal:host-gateway` **不是可选项**：本发行版下容器不共享 WSL 网络命名空间，只能经**宿主上被发布的端口**出去（实测这条路抓得到 `18522/metrics`，而 `172.17.0.1` 那一路是 `Connection refused`）。所以 `--listen` 要给 `0.0.0.0`，观测面跟着 `--listen` 走、不另开旋钮。
+
+### 一键起全套（`docker compose`，S5-05）
+
+上面那一串是**手摆**的起法，它同时也是三个数字的判定通路（裸进程 + 落盘摘要）。想一把起全套就用编排那份：[deploy/compose/docker-compose.yml](deploy/compose/docker-compose.yml)——八件一起：网关 + 两台上游 + 旁路 exporter + Redis + MySQL + Prometheus + Grafana。
+
+```bash
+cmake --build --preset release -j 16        # **先构建**：产物是挂进容器的，不是打包进镜像的
+docker compose -f deploy/compose/docker-compose.yml up -d --build
+curl -s http://127.0.0.1:18080/hello        # 业务面
+# Grafana http://127.0.0.1:13000（admin / l7gate-demo）、Prometheus http://127.0.0.1:19090
+docker compose -f deploy/compose/docker-compose.yml down --remove-orphans
+docker ps -a --filter name=l7gate-          # 停栈后这一条必须是空的
+```
+
+四件写在文件里的事实，不是假设（[ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)）：
+
+- **`--ws-echo` 那台上游不进这个栈**。S5-04 已经写明它是**仪器与假上游**，别把演示页的握手对端当生产后端；这一栈里的两台上游走默认档。
+- **被网关引用的地址全是静态 IPv4**（`172.31.250.0/24` 由编排自己声明）。容器之间按服务名解析这一格本轮实测**通**（第一次尝试就 200），**但网关不做名字解析**——它的地址走 `inet_pton(AF_INET)`，实测把配置里的 `address` 写成 `localhost` 就是 `502` + `upstream_connect_failed`。冒烟把"服务名那一版"真跑了一次，它必须红（阶段 4）。反过来 Prometheus 与 Grafana 自己做名字解析，所以**入库那两份抓取配置的 target 值（`host.docker.internal:18522/18090/19090`）一个字母没动**——实测容器经 `host.docker.internal` 打得通别的容器发布出来的端口，因此不必改；那两份**顶上关于 `extra_hosts` 的说法按本轮实测更正过**（"不带上就变假目标"这句说重了，见 [ADR-27 第三节](docs/adr/ADR-27-compose-one-command-stack.md)），改的是注释、不是值。
+- **没有 `network_mode: host`，`image` 里没有 `latest`**（前者在这台机器上不成立，后者是契约 9.1）。四个基础设施镜像走锁定 tag；我们自己产物那台是 `l7gate/runtime:s5-05`——一个**壳镜像**（`ubuntu:26.04` + 契约已经点名的 `libmysqlclient24` / `libhiredis1.1.0`），里面没有任何本项目产物。
+- **Redis 按 B-017 只绑 Redis**（`cpuset: "15"` 只出现在 redis 那一段，网关不绑）。契约要的是"Redis 不许抢走网关正在用的核"，不是"各占一半机器"；网关仍可被调度到 15 号核，那条竞争没被消除，只是不再扩散。前提 `docker info` 的 `NCPU=16` 由冒烟阶段 0 先断住。
+
+**这一栈只服务演示面**：网关进了容器，数据路径就多一次 DNAT/userland proxy——这正是 B-005 那句"赢的是对照组不是实现"的根据本身。所以三个数字的判定仍走上面那条裸进程通路 + `scripts/bench/` 的落盘摘要；要把网关与 nginx 放在同一拓扑里比（已裁第 ⑨ 条第 4 项那一臂）归 S5-07，且**两侧都进容器**。
+
+两句明写的"没做"：**MySQL 起而不用**（它是契约锁的服务、健康且可达，但没接成路由来源——接 `--nodes-db` 会撞 ADR-10 追加节第七条"首装含 mysql 组的网关不许 arm 文件重载"，那是定义域的收缩，不归编排决定）；**这一栈不 arm 文件重载**，所以"限流参数改了不生效""逐目标健康键只覆盖首装那批成员"那两句照旧有效（面板 RSS 那一格仍然写"含热重载的预留槽位容量"，那是 B-020 的口径，不是这一栈 arm 了）。
+
+判定入口是 `scripts/smoke-s5-05.sh`（十阶段、`build/smoke-s5-05/verdict.txt` 落盘），不是"我起起来了"。清理只按 `l7gate-` 前缀，脚本里没有任何全量 `rm`/`kill`，同机别人的容器一条都不碰（开工前后各数一次，不等就红）。
 
 **面板是眼睛，不是账本**：三个数字的判定读的仍是 [docs/BENCHMARK.md](docs/BENCHMARK.md) 的落盘读数与 `scripts/bench/` 的原始档；Grafana 上的曲线不进入任何达标结论。
 

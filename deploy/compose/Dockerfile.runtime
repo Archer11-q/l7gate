@@ -1,0 +1,25 @@
+# ADR-27 · 运行时壳镜像。
+#
+# 这一层里**没有任何本项目的产物**：三个二进制（l7gate、l7gate_test_upstream、l7gate_bench_exporter）
+# 都不 COPY 进来，运行期以只读 bind mount 挂到 /app。这不是省事，是只留一份真相——契约 9.4 要求
+# 产物在 ext4 里构建，把产物烤进镜像就会同时存在「镜像里那一份」和「盘上那一份」，而面板与冒烟读的
+# 必须是你刚构建的那一个字节（S5-03 就为「测的不是入库那一份」连锁红过一轮，FAULT-INJECTION §22.2 第 1 条）。
+# 连带后果：先构建，再起栈；产物不在时冒烟在阶段 0 自己拒跑。
+#
+# base 是 ubuntu:26.04（digest 与选择理由在 ADR-27 第一节 P-2/P-4 那两行，它不在契约 9.1 的表里，
+# 按禁令三由那份 ADR 放行；选它不是偏好，是因为它的 glibc 与宿主构建环境逐字相同
+# ——2.43-2ubuntu2.4，而网关实际要的符号上界是 GLIBC_2.38 + GLIBCXX_3.4.31，
+# 契约锁的那五个镜像最高只到 glibc 2.36）。
+#
+# 装进去的那两个库**不是新依赖**：它们就是契约 9.1 已经点名的版本
+# （libmysqlclient 8.4.x、hiredis v1.2.0），apt 候选实测是 8.4.11-0ubuntu0.26.04.1 与 1.2.0-6ubuntu4。
+#
+# 构建上下文是 deploy/compose/ 本身（不是仓库根）——上下文里不需要任何产物，
+# 于是 `docker compose build` 不会把 build/ 那几 GB 的对象文件发给 daemon。
+FROM ubuntu:26.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libmysqlclient24 libhiredis1.1.0 \
+ && rm -rf /var/lib/apt/lists/*
+
+# 没有 ENTRYPOINT/CMD：每台服务自己在 compose 里写 command，指向挂载进来的 /app。

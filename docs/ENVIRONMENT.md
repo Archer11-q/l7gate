@@ -246,6 +246,28 @@ Windows 侧那个 exe**。
 写 `refused=1`），不换个浏览器顶上去，也不把 DOM 那一半静默降级成"没做"。
 它不参与任何 SLO 测量——三个数字的读数仍然只认 `scripts/bench/` 的落盘档与退出账。
 
+### 5.3 编排这一层的通路事实（2026-11-04 实测，S5-05 / ADR-27）
+
+S5-03 留给 S5-05 的那笔账——**容器之间能不能按服务名解析**——本轮第一次真测，四条都落在这里。
+探针落在 `/home/archer/s5-05-probe/`（不进仓库；每台探针容器自己 `down`，收尾 `--filter name=l7gate-` 为空）。
+
+| 探测 | 读数 | 结论 |
+|---|---|---|
+| compose 用户自定义网络里，prom 容器 `wget http://gateway-stub/` | **第 0 次尝试即 `200 OK`**；容器内 `/etc/resolv.conf` 是 `nameserver 127.0.0.11`，`docker inspect` 的 `Aliases` 就是服务名 | **服务名解析在 compose 网络里通**。5.1 那一路"不共享网络命名空间"讲的是**宿主↔容器**与**默认 bridge**，不等于容器↔容器 |
+| 同一姿势，把网关配置里的 `address` 写成主机名（`localhost`，能解析的那种） | `HTTP 502`、退出账 `upstream_connect_failed=1`、`responses_completed=0`；对照臂 `127.0.0.1` 是 `200 + seq=1` | **网关不做名字解析**（`inet_pton`，`src/net/socket.cc:16-35`）。所以凡被网关引用的地址只能写 IPv4 字面量 |
+| compose 声明 `ipam` 静态子网 `172.31.250.0/24` 并给容器 `ipv4_address` | 同网络另一台容器 `wget http://172.31.250.20/` → `200 OK` | 静态 IPAM 在这台 Docker Desktop 上生效；编排据此把地址写成文件里的事实 |
+| prom 容器 `wget http://host.docker.internal:18777/`（18777 是**另一台容器**发布到宿主 `127.0.0.1` 的端口，宿主侧同一端口先读到 200） | **`200 OK`**；对照 `http://172.31.250.1:18777/` → `Connection refused` | 容器经 `host.docker.internal` 打得通别的容器的**发布端口** → 入库的 `prometheus.yml` / grafana 数据源**不需要改值**，S5-03 测的仍是同一份 |
+| 退化：删掉 prometheus 那台的 `extra_hosts` 后整栈重跑 | **两条 target 仍然全 up**；容器里 `/etc/hosts` 没有那一行，而名字照样解析到 `192.168.65.254` | **更正 5.1 与入库配置里那句"不带上就变假目标"**——它说重了。本机不依赖那一行也能解析；留着它是**不押在 daemon 的自动行为上**（换引擎/发行版那个自动名字未必存在）。已就地写进 `deploy/prometheus/prometheus.yml` 与 compose 的注释 |
+| 契约锁的镜像里谁能承载我们的二进制 | 网关要 `GLIBC_2.38` + `GLIBCXX_3.4.31`；`redis:7.2.5`/`nginx:1.25.4` 是 glibc 2.36、`mysql:8.0.36` 是 2.28、prometheus 是 busybox、grafana 是 musl。把宿主库挂进 `redis:7.2.5` → `symbol lookup error: undefined symbol: __tunable_is_initialized` | **五个锁定镜像一个都不行**，而"挂一半宿主 glibc"比不挂更糟。这是 S5-05 需要一份 ADR 的全部原因 |
+| `docker pull ubuntu:26.04`（走 daemon 里配的 mirror） | rc=0，digest `sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c`，`ldd --version` = `Ubuntu GLIBC 2.43-2ubuntu2.4` | **与宿主构建环境逐字同代**。它的 apt 里 `libmysqlclient24=8.4.11-0ubuntu0.26.04.1`、`libhiredis1.1.0=1.2.0-6ubuntu4` 与契约 9.1 字面命中，所以壳镜像装的是契约已点名的版本，不是新增第三方依赖。判定镜像在位一律以 `docker image inspect` 为准（口径⑰ 那族） |
+| `docker manifest inspect ubuntu:26.04`（直连 registry） | 超时（`registry-1.docker.io` 建不起连接） | 与 5.1 那条一致：**manifest 那一维仍无法与官方对账**，本机 digest 来自配置的 mirror，照记不假装核验过 |
+
+**编排占用的名字与端口**（compose project name = `l7gate`，所以容器一律 `l7gate-<service>-1`，网络 `l7gate-obs`）：
+发布的宿主端口是 `127.0.0.1:18080`（业务）/ `18522`（观测面）/ `18090`（exporter）/ `19090`（Prometheus）/ `13000`（Grafana），
+容器内部 `18081/18082` 两台上游不发布。**这套端口与 `smoke-s5-01/02/03` 那几条是同一批数**，所以四者不能同时跑；
+`smoke-s5-05.sh` 阶段 0 逐端口探活，被占就 `die`。B-017 那格在编排层的落点：`cpuset: "15"` 只给 redis 一段，
+前提 `docker info` 的 `NCPU=16` 由阶段 0 断住。
+
 ## 6. 文件系统位置（会影响数据的一条）
 
 仓库与全部构建、压测都在 WSL 原生 ext4 内。当前仓库位置是 `/home/archer/workspace/l7gate`（2026-10-26 从 `/home/archer/l7gate` 平移进来，同发行版同文件系统，所以契约 9.4 的条件与全部历史数字继续成立；搬家的代价与复跑记录见 TASKS 交接段的「搬家」一条）。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\workspace\l7gate` 形式）查看和编辑同一批文件。
@@ -263,11 +285,15 @@ Windows 侧那个 exe**。
 
 另外两条与端口有关、容易被当成可自由决定的事实：**观测面的绑定地址跟着 `--listen` 走**（缺省 `127.0.0.1`，容器里部署方写 `0.0.0.0` 时它才对外，S5-05 编排要按这条摆 `-p`），**`--metrics-port 0` 不是"关闭"**——`0` 在这台机器上已经是"内核给端口"（本轮实测：拿到 34387 并抓取成功），关闭的形态是"标志缺席"。
 
+S5-05 的编排占的是**同一批端口**（18080/18522/18090/19090/13000，容器内部 18081/18082 不发布），
+所以它与 `smoke-s5-01/02/03/05` 不能同时跑；那张表的读数与"谁占哪个口"写在 **5.3**，这里只留指路不留第二份真相。
+`scripts/smoke-s5-05.sh` 阶段 0 逐端口探活，被占就 `die` 而不是带着它往下跑。
+
 ## 7. 尚未确定的环境项
 
 | 项 | 状态 | 定夺时机 |
 |---|---|---|
 | **100k 长连接的两个前置条件**（2026-10-27 实测，**推翻了我之前写在四处文档里的说法**） | **① fd 上限不是环境阻塞**：`ulimit -n` soft=**10240**、hard=**1048576**，实测 `bash -c 'ulimit -n 300000'` **当场成功**——抬 soft 不需要 root、不需要改机器配置，脚本里一行或进程自己 `setrlimit` 就够（`fs.file-max` = 9.2e18、systemd `DefaultLimitNOFILE`=1048576，都不卡）。**② 真卡住 100k 的是临时端口**：`ip_local_port_range` = 32768–60999 = **28,232 个源端口**，压测客户端对同一个（目标 IP，目标端口）最多开约 2.8 万条连接，**抬 fd 完全解决不了它**。要到 100k 只有两条路：多目标端口/多地址，或者改测量口径——两条都属测量方案设计。 | 之前四处写的"S2/S3 之前必须由环境侧解决 rlimit"是**错的**（把可自抬的 soft limit 当成了机器配置），已就地改成"①不是问题、②是"；②的方案随 S2 的 `c100k.sh` 定，届时按规矩补一条 ADR |
 | 内存分配器（glibc / jemalloc / tcmalloc） | 目前默认 glibc malloc 2.43；契约 SLO #2 要求必须记录 | S1 首次记录 RSS 时定稿；换分配器属版本/依赖变更，先写 ADR |
-| `cpuset` 绑核方案（Redis 与网关、wrk 的核分配） | **已定稿并实测生效（2026-11-02，ADR-05 追加节第七节 + BENCHMARK B-017）**：只给 Redis 容器绑核 `--cpuset-cpus 15`（引擎侧 `NCPU=16` 与发行版 `nproc=16` 同一视野），证据两处——`HostConfig.CpusetCpus=15` 且容器内 `/sys/fs/cgroup/cpuset.cpus.effective=15`；容器另加 `--save "" --appendonly no`（计数是易失状态，BGSAVE 会把 CPU 抖进尾延迟）。**网关与压测工具刻意保持未绑核**：契约 3.3 要的是"Redis 不许抢走网关正在用的核"，而把网关/wrk 钉到核上会让新读数与 B-008/B-012/B-013/B-016 这些未绑核的历史档不可比。**这条不是完整隔离**（网关仍可被调度到 15 号核），边界写在 B-017 第一节末尾 | S4-08 与 S5 任何带 Redis 的压测都按 B-017 那张表复述 CPU 分配 |
+| `cpuset` 绑核方案（Redis 与网关、wrk 的核分配） | **已定稿并实测生效（2026-11-02，ADR-05 追加节第七节 + BENCHMARK B-017）**：只给 Redis 容器绑核 `--cpuset-cpus 15`（引擎侧 `NCPU=16` 与发行版 `nproc=16` 同一视野），证据两处——`HostConfig.CpusetCpus=15` 且容器内 `/sys/fs/cgroup/cpuset.cpus.effective=15`；容器另加 `--save "" --appendonly no`（计数是易失状态，BGSAVE 会把 CPU 抖进尾延迟）。**网关与压测工具刻意保持未绑核**：契约 3.3 要的是"Redis 不许抢走网关正在用的核"，而把网关/wrk 钉到核上会让新读数与 B-008/B-012/B-013/B-016 这些未绑核的历史档不可比。**这条不是完整隔离**（网关仍可被调度到 15 号核），边界写在 B-017 第一节末尾 | S4-08 与 S5 任何带 Redis 的压测都按 B-017 那张表复述 CPU 分配。**编排层的落点（2026-11-04，S5-05）**：`deploy/compose/docker-compose.yml` 里 `cpuset: "15"` 只给 redis 那一段、全栈只此一条，同一判据由 `scripts/smoke-s5-05.sh` 阶段 1（文件里只有一条且落在 redis 段）+ 阶段 9（`HostConfig` 与容器内 `cpuset.cpus.effective` 两处生效、网关那台读回空）守着，阶段 0 还先断 `docker info` 的 `NCPU=16`——那个数不成立时"15 号核"这个写法本身就是假事实 |
 | tc netem 在 6.18 WSL2 内核可用性 | 未测（契约 9.3 已预期可能不支持） | 仅作交叉验证，不阻塞主路径 |

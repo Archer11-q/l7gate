@@ -1,0 +1,224 @@
+# ADR-27 · S5-05 一键起全套：网关 + 两台上游 + 旁路 percentile exporter + Redis + MySQL + Prometheus + Grafana。
+#
+# 三条规矩先摆在这里，它们都不是风格：
+#
+# 1. **没有 `network_mode: host`**。这台机器上它不成立（ENVIRONMENT 5.1 实测：`--network host` 的容器
+#    监听表里没有那个端口，WSL 侧 curl 拿 000）。宿主↔容器只有 `-p` 发布这一条，编排不例外。
+# 2. **`latest` 一条不出现**（契约 9.1）。四个基础设施镜像走锁定 tag；我们自己产物那台是
+#    `l7gate/runtime:s5-05`——它是个**壳**，里面没有产物，三个二进制运行期只读挂进来（理由在
+#    Dockerfile.runtime 顶上那一段与 ADR-27 第二节第 3 条）。
+# 3. **地址为什么写成静态 IPv4 而不是服务名**：容器之间按服务名解析这一格本轮实测**通**
+#    （`nameserver 127.0.0.11`、Aliases 就是服务名、prom 容器第一次尝试就 200），**但网关不做名字解析**——
+#    它的地址走 `inet_pton(AF_INET)`（src/net/socket.cc:16-35），实测把 `address` 写成 `localhost`
+#    就是 502 + `upstream_connect_failed=1`。所以凡是**被网关引用**的地址都写 IPv4 字面量，
+#    而这个栈里的 IPv4 由下面的 IPAM 显式钉死——写成文件里的事实，不是假设（验收句③）。
+#    反过来，Prometheus 与 Grafana 自己做名字解析，它们继续用**入库那两份配置里已经写死的**
+#    `host.docker.internal:<发布端口>`（实测容器打得通别的容器发布出来的端口），
+#    所以 `deploy/prometheus/prometheus.yml` 与 `deploy/grafana/**` **一个字不用改**，
+#    S5-03 那条冒烟测的仍是它自己那一份。
+#
+# 端口带：18080 业务、18522 观测面、18090 exporter、19090 Prometheus、13000 Grafana，
+# 与 ENVIRONMENT 6.1 那张表和入库配置一致；容器内部 18081/18082 不发布（只有网关够得到）。
+# 用法：先在 ext4 里构建（契约 9.4），再 `docker compose -f deploy/compose/docker-compose.yml up -d`。
+# 判定入口是 `scripts/smoke-s5-05.sh`，不是这份文件能不能 `up` 起来。
+
+name: l7gate
+
+networks:
+  obs:
+    name: l7gate-obs
+    ipam:
+      driver: default
+      config:
+        # 实测这个网段在本机可用（172.31.250.0/24 + 静态分配 172.31.250.20 能被同网络另一台容器打到 200）。
+        # 万一哪天与别的 bridge 冲突，`up` 会直接失败而不是静默换个网段——地址是事实，不能漂。
+        - subnet: 172.31.250.0/24
+          gateway: 172.31.250.1
+
+services:
+
+  # ---------- 被测方（演示面，不是判定档：进容器就多一次 DNAT，ADR-27 第二节第 6 条） ----------
+
+  gateway:
+    build:
+      # 上下文是本目录而不是仓库根：壳镜像里不 COPY 任何东西，
+      # 于是构建不会把 build/ 那几 GB 的对象文件发给 daemon。
+      context: .
+      dockerfile: Dockerfile.runtime
+    image: l7gate/runtime:s5-05
+    command:
+      - /app/l7gate
+      - --serve
+      - --listen
+      - 0.0.0.0:18080
+      - --config
+      - /cfg/gateway.json
+      - --metrics-port
+      - "18522"
+      # Redis 授予额度 + 本地执行（S4-04 的形状）。这里 arm 它有两个用处：B-017 那句「只绑 Redis」
+      # 于是有主体，而 `redis_settles_ok` 是一格能断的下界——Redis 在那台网关的账里真的被用过。
+      # --nodes-db 故意不接：接进来就撞 ADR-10 追加节第七条（首装含 mysql 组的网关不许 arm 文件重载），
+      # 那是定义域收缩，归项目所有人裁（ADR-27 第三节那句「起而不用」）。
+      - --redis-db
+      - 172.31.250.41:6379
+    volumes:
+      # 产物挂进来，不打包进来：这一条是「只留一份真相」，改镜像不如改构建。
+      - ../../build/${L7GATE_PRESET:-release}:/app:ro
+      - ../gateway-compose.json:/cfg/gateway.json:ro
+      - ./healthcheck-gateway.sh:/checks/healthcheck-gateway.sh:ro
+    networks:
+      obs:
+        ipv4_address: 172.31.250.11
+    ports:
+      - "127.0.0.1:18080:18080"   # 业务面（浏览器/宿主侧 curl 走这条，ENVIRONMENT 5.2：Windows 能打进 WSL 的端口）
+      - "127.0.0.1:18522:18522"   # 观测面：入库的 prometheus.yml 写的就是 host.docker.internal:18522
+    healthcheck:
+      test: ["CMD-SHELL", "sh /checks/healthcheck-gateway.sh"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      upstream-a: { condition: service_healthy }
+      upstream-b: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  upstream-a:
+    image: l7gate/runtime:s5-05    # 镜像由 gateway 那一台构建（同一个 tag、同一份上下文）
+    command: ["/app/tests/l7gate_test_upstream", "--listen", "0.0.0.0:18081", "--body-bytes", "64"]
+    volumes:
+      - ../../build/${L7GATE_PRESET:-release}:/app:ro
+    networks:
+      obs:
+        ipv4_address: 172.31.250.21
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/18081'"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  upstream-b:
+    image: l7gate/runtime:s5-05
+    command: ["/app/tests/l7gate_test_upstream", "--listen", "0.0.0.0:18082", "--body-bytes", "64"]
+    volumes:
+      - ../../build/${L7GATE_PRESET:-release}:/app:ro
+    networks:
+      obs:
+        ipv4_address: 172.31.250.22
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/18082'"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # ---------- 仪器：ADR-25 第六节点名的「第四个独立服务」 ----------
+  # 自己的容器、自己的进程地址空间，只读挂载 build/bench。它不进网关容器、不共享网关内存，
+  # 也不因为编排而改成读 /proc 或读 ReactorStats（ADR-25 第六节原话）。同一个镜像、两个容器
+  # 不违反那条——那条守的是内存与计数，不是 inode。
+  bench-exporter:
+    image: l7gate/runtime:s5-05
+    command: ["/app/tools/l7gate_bench_exporter", "--root", "/bench", "--listen", "0.0.0.0:18090"]
+    volumes:
+      - ../../build/${L7GATE_PRESET:-release}:/app:ro
+      - ../../build/bench:/bench:ro
+    networks:
+      obs:
+        ipv4_address: 172.31.250.31
+    ports:
+      - "127.0.0.1:18090:18090"   # 同上：入库的 prometheus.yml 里那条 job 写的是 host.docker.internal:18090
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/18090'"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # ---------- 契约锁定的那四台 ----------
+
+  redis:
+    image: redis:7.2.5
+    # 持久化关掉：限流计数是易失状态，RDB 快照会把 BGSAVE 的 CPU 抖进尾延迟（B-017 那格的原话）。
+    command: ["--save", "", "--appendonly", "no"]
+    # B-017 的 CPU 分配：**只绑 Redis**。契约要的是「Redis 不许抢走网关正在用的核」，
+    # 不是「Redis 与网关各占一半机器」——网关仍可被调度到 15 号核，那条竞争没被消除，只是不再扩散。
+    # 这一格成立的前提是引擎侧看得见 16 个核（冒烟阶段 0 先断 docker info 的 NCPU=16，
+    # 否则「15 号核」这个写法本身就是假事实）。
+    cpuset: "15"
+    networks:
+      obs:
+        ipv4_address: 172.31.250.41
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  mysql:
+    image: mysql:8.0.36
+    # 这一台在本栈里是「起而不用」：它是契约 9.1 锁的服务、健康且可达，但**没有**接成路由来源。
+    # 要接就得上 --nodes-db + source: mysql 那一组，而 ADR-10 追加节第七条规定那台就不能 arm
+    # 文件重载——那是演示面定义域的收缩，不归编排决定（ADR-27 第三节）。
+    environment:
+      MYSQL_ROOT_PASSWORD: l7gate-root
+      MYSQL_DATABASE: l7gate
+      MYSQL_USER: l7gate
+      MYSQL_PASSWORD: l7gate-pw
+    networks:
+      obs:
+        ipv4_address: 172.31.250.42
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    # 入库那份配置，不是临时抄的一份（§22.2 第 1 条那条连锁红的教训）。
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    # 这两个 target 是 host.docker.internal:<发布端口>，所以这里显式带上 extra_hosts。
+    # **但"不带上就会变成假目标"这句在本机不成立，照记**：退化 C4 把它删掉之后两条 target 仍然全 up
+    # （容器里 /etc/hosts 没有那一行，而名字照样解析到 192.168.65.254——Docker Desktop 的内置 DNS 会给）。
+    # 留着它的理由因此不是"少了就抓不到"，是**不押在 daemon 的自动行为上**：换一个引擎或发行版，
+    # 那个自动名字未必存在，而 `--add-host=host.docker.internal:host-gateway` 是明文写下的通路。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [obs]
+    ports:
+      - "127.0.0.1:19090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/-/ready >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: l7gate-demo
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # 数据源 URL 是 host.docker.internal:19090（入库那份）
+    networks: [obs]
+    ports:
+      - "127.0.0.1:13000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s

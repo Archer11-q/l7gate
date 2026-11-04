@@ -4,7 +4,13 @@
 # 本发行版下容器不共享 WSL 网络命名空间（ENVIRONMENT 第 5 节），但容器经
 # `--add-host=host.docker.internal:host-gateway` 能读到宿主上绑 `0.0.0.0` 的端口
 # —— 本会话实测：抓回 `# HELP elapsed_ms` 那行；`172.17.0.1` 那一路是 `Connection refused`。
-# S5-05 的 compose 里必须带上那条 `extra_hosts`，否则这两个 target 一起变成假目标。
+#
+# S5-05 更正这一句（照记实测，原话说重了）：原先写的是「compose 里必须带上那条 `extra_hosts`，
+# 否则这两个 target 一起变成假目标」。退化 C4 真把它删掉跑了一遍：**两条 target 仍然全 up**，
+# 容器里 `/etc/hosts` 没有那一行，而名字照样解析（本机解析到 192.168.65.254，Docker Desktop 的
+# 内置 DNS 自己给）。所以带 extra_hosts 的理由不是"少了就抓不到"，是**不把抓取通路押在 daemon 的
+# 自动行为上**——换引擎或换发行版那个自动名字未必存在，而这一行是明文写下的通路。
+# compose 里两处都带着它（prometheus 与 grafana），判据见 `scripts/smoke-s5-05.sh` 阶段 1。
 #
 # 网关侧那两个端口都不是业务端口：`18522` 是 `--metrics-port`（观测面独立端口，已裁第 ⑨ 条
 # 第 2 项；业务客户端摸不到它，抓取连接也进不了 `requests_parsed`）；`18090` 是

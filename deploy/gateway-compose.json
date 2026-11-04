@@ -1,0 +1,30 @@
+{
+  "upstreams": [
+    {
+      "name": "api",
+      "balance": "round_robin",
+      "targets": [
+        { "address": "172.31.250.21", "port": 18081 },
+        { "address": "172.31.250.22", "port": 18082 }
+      ]
+    }
+  ],
+  "routes": [
+    { "match": "prefix", "pattern": "", "upstream": "api" }
+  ],
+  "health": {
+    "max_fails": 2,
+    "fail_timeout_ms": 1500,
+    "probe_interval_ms": 0,
+    "max_ejection_percent": 50
+  },
+  "circuit": {
+    "window_ms": 2000,
+    "minimum_requests": 5,
+    "error_rate_percent": 50,
+    "half_open_requests": 2,
+    "half_open_successes": 2,
+    "half_open_timeout_ms": 8000
+  },
+  "rate_limit": { "rate": 1000, "burst": 1000, "key": "path" }
+}
