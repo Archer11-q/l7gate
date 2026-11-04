@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>l7gate WebSocket 调试页</title>
+</head>
+<body>
+<!--
+  地址栏 + 消息流 + 输入框（契约 4.2 第 2 层）。零依赖，不解析 WebSocket 帧：
+  这一页显示的是**网关给它的东西**，帧的语义在浏览器与上游各自那一侧（ADR-09 / ADR-26）。
+
+  两处不显然的决定：
+  1. 「429 rate limited」这句文案只能来自页面自己发的一条**普通 HTTP 请求**。
+     浏览器不暴露 WebSocket 握手的状态码（实测：被限流的那几条只有 code=1006，没有任何码），
+     所以要读 429 就得走 fetch；而 fetch 要读得到响应，页面必须与网关**同源**
+     ——这就是这页由上游经网关发出的原因（ADR-26 第一节末条的 CORS 实测）。
+  2. 末尾那个 <output id="s504-verdict"> 是**完成哨兵**，只在整串自动步骤跑完之后才写。
+     冒烟脚本读它而不是读整篇文档：无头浏览器的单次快照会抓到"还没跑完"的那一轮，
+     而整篇 grep 会被本文件里同样的字符串骗过（实测命中 2 次 vs 限定后 1 次）。
+-->
+<p>
+  <input id="addr" size="34" placeholder="网关地址 host:port，留空=本机同源">
+  <button id="connect">连接</button>
+  <button id="probe">限流探针</button>
+  <button id="disconnect">断开</button>
+</p>
+<pre id="log">待连接</pre>
+<p><input id="msg" size="46" value="hello"><button id="send">发送</button></p>
+<output id="s504-verdict"></output>
+<script>
+var ws = null, recv_n = 0, got429 = 0, probe_total = 0, done = false;
+var Q = new URLSearchParams(location.search);
+var WS_PATH = Q.get('ws') || '/ws', PROBE_PATH = Q.get('probe') || '/limited';
+var BURST = parseInt(Q.get('burst') || '12', 10);
+function note(s) { var p = document.getElementById('log'); p.textContent = (p.textContent === '' || p.textContent === '待连接' ? '' : p.textContent + '\n') + s; }
+function host() { return document.getElementById('addr').value.trim() || location.host; }
+function wsURL() { return (location.protocol === 'https:' ? 'wss://' : 'ws://') + host() + WS_PATH; }
+function connect() {
+  if (ws) { note('已经连着一条了'); return; }
+  note('connect ' + wsURL());
+  ws = new WebSocket(wsURL());
+  ws.onopen = function () { note('open');
+    if (window.__onopen) { var h = window.__onopen; window.__onopen = null; h(); } };
+  ws.onmessage = function (ev) {
+    recv_n += 1;
+    note('recv ' + recv_n + ' len=' + ev.data.length + ' val=' + ev.data);
+    if (window.__onrecv) { var f = window.__onrecv; window.__onrecv = null; f(); }
+  };
+  ws.onerror = function () { note('error'); };
+  ws.onclose = function (ev) { note('closed code=' + ev.code); ws = null;
+    if (window.__onclose) { var g = window.__onclose; window.__onclose = null; g(ev); }
+    else if (Q.get('auto') === '1' && !done) finish(); };
+}
+function send() {
+  if (!ws || ws.readyState !== 1) { note('没连着，发不出去（readyState=' + (ws ? ws.readyState : 'none') + '）'); return; }
+  var m = document.getElementById('msg').value;
+  ws.send(m);
+  note('sent ' + m);
+}
+// 同源的普通请求：读得到状态码，而这条请求在网关那侧是真业务请求（该进 rate_limit_rejected 就进）。
+function probe() {
+  return fetch(PROBE_PATH, {cache: 'no-store'}).then(function (r) {
+    probe_total += 1;
+    note('probe ' + probe_total + ' status=' + r.status);
+    if (r.status === 429) { got429 += 1; note('429 rate limited'); }
+    return r.status;
+  }).catch(function (e) { note('probe 失败 ' + e.name); return 0; });
+}
+// 自动序列全部由**事件**驱动，不用轮询定时器：虚拟时间预算下定时器几乎不等，
+// 而真实网络往返按真实时间走——用 setInterval 等握手等于把预算烧在空转上，
+// 实测那一形状下 12 条探针只跑完 2 条就被快照截走（DOM 停在 same-connection、哨兵为空）。
+function auto() {
+  document.getElementById('log').textContent = '';
+  window.__onopen = step1;
+  connect();
+}
+function step1() {
+  document.getElementById('msg').value = 's504-a';
+  send();
+  window.__onrecv = function () {
+    if (!ws || ws.readyState !== 1) { note('第二条前连接已不在（不是同一条长连接）'); return finish(); }
+    document.getElementById('msg').value = 's504-b';
+    send();
+    window.__onrecv = function () {
+      note('same-connection recv=' + recv_n + ' readyState=' + (ws ? ws.readyState : 'none'));
+      probeChain();
+    };
+  };
+}
+function probeChain() {
+  var i = 0;
+  (function next() {
+    if (i++ >= BURST) return finish();
+    probe().then(next);
+  })();
+}
+function finish() {
+  // 关连接是句③ 的动作：页面主动 close，网关那一侧要看到配对两头都收。
+  // __onclose 里绝不能再调 ws.close()（onclose 触发时连接已经关了、handler 也已把 ws 置空）。
+  if (ws) { window.__onclose = write; ws.close(); } else write();
+  function write() {
+    done = true;
+    var steps = ['open', 'recv1', 'recv2', 'same-connection', got429 ? 'probe429' : 'probe-none', 'close'];
+    var ok = recv_n === 2 && got429 > 0;
+    document.getElementById('s504-verdict').textContent =
+      (ok ? 'DONE ' : 'INCOMPLETE ') + 'steps=' + steps.join(',') +
+      ' recv=' + recv_n + ' got429=' + got429 + ' probe_total=' + probe_total;
+  }
+}
+document.getElementById('connect').onclick = connect;
+document.getElementById('send').onclick = send;
+document.getElementById('probe').onclick = probe;
+document.getElementById('disconnect').onclick = function () { if (ws) ws.close(); };
+if (Q.get('auto') === '1') auto();
+</script>
+</body>
+</html>

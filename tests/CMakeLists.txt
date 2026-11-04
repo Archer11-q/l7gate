@@ -20,6 +20,7 @@ add_executable(l7gate_tests
   request_parser_test.cc
   route_test.cc
   upgrade_test.cc
+  ws_frame_test.cc
 )
 target_link_libraries(l7gate_tests PRIVATE
   l7gate_core

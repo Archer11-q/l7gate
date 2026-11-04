@@ -222,6 +222,30 @@ FAULT-INJECTION §14）。这一条掉线仍然是**第三次**，所以那句"�
 退化环境的读数"照旧成立：本轮的代价不是错读数，而是**整整一条任务的前置被卡住半天**——S4-04 的
 认领提交（`7edff8f`）里我明写了"本提交不含任何容器侧结论"，就是这个原因。
 
+### 5.2 WSL interop 能把 Windows 侧的 Chrome 当取数仪器用（2026-11-04 实测，S5-04 / ADR-26）
+
+S5-04 的验收句⑤ 要求"取数证据用 DOM 断言"，而本机没有 Linux 侧浏览器（实测 `chromium`、
+`chromium-browser`、`google-chrome`、`google-chrome-stable`、`firefox` **全部 MISS**，
+`node` 也不在 PATH 上——它在 `~/tools/node/bin` 下）。可用的通道只有一条：**从 WSL 里直接执行
+Windows 侧那个 exe**。
+
+| 项 | 实测值 / 事实 |
+|---|---|
+| Chrome 版本 | **156.0.8078.80**（`powershell.exe (Get-Item …chrome.exe).VersionInfo.ProductVersion`；`chrome.exe --version` **不给版本号**，它会把浏览器拉起来——我第一次就撞上了，别再照契约 9.2 那个姿势去取） |
+| 可执行路径 | `/mnt/c/Program Files/Google/Chrome/Application/chrome.exe`，`test -x` 为真，WSL interop 能执行 |
+| 取 DOM 的姿势 | `--headless=new --disable-gpu --no-first-run --user-data-dir=<Windows 路径> --virtual-time-budget=30000 --dump-dom <url>` |
+| 单轮耗时 | **1.11 s**（三轮各 1.11 s，含 Chrome 冷启动）——所以"重试到 8 次"这条不贵 |
+| 单次快照可靠吗 | **不可靠**：同参数连跑三轮，第三轮只抓到 `connect` 那一行（预算 8000 那一档也只到 `sent`，15000 才抓到 `recv`）。判定必须是"有限重试 + 完成哨兵"，不是跑一次 |
+| 输出行尾 | **CRLF**（Windows 进程写的）。`grep -x` 这类整行匹配会全部落空，取数前要 `tr -d '\r'`（快照按原样留档，那是证据） |
+| profile | 必须给**专用** `--user-data-dir`（我用 `%TEMP%\l7gate-s5-04-profile`），绝不能挂到用户自己的 Chrome 配置上 |
+| Windows→WSL 的可达性 | 顺带纠正一条我之前记着的印象：Windows 侧**能**打进 WSL 的端口，`127.0.0.1:<port>` 与 WSL 的 NAT IP（本轮 `172.28.252.175`）两路 `curl` 都是 200。这与 5.1 那条"容器 → `172.17.0.1` refused"是**两个不同的网络**（一个是宿主↔WSL，一个是容器↔WSL），别混用 |
+
+**这条为什么算新依赖**：`chrome.exe` 不在契约 9.1 的锁定表里、版本随 Windows 侧自动更新漂移，
+而 `scripts/smoke-s5-04.sh` 现在用它取 DOM。按禁令三，登记在 ADR-26（第四节第 2 条），
+并照 `smoke-s3-04`/`smoke-s4-04` 对 Docker 的先例：**依赖不在时脚本在阶段 0 自己拒跑**（`verdict.txt`
+写 `refused=1`），不换个浏览器顶上去，也不把 DOM 那一半静默降级成"没做"。
+它不参与任何 SLO 测量——三个数字的读数仍然只认 `scripts/bench/` 的落盘档与退出账。
+
 ## 6. 文件系统位置（会影响数据的一条）
 
 仓库与全部构建、压测都在 WSL 原生 ext4 内。当前仓库位置是 `/home/archer/workspace/l7gate`（2026-10-26 从 `/home/archer/l7gate` 平移进来，同发行版同文件系统，所以契约 9.4 的条件与全部历史数字继续成立；搬家的代价与复跑记录见 TASKS 交接段的「搬家」一条）。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\workspace\l7gate` 形式）查看和编辑同一批文件。

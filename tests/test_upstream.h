@@ -17,6 +17,7 @@
 
 #include "net/fd.h"
 #include "net/socket.h"
+#include "ws_frame.h"
 
 namespace l7gate::testing {
 
@@ -99,6 +100,14 @@ class TestUpstream {
   std::uint64_t path_status_responses_served() const noexcept {
     return path_status_responses_.load(std::memory_order_relaxed);
   }
+  // S5-04：演示页的三方同轴靠这两个数——页面 DOM 数到的条数、网关的 `upgrades_101` /
+  // 隧道字节数、以及这里"上游自己承认回了几条"。三个都在，串号与丢帧才读得出来。
+  std::uint64_t upgrades_101_served() const noexcept {
+    return upgrades_101_.load(std::memory_order_relaxed);
+  }
+  std::uint64_t ws_frames_echoed() const noexcept {
+    return ws_frames_echoed_.load(std::memory_order_relaxed);
+  }
 
   // 三个测试侧旋钮。语义都限定在"对端行为"，不触碰网关内部状态。
   // 响应体的**长度**由 response_body_bytes_ 决定，内容形如 "seq=42....."，
@@ -153,6 +162,17 @@ class TestUpstream {
   // 只在 `start()` 之前设（它是普通 bool，运行中改就是 data race）。
   void set_ignore_close_header(bool on) noexcept { ignore_close_header_ = on; }
 
+  // --- S5-04 演示页的两档（ADR-26） ------------------------------------------
+  // `--ws-echo` 改的是**握手对端的成色**，不是网关的语义：101 里的 accept 按
+  // `Sec-WebSocket-Key` 现算，进隧道之后解掩码取载荷、回一条未掩码帧。
+  // 这两件事只在真浏览器参与的那条路上必要（实测理由在 ADR-26 第一节），默认不开——
+  // 默认档仍是"原样吐回字节"的笨对端，S1-05/S2-05 那批透传断言靠的就是它笨。
+  // 两档不可互换，所以这条开关必须显式开。
+  void set_ws_echo(bool on) noexcept { ws_echo_ = on; }
+  // 演示页得**经网关同源**提供，否则页面的状态码探针会被 CORS 挡（ADR-26 第一节末条实测）。
+  // 网关不做静态文件服务（那是动 `src/`），所以页面由这台上游发：非升级的普通请求回这段体。
+  void set_html_body(std::string html) { html_body_ = std::move(html); }
+
   // 这一档 stall 原本还有**第二个动作**：`clamp_receive_window` / `release_receive_window`
   // 在 stall 期间把每条连接的 SO_RCVBUF 显式设成 4096（内核翻倍记账 → 通告窗口 8 KiB），
   // 理由是"不钉的话载荷会被内核一路吸收，网关的入向缓冲顶不到停读线"。整段删了，
@@ -189,6 +209,11 @@ class TestUpstream {
     // 原样回显（一次 read 回一次，正好和"网关每事件搬一块"对齐）。测试对端
     // 在这里同样"不解析帧"：它证明的只是"另一端原样收到"，语义都在网关侧断言。
     bool tunneled = false;
+    // S5-04：`--ws-echo` 开启时这一条隧道走"解掩码 → 回未掩码帧"而不是原样吐回。
+    // 分开两个标志（而不是复用 `tunneled`）是因为**默认档必须一个字节都不变**：
+    // S2-05 阶段四那条"客户端收到的恰好 = 101 头 + 我发出的 2048 帧字节"的判据
+    // 靠的就是原样吐回，重组过一次就不成立了。
+    bool ws_framed = false;
     // S1-06：这一条由上游**主动断掉**（坏上游的两种形态：不回话 / 回半条）。
     // 断完之后本轮就把 client 摘掉，不让它带着 -1 的 fd 再进一次 poll 表。
     bool hang_up = false;
@@ -229,8 +254,12 @@ class TestUpstream {
           // 隧道：不碰语义，pending 里是什么就回显什么（包括"看起来像畸形 HTTP"
           // 的帧字节）。回显掉即清空——这里没有"请求"可消费。
           if (alive && !client.pending.empty()) {
-            echo_all(client, client.pending);
-            client.pending.clear();
+            if (client.ws_framed) {
+              ws_echo_frames(client);
+            } else {
+              echo_all(client, client.pending);
+              client.pending.clear();
+            }
           }
         } else if (alive) {
           serve_complete_requests(client);
@@ -303,8 +332,10 @@ class TestUpstream {
       // 只带 Upgrade 头的请求若被网关当握手，这里的 101 会原样漏给客户端并被
       // 隧道计数断言抓住（见 S1_05_Reactor 的 negative 用例）。
       if (lower.find("upgrade:") != std::string::npos) {
-        respond(client, build_101(), block_end);
+        respond(client, build_101(headers), block_end);
         client.tunneled = true;
+        client.ws_framed = ws_echo_;
+        upgrades_101_.fetch_add(1, std::memory_order_relaxed);
         return;
       }
 
@@ -320,6 +351,21 @@ class TestUpstream {
       const bool want_close =
           !ignore_close_header_ && lower.find("connection: close") != std::string::npos;
       if (want_close) client.closed_by_close_header = true;
+
+      // S5-04：`--html` 接管非升级请求的响应形态（演示专用，它会让 /dies 那批前缀档失效，
+      // 所以同一次启动里不要混用）。存在的理由只有一条：页面必须**经网关同源**提供，
+      // 页面的状态码探针才读得到 429（ADR-26 第一节末条的 CORS 实测）。
+      if (!html_body_.empty()) {
+        std::string payload = "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: text/html; charset=utf-8\r\n"
+                              "Content-Length: " + std::to_string(html_body_.size()) +
+                              "\r\nConnection: " + (want_close ? "close" : "keep-alive") +
+                              "\r\n\r\n" + html_body_;
+        requests_served_.fetch_add(1, std::memory_order_relaxed);
+        respond(client, payload, block_end + body_len);
+        if (client.closed_by_close_header) return;
+        continue;
+      }
 
       // S1-06 的故障与框架模式。判定口径只看请求 target 里的路径前缀——
       // 上游不需要 HTTP 语义，只需要"看到不同路径回不同字节"，聪明留给网关。
@@ -425,15 +471,65 @@ class TestUpstream {
     }
   }
 
-  std::string build_101() {
+  std::string build_101(const std::string& headers) {
     // 握手计入"已服务"（脚本侧的上游自报数要保持同一条口径），但 101 没有
     // seq 体——隧道里没有响应体这回事。
     requests_served_.fetch_add(1, std::memory_order_relaxed);
+    std::string accept = "dGhpcyBpcyBub3QgcmVhbCBjcnlwdG9ncmFwaHk=";
+    if (ws_echo_) {
+      // S5-04：真浏览器校这一格（实测假 accept 让 Chrome 判 1006，而网关侧
+      // `upgrades_101` 同刻 +1）。按 key 现算，不再抄固定串。
+      accept = websocket_accept(header_value(headers, "sec-websocket-key"));
+    }
     return "HTTP/1.1 101 Switching Protocols\r\n"
            "Upgrade: websocket\r\n"
            "Connection: Upgrade\r\n"
-           "Sec-WebSocket-Accept: dGhpcyBpcyBub3QgcmVhbCBjcnlwdG9ncmFwaHk=\r\n"
+           "Sec-WebSocket-Accept: " + accept + "\r\n"
            "\r\n";
+  }
+
+  // 只认单值、大小写不敏感的头取值——和 `content_length_of` 同一条立场：
+  // 这里不需要一份完整解析器，那职责在网关侧，重抄一份只会让两处漂移。
+  static std::string_view header_value(const std::string& headers, std::string_view name_lower) {
+    std::string lower = headers;
+    for (auto& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    const std::size_t pos = lower.find(name_lower);
+    if (pos == std::string::npos) return {};
+    std::size_t i = pos + name_lower.size();
+    while (i < lower.size() && (lower[i] == ' ' || lower[i] == '\t')) ++i;
+    if (i < lower.size() && lower[i] == ':') ++i;
+    while (i < lower.size() && (lower[i] == ' ' || lower[i] == '\t')) ++i;
+    const std::size_t line_end = headers.find("\r\n", i);
+    if (line_end == std::string::npos) return std::string_view(headers).substr(i);
+    return std::string_view(headers).substr(i, line_end - i);
+  }
+
+  // 隧道里的帧回显：一次事件可能堆着 0..n 条完整帧，也可能有一条只到了一半。
+  // 半条就**留在 pending 里**等下一次事件（默认档那句"回显掉即清空"在这里不成立——
+  // 清空一次残缺帧等于替浏览器把一个畸形帧拼出来，那是仪器自己造故障）。
+  // 畸形帧与 close 之后把这条标成 `hang_up` 交给外层摘除；不动 `alive`——那个变量的
+  // 意思是"连接还活着"（read_into 的返回值），不是"该摘"，把两件事并成一个会读掉
+  // `close_after_response_` 那类别的摘除理由。
+  void ws_echo_frames(Client& client) {
+    while (!client.pending.empty()) {
+      std::size_t consumed = 0;
+      std::string frame;
+      const WsTake outcome = take_client_frame(client.pending, &consumed, &frame);
+      if (outcome == WsTake::kNeedMore) return;
+      if (outcome == WsTake::kMalformed) {
+        client.hang_up = true;
+        return;
+      }
+      client.pending.erase(0, consumed);
+      if (!frame.empty()) {
+        echo_all(client, frame);
+        ws_frames_echoed_.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (outcome == WsTake::kClosed) {
+        client.hang_up = true;
+        return;
+      }
+    }
   }
 
   static bool content_length_of(const std::string& headers, std::size_t* out, bool* found) {
@@ -591,6 +687,11 @@ class TestUpstream {
   std::atomic<bool> stall_reads_{false};
   int stall_reads_ms_ = 0;
   std::chrono::steady_clock::time_point stalled_until_{};
+  // S5-04 的两档与两笔自报账（都只在 start 之前设，理由同 `ignore_close_header_`）。
+  bool ws_echo_ = false;
+  std::string html_body_;
+  std::atomic<std::uint64_t> upgrades_101_{0};
+  std::atomic<std::uint64_t> ws_frames_echoed_{0};
 };
 
 }  // namespace l7gate::testing

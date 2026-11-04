@@ -34,7 +34,7 @@
 - [架构与数据流](#架构与数据流)
 - [快速开始](#快速开始)
 - [明确不做的东西](#明确不做的东西)
-- [可观测面与调试界面（规划中，未实现）](#可观测面与调试界面规划中未实现)
+- [可观测面与调试界面](#可观测面与调试界面)
 - [文档索引](#文档索引)
 
 ---
@@ -283,7 +283,7 @@ scripts/bench/s1-p999.sh                  # SLO #1 的 p999 半边：1000 并发
 
 ## 可观测面与调试界面
 
-三个数字最终要能被**看见**，不是只存在于压测报告里。这一节是 S5 的交付物形状；**S5-01（运行期指标面）、S5-02（配置热重载）、S5-03（Prometheus 抓取 + Grafana 六格）已交出**，WebSocket 调试页（S5-04）与 `docker compose` 一键起全套（S5-05）仍未实现（[docs/SLO.md](docs/SLO.md) 的 #2/#3 测量条件就是面板上的格子）。
+三个数字最终要能被**看见**，不是只存在于压测报告里。这一节是 S5 的交付物形状；**S5-01（运行期指标面）、S5-02（配置热重载）、S5-03（Prometheus 抓取 + Grafana 六格）、S5-04（WebSocket 调试页）已交出**，`docker compose` 一键起全套（S5-05）与 `tc netem` 现场（S5-06）仍未实现（[docs/SLO.md](docs/SLO.md) 的 #2/#3 测量条件就是面板上的格子）。
 
 **⓪ 运行期指标面 `--metrics-port PORT`——已实现（S5-01，[ADR-24](docs/adr/ADR-24-metrics-exposition.md)）**
 
@@ -324,13 +324,30 @@ docker run -d --name l7gate-grafana --add-host=host.docker.internal:host-gateway
 
 **面板是眼睛，不是账本**：三个数字的判定读的仍是 `docs/BENCHMARK.md` 里的落盘读数与 `scripts/bench/` 的原始档；Grafana 上的曲线不进入任何达标结论。
 
-**② WebSocket 调试页——只有三块：地址栏、消息流、输入框**
+**② WebSocket 调试页——已实现（S5-04，[ADR-26](docs/adr/ADR-26-ws-echo-upstream-and-headless-dom.md)）：地址栏、消息流、输入框**
 
-连上 `ws://<host>:<port>/ws` 后能看到握手状态、RTT、已收条数，以及逐条带方向的帧；被限流时那一行直接显示 `429 rate limited`。它存在的理由不是方便我调试，而是**把"透传不裁决"（ADR-09）这件事变成肉眼可验的**：帧内容原样进出，网关只在连接层面做握手与转发。
+[demo/ws-echo.html](demo/ws-echo.html) 零依赖，一进一出就是页面该做的事：连 `ws://<网关>/ws`，把**网关给它的东西**显示出来——连接事件（`open` / `closed code=1005`）、逐条收发的文本（回来的 `val=` 必须与发出去的那一串逐字相等）、以及被限流时那一行 `429 rate limited`。它存在的理由不是方便我调试，而是**把"透传不裁决"（ADR-09）这件事变成可验的**：帧内容原样进出，网关只在连接层面做握手与转发。
 
-**③ 故障注入的现场**：配合 `tc netem` 注入延迟与丢包，同一页面上能亲眼看到限流返回 429、熔断把后端摘掉。`netem` 在本机 6.18 WSL2 内核上**尚未验证可用**（记在 ENVIRONMENT 第 7 节），所以这一条的落地前提是它可用，否则按契约 8.2 先写 ADR 再换手段。
+三条不是缺陷、而是**协议与浏览器边界**的事实，我按实测写在这里（细节与数据在 ADR-26 与 ARCHITECTURE 1.37）：
 
-> S5 的拆解已经过项目所有人确认（2026-11-02，五条岔路逐条按推荐裁定＝已裁第 ⑨ 条）；上面 ② ③ 两格分别落在 S5-04 与 S5-05/S5-06，`tc netem` 在本机 6.18 WSL2 内核上仍未验证可用（S5-06 的第一件事是给可用性判据）。
+- **`429` 这句文案不是从 WebSocket 事件里读出来的**。浏览器不暴露握手的 HTTP 状态码（实测：被限流的那 7 条只有 `code=1006`，没有任何码），所以页面对同一路径发一条**普通 HTTP 请求**去读 `response.status`。这条请求是真业务请求，网关那侧同样计入 `rate_limit_rejected`——冒烟断的是**页面数到的条数 == 网关自报的增量**（本轮实测两处各一次：自动序列那轮 7==7，同轴那一轮又 7==7；`build/smoke-s5-04/prov-429.txt` 留下两条取数通道的指纹）。
+- **页面必须由网关同源提供**。跨源 `fetch` 会被 CORS 挡（实测控制台原文 `No 'Access-Control-Allow-Origin' header is present`），而网关不做静态文件服务（那是动 `src/`）。所以起法是把演示页交给上游 `--html`，浏览器一律从网关端口进：`http://127.0.0.1:<网关>/demo/ws-echo.html`。直接双击打开本地文件那一版只能看连接事件，读不到状态码——这是同源规则，不是我少写了。
+- **回显发生在上游，不在网关**。浏览器要求服务端回帧未掩码，而客户端帧一定带掩码（实测把原样字节吐回去时 `onmessage` 一次都不触发，直接断连）。所以"会解帧的对端"是测试/演示夹具（`l7gate_test_upstream --ws-echo`，SHA-1/base64/掩码都自带），**网关一字未动**：它仍然只做 101 relay + 之后不透明双向透传——真实拓扑本来就是这样，WebSocket 的端点是应用而不是代理。
+
+**没做的两样照记**：这一节原先的规划文案里有「RTT」与「逐条带方向的帧」。RTT 我没做——它是页面自己掐表的一个数，不进任何判定，而契约 4.2 要的是"限流与摘除看得见"；「逐条带方向的帧」按 ADR-09 就不该做（页面一旦解释帧，就把"网关不解析"这件事搞混了），现在显示的是收发两条事件行。这两句按偏离记在这里，不当作已经实现。
+
+起法（一条命令一套，配合 S5-03 那套观测面）：
+
+```bash
+build/debug/tests/l7gate_test_upstream --listen 127.0.0.1:18941 --ws-echo \
+  --html demo/ws-echo.html &
+build/debug/l7gate --serve --listen 0.0.0.0:18940 --config build/smoke-s5-04/gw.json --metrics-port 18524 &
+# 浏览器打开 http://127.0.0.1:18940/demo/ws-echo.html ；加 ?auto=1 让页面自己跑完那一串（冒烟用的就是这一档）
+```
+
+**③ 故障注入的现场**：配合 `tc netem` 注入延迟与丢包，同一页面上能亲眼看到限流返回 429、熔断把后端摘掉。`netem` 在本机 6.18 WSL2 内核上**尚未验证可用**（记在 ENVIRONMENT 第 7 节），所以这一条的落地前提是它可用，否则按契约 8.2 先写 ADR 再换手段。限流那半句**已经在 S5-04 里被 DOM 断言验过一次**（不靠眼睛），熔断那半句的现场演示要等 S5-05/S5-06。
+
+> S5 的拆解已经过项目所有人确认（2026-11-02，五条岔路逐条按推荐裁定＝已裁第 ⑨ 条）；上面 ③ 落在 S5-05/S5-06，`tc netem` 在本机 6.18 WSL2 内核上仍未验证可用（S5-06 的第一件事是给可用性判据）。验收句⑤ 那句"取数证据用 DOM 断言，不用人眼"的落地形态是 `chrome.exe --headless=new --dump-dom`（经 WSL interop，单轮实测 1.11 s）+ 有限重试 + 完成哨兵 + `build/smoke-s5-04/verdict.txt` 落盘——单次快照会抓到"还没跑完"的那一轮，所以脚本读的永远是**哨兵结论 + 消息流那一格**，不是整篇文档，也不是我看过一眼。
 
 ---
 
@@ -346,7 +363,7 @@ docker run -d --name l7gate-grafana --add-host=host.docker.internal:host-gateway
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测记录：B-001…B-005 + 口径变更节，**未达标照记** |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障注入的预期 vs 实测 + sanitizer 结论（每条"干净"都带反证） |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**：S1 四件套对账、一键复现、留给 S2 的九条债、待答复事项 |
-| [docs/adr/](docs/adr/) | 16 条决策记录（ADR-14 连接所有权、ADR-15 per-worker 上游连接池、ADR-16 请求-响应配对模型随 S2 新增） |
+| [docs/adr/](docs/adr/) | 26 条决策记录（ADR-14 连接所有权、ADR-15 per-worker 上游连接池、ADR-16 请求-响应配对模型随 S2 新增；S5 新增 ADR-24 指标暴露面、ADR-25 分位那格的旁路 exporter、ADR-26 演示页的握手对端与取数仪器） |
 
 ---
 
