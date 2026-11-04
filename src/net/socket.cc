@@ -36,6 +36,14 @@ bool to_sockaddr(std::string_view ipv4_addr, std::uint16_t port, sockaddr_in* ou
 
 }  // namespace
 
+// ADR-28：谓词不另起一份解析——它调的就是上面 `to_sockaddr`，也就是 `make_listen_socket`
+// 与 `start_connect` 真正走的那一次 `inet_pton`。端口给 0 只因为这里不关心它。
+bool is_ipv4_literal(std::string_view ipv4_addr) noexcept {
+  sockaddr_in probe{};
+  int error = 0;
+  return to_sockaddr(ipv4_addr, 0, &probe, &error);
+}
+
 bool set_nonblocking(int fd, int* error) noexcept {
   int flags = ::fcntl(fd, F_GETFL, 0);
   if (flags < 0) {

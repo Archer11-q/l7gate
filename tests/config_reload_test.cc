@@ -380,6 +380,28 @@ TEST(S5_02_Reloader, RateLimitParametersAreOutOfScopeAndRefusedByName) {
   EXPECT_EQ(fx.publisher().publishes(), 1u);
 }
 
+// ADR-28（S5-09）：重载路径上的同一个校验器。地址写成服务名 → 那一轮拒载、`config_publishes`
+// 一动不动、旧世代仍在服务；话里点到实际读到的值。S5-05 的退化 C1 记的是这件事的**后果**
+// （整份 `/metrics` 抓失败），这一条钉的是它的前因（那种配置根本进不来）。
+TEST(S5_09_Reloader, HostnameAddressIsRefusedByNameAndKeepsTheOldGeneration) {
+  ReloadFixture fx("byname", v1_text());
+  ASSERT_FIXTURE(fx);
+  const auto before = fx.current();
+
+  fx.write_and_tick(mutated(R"("address": "127.0.0.1")", R"("address": "upstream-a")"));
+  EXPECT_EQ(fx.publisher().rejects_scope(), 1u);
+  EXPECT_EQ(fx.publisher().publishes(), 0u) << "地址非法却换发了世代——那是半套";
+  EXPECT_EQ(fx.publisher().generation(), 1u);
+  EXPECT_EQ(fx.current(), before) << "拒载之后发布点上的世代指针动了";
+  EXPECT_NE(fx.last_reject_reason().find("不是 IPv4 字面量"), std::string::npos)
+      << "拒绝了，但话里没点到那条理由：" << fx.last_reject_reason();
+  EXPECT_NE(fx.last_reject_reason().find("upstream-a"), std::string::npos)
+      << "话里没点到实际读到的值：" << fx.last_reject_reason();
+
+  fx.write_and_tick(v2_text());  // 下界：合法配置照样发得出去
+  EXPECT_EQ(fx.publisher().publishes(), 1u);
+}
+
 TEST(S5_02_Reloader, RateLimitKeyChangeIsRefusedByName) {
   ReloadFixture fx("ratekey", v1_text());
   ASSERT_FIXTURE(fx);

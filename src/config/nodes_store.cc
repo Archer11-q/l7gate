@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 
 #include <mysql/mysql.h>
+
+#include "net/socket.h"  // ADR-28：is_ipv4_literal 与连接支共用同一次 inet_pton
 
 namespace l7gate::config {
 namespace {
@@ -20,6 +24,39 @@ bool valid_health_path(const std::string& path) noexcept {
 }
 
 }  // namespace
+
+// ADR-28：从 fetch 的循环里抽出来的行校验。检查的**内容与顺序**、错误话的字面都照原样搬，
+// 搬出来的唯一目的是让节点表那一支也有 ctest 可钉（`fetch` 需要真连接）。
+bool validate_node_row(std::string_view group, std::string_view address,
+                       std::string_view port_text, std::string_view health_path,
+                       std::uint16_t* port, std::string* error) {
+  if (address.empty()) {
+    *error = "节点表组 " + std::string(group) + " 的某行 address 为空";
+    return false;
+  }
+  if (!net::is_ipv4_literal(address)) {
+    *error = "节点表组 " + std::string(group) + " 的行 address=\"" + std::string(address) +
+             "\" 不是 IPv4 字面量（网关按 inet_pton 解析，主机名不会生效）";
+    return false;
+  }
+  const std::string port_copy(port_text);
+  const long parsed = port_copy.empty()
+                          ? 0
+                          : std::strtol(port_copy.c_str(), nullptr, 10);
+  if (parsed <= 0 || parsed > 65535) {
+    *error = "节点表组 " + std::string(group) + " 的行 " + std::string(address) + ":" +
+             std::string(port_text) + " 的 port 要落在 1..65535";
+    return false;
+  }
+  *port = static_cast<std::uint16_t>(parsed);
+  if (!valid_health_path(std::string(health_path))) {
+    *error = "节点表组 " + std::string(group) + " 的行 " + std::string(address) + ":" +
+             std::string(port_text) + " 的 health_path 必须以 / 开头且非空，读到的是 \"" +
+             std::string(health_path) + "\"";
+    return false;
+  }
+  return true;
+}
 
 bool NodesStore::fetch(const std::vector<std::string>& mysql_groups,
                        route::NodesFetch* out, std::string* error) const {
@@ -79,23 +116,10 @@ bool NodesStore::fetch(const std::vector<std::string>& mysql_groups,
       mysql_close(m);
       return false;
     }
-    if (address.empty()) {
-      *error = "节点表组 " + group + " 的某行 address 为空";
-      mysql_free_result(res);
-      mysql_close(m);
-      return false;
-    }
-    const long port = std::strtol(port_text.c_str(), nullptr, 10);
-    if (port <= 0 || port > 65535) {
-      *error = "节点表组 " + group + " 的行 " + address + ":" + port_text +
-               " 的 port 要落在 1..65535";
-      mysql_free_result(res);
-      mysql_close(m);
-      return false;
-    }
-    if (!valid_health_path(health_path)) {
-      *error = "节点表组 " + group + " 的行 " + address + ":" + port_text +
-               " 的 health_path 必须以 / 开头且非空，读到的是 \"" + health_path + "\"";
+    // ADR-28：三条值域检查抽到 `validate_node_row` 里，好让节点表那一支也能被 ctest 钉住。
+    // 检查的内容、顺序与错误话都没改。
+    std::uint16_t port_value = 0;
+    if (!validate_node_row(group, address, port_text, health_path, &port_value, error)) {
       mysql_free_result(res);
       mysql_close(m);
       return false;
@@ -109,7 +133,7 @@ bool NodesStore::fetch(const std::vector<std::string>& mysql_groups,
       out->groups.push_back(route::NodesFetch::GroupMembers{group, {}});
       return &out->groups.back().members;
     }();
-    const route::NodeTarget candidate{address, static_cast<std::uint16_t>(port), health_path};
+    const route::NodeTarget candidate{address, port_value, health_path};
     if (std::any_of(members->begin(), members->end(),
                     [&](const route::NodeTarget& t) {
                       return t.address == candidate.address && t.port == candidate.port;

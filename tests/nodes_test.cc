@@ -186,3 +186,29 @@ TEST(S3_04_Nodes, StoreFetchFailureNamesTheCause) {
   EXPECT_FALSE(store.fetch({"dynamic"}, &fetch, &error));
   EXPECT_NE(error.find("连接失败"), std::string::npos) << error;
 }
+
+// ADR-28（S5-09）：节点表那一行的值域校验。它**不依赖 Docker**——`validate_node_row` 就是
+// `NodesStore::fetch` 循环里那三段抽出来的，抽它的唯一理由是让"服务名混进节点表"这件事
+// 也能被 ctest 钉住（`fetch` 要真连接，而那三条检查与 MySQL 无关）。
+// 抽出前后行为逐字相同：同样的错误话（带组名与实际读到的值）、同样"任何一行不合格就整批失败"。
+TEST(S5_09_NodesRow, AddressMustBeAnIpv4Literal) {
+  std::uint16_t port = 0;
+  std::string error;
+
+  EXPECT_TRUE(l7gate::config::validate_node_row("api", "172.31.250.21", "18081", "/", &port, &error))
+      << error;
+  EXPECT_EQ(port, 18081);
+
+  EXPECT_FALSE(l7gate::config::validate_node_row("api", "upstream-a", "18081", "/", &port, &error));
+  EXPECT_NE(error.find("不是 IPv4 字面量"), std::string::npos) << error;
+  EXPECT_NE(error.find("upstream-a"), std::string::npos) << "话里没点到实际读到的值：" << error;
+  EXPECT_NE(error.find("节点表组 api"), std::string::npos) << "话里没点到是哪一组：" << error;
+
+  // 抽出没改变另外三条检查的行为（每条都断关键词，不断整句话，免得文案一挪用例就假红）。
+  EXPECT_FALSE(l7gate::config::validate_node_row("api", "", "18081", "/", &port, &error));
+  EXPECT_NE(error.find("address 为空"), std::string::npos) << error;
+  EXPECT_FALSE(l7gate::config::validate_node_row("api", "127.0.0.1", "70000", "/", &port, &error));
+  EXPECT_NE(error.find("port 要落在 1..65535"), std::string::npos) << error;
+  EXPECT_FALSE(l7gate::config::validate_node_row("api", "127.0.0.1", "18081", "probe", &port, &error));
+  EXPECT_NE(error.find("health_path 必须以 / 开头"), std::string::npos) << error;
+}

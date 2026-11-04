@@ -5,7 +5,7 @@
 它不是"又一个高性能 Web 服务器"，不是框架，也不是功能清单。对外形态是一个能顶替 Nginx 位置的网关。
 
 [![C++20 · 无第三方网络库](https://img.shields.io/badge/C%2B%2B20-no%20third--party%20net%20lib-blue)](docs/adr/ADR-04-no-third-party-network-lib.md)
-[![单测 376/376 · 三 preset](https://img.shields.io/badge/unit%20tests-376%2F376%20%C3%97%203%20presets-brightgreen)](docs/ROADMAP.md)
+[![单测 383/383 · 三 preset](https://img.shields.io/badge/unit%20tests-383%2F383%20%C3%97%203%20presets-brightgreen)](docs/ROADMAP.md)
 [![TSan 0 data race](https://img.shields.io/badge/ThreadSanitizer-0%20races-green)](docs/FAULT-INJECTION.md)
 [![SLO #2 达标](https://img.shields.io/badge/SLO%20%232%20100k%20%E5%86%85%E5%AD%98-17.47%20KiB%2F%E5%AF%B9%20%E2%9C%85-green)](docs/BENCHMARK.md)
 [![SLO #1 未达标，照记](https://img.shields.io/badge/SLO%20%231%20p99-4.2%E2%80%936.3%20ms%20%E2%9D%8C-red)](docs/SLO.md)
@@ -78,7 +78,7 @@
 | **三个数字终稿 + vs Nginx 差值归因**（终判档＝两侧都进容器、同一种 `-p` 发布） | S5-07 | [B-021](docs/BENCHMARK.md) / [B-022](docs/BENCHMARK.md) 与上面「三个数字」那四行；脚本 `scripts/bench/s5-07-qps-symmetric.sh`、`s5-07-flamegraph.sh`。**归因两边不对称这件事明写**：网关侧有用户态 self 榜，nginx 侧同法火焰图在这台机器上取不到（三条实测在 [ENVIRONMENT 4.2](docs/ENVIRONMENT.md)），"nginx 慢在哪一层"那句今天没有证据 |
 | **S5 门禁收尾**（四件套与另加三样逐项指路、§25.3 欠的两条阳性验证补打、三笔待决逐笔给状态） | S5-08 | [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节 + [FAULT-INJECTION §26](docs/FAULT-INJECTION.md)：D4 谎报注入红 **3** 条、D5 清场失灵红 **3** 条，还原后与备份 `cmp` 逐字节相同、复跑 `PASS checks=22 fails=0` |
 
-**这一阶段没有"还没落地"那一行了**——S5-01…S5-08 八条全 DONE（2026-11-04 关门，门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节）。剩下的都不是功能缺口，而是**排期与裁决**，原样列在 [TASKS.md](TASKS.md)「已知待决事项」与 ROADMAP 的 S5 债表里：nginx 基线镜像加 perf 层（禁令三／契约 9.1，归项目所有人）、`l7gate_c100k` 观察者多线程（`tools/` 的测量手段 + 一条 ADR，按 ADR-17 先例）、带连字符的 `address` 会造出 Prometheus 非法指标名那条**没修**的暴露面缺陷，另有七格"写在纸上没测"的账与三条候补。**没有一笔被读成已闭合。**
+**这一阶段八条全 DONE（2026-11-04 关门，门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节）；关门之后追加一条 S5-09**——它结掉的正是 S5-05 抓到、后面三条任务都不许顺手改的那条缺陷：配置里的 `address` 现在**只收 IPv4 字面量**，不是就整份拒载 + 点名（[ADR-28](docs/adr/ADR-28-ipv4-literal-validation-at-config-parse.md)，修法由项目所有人 2026-11-04 选定；状态与门禁读数见 TASKS 的 S5-09 行）。剩下的都不是功能缺口，而是**排期与裁决**，原样列在 [TASKS.md](TASKS.md)「已知待决事项」与 ROADMAP 的 S5 债表里：nginx 基线镜像加 perf 层（禁令三／契约 9.1，归项目所有人；可行性已探完——Debian 12 里 `apt install linux-perf` 装得上、由 perf 直接拉起 nginx 出得来 3K 样本与 62 条 `ngx_` 符号）、`l7gate_c100k` 观察者多线程（`tools/` 的测量手段 + 一条 ADR，按 ADR-17 先例；按建议**暂不立项**），另有七格"写在纸上没测"的账与三条候补。**没有一笔被读成已闭合。**
 
 ---
 
@@ -88,7 +88,7 @@
 
 ```bash
 cmake --preset debug && cmake --build --preset debug
-ctest --preset debug              # 376/376（asan-ubsan / tsan 里各有 2 条 Skipped：
+ctest --preset debug              # 383/383（asan-ubsan / tsan 里各有 2 条 Skipped：
                                   #   sanitizer 换分配器后 mallinfo2() 一律报 0 → 跳过＝不判、不是通过）
 ./build/debug/l7gate --self-check # version / compiler / gtest / sanitizers / build_type / malloc
 ```
@@ -298,7 +298,7 @@ docker ps -a --filter name=l7gate-          # 停栈后这一条必须是空的
 四件写在文件里的事实，不是假设（[ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)）：
 
 - **`--ws-echo` 那台上游不进这个栈**。S5-04 已经写明它是**仪器与假上游**，别把演示页的握手对端当生产后端；这一栈里的两台上游走默认档。
-- **被网关引用的地址全是静态 IPv4**（`172.31.250.0/24` 由编排自己声明）。容器之间按服务名解析这一格本轮实测**通**（第一次尝试就 200），**但网关不做名字解析**——它的地址走 `inet_pton(AF_INET)`，实测把配置里的 `address` 写成 `localhost` 就是 `502` + `upstream_connect_failed`。冒烟把"服务名那一版"真跑了一次，它必须红（阶段 4）。反过来 Prometheus 与 Grafana 自己做名字解析，所以**入库那两份抓取配置的 target 值（`host.docker.internal:18522/18090/19090`）一个字母没动**——实测容器经 `host.docker.internal` 打得通别的容器发布出来的端口，因此不必改；那两份**顶上关于 `extra_hosts` 的说法按本轮实测更正过**（"不带上就变假目标"这句说重了，见 [ADR-27 第三节](docs/adr/ADR-27-compose-one-command-stack.md)），改的是注释、不是值。
+- **被网关引用的地址全是静态 IPv4**（`172.31.250.0/24` 由编排自己声明）。容器之间按服务名解析这一格本轮实测**通**（第一次尝试就 200），**但网关不做名字解析**——它的地址走 `inet_pton(AF_INET)`，实测把配置里的 `address` 写成 `localhost` 就是 `502` + `upstream_connect_failed`。冒烟把"服务名那一版"真跑了一次，它必须红（阶段 4）。**S5-09 之后这一臂的形状变了**：那种配置现在**在装配期就被拒**（`rc=2` + 话里点名到实际读到的值 + 观测端口根本不开放），阶段 4 的判据跟着改成"上界被拒载 + 下界那一台合法 IPv4 照常 200"——S5-05 当时量到的 502 没被推翻，那是修前的二进制（见 [ADR-28](docs/adr/ADR-28-ipv4-literal-validation-at-config-parse.md) 与 FAULT-INJECTION §27.4）。反过来 Prometheus 与 Grafana 自己做名字解析，所以**入库那两份抓取配置的 target 值（`host.docker.internal:18522/18090/19090`）一个字母没动**——实测容器经 `host.docker.internal` 打得通别的容器发布出来的端口，因此不必改；那两份**顶上关于 `extra_hosts` 的说法按本轮实测更正过**（"不带上就变假目标"这句说重了，见 [ADR-27 第三节](docs/adr/ADR-27-compose-one-command-stack.md)），改的是注释、不是值。
 - **没有 `network_mode: host`，`image` 里没有 `latest`**（前者在这台机器上不成立，后者是契约 9.1）。四个基础设施镜像走锁定 tag；我们自己产物那台是 `l7gate/runtime:s5-05`——一个**壳镜像**（`ubuntu:26.04` + 契约已经点名的 `libmysqlclient24` / `libhiredis1.1.0`），里面没有任何本项目产物。
 - **Redis 按 B-017 只绑 Redis**（`cpuset: "15"` 只出现在 redis 那一段，网关不绑）。契约要的是"Redis 不许抢走网关正在用的核"，不是"各占一半机器"；网关仍可被调度到 15 号核，那条竞争没被消除，只是不再扩散。前提 `docker info` 的 `NCPU=16` 由冒烟阶段 0 先断住。
 
@@ -346,6 +346,8 @@ docker ps -a --filter name=l7gate-          # 停栈后这一条必须是空的
 - **生效延迟报的是毫秒**：133–205 ms（节拍 200 ms，粒度由节拍决定），**没有一处写成"秒级"**。
 
 **命令行与配置文件各管什么**：监听地址、`--workers`、Redis 参数、`--config-reload-ms` 这些**部署事实**留在命令行、不进配置文件，也不参与重载；路由/后端表/健康与熔断参数才是配置文件的东西。两个来源同时给＝拒绝。
+
+**`address` 只收 IPv4 字面量**（S5-09，[ADR-28](docs/adr/ADR-28-ipv4-literal-validation-at-config-parse.md)）：文件里的 `targets[].address` 与 MySQL 节点表的 `address` 列都不是就**整份拒载 / 整批不生效**，话里点到"哪一组哪一行 + 实际读到的值"。这不是新加的限制——消费那个值的一直是 `inet_pton(AF_INET)`，主机名**本来就连不上**；挡在前面是因为它还会把地址原样拼进 `health_t<i>_<addr>_<port>_<metric>`，连字符在 Prometheus 名字法里非法，后果是**整份 `/metrics` 抓失败**（S5-05 的 C1 实测）。`--upstream` 命令行那一支没改语义：它与 `--config` 互斥、也产不出那些键，给主机名仍是运行期 502。
 
 **限流**：桶键数上界 16384，溢出键共用一只桶并计数；Redis 那一路的余额上报有一个结算周期的滞后（上界 = 该键一周期内的放行数），这条代价写在 B-017 第四节。
 
@@ -415,12 +417,12 @@ scripts/fault/s5-06-netem.sh              # 网络层六臂（非特权 user+net
 | **S2** | 多 Reactor + 连接池 + 跨线程销毁 | ✅ 八条全 DONE，已 push `47bca67..dcccca5` | **TSan 零 data race**；#2 达标、#1 未达标但第一次测到多 Reactor 有效（33 ms → 4–6 ms 带）、100k 负载下排水 **0.947 s** |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 安全阀 | ✅ 六条全 DONE，已 push `e54ae61..17b9234` | 摘除 **202 ms**、误摘 **0/3480**、安全阀 10 台全死停在 **1/10**、五类故障矩阵全过 |
 | **S4** | 限流 + 熔断 + 超时与重试防放大 | ✅ 九条全 DONE，已 push `17b9234..0f54343` | 429 生效、熔断恢复时间线、Redis 三段降级、重试放大 **1.50 / 2.00** 实测、配对账两处退化 |
-| **S5** | 热重载 + 指标 + 面板六格 + 调试页 + `docker compose` 一键栈 + `tc netem` 现场 + 三个数字终判 | ✅ **八条全 DONE（S5-01…S5-08，2026-11-04 关门）**；`push` 按契约 8.3 先问 | 三 preset 各 **376/376**、非 gtest 警告各 **0 条**、`tsan` 直跑日志 `ThreadSanitizer` **0 次**（374 PASSED + 2 SKIPPED）、**十四条冒烟**逐条 rc=0 且 ✗ 计数 **0**（第 12/13/14 条读 `verdict.txt`：40 / 29 / 66 项 `fails=0`）；三个数字 **#1 未达标照记 / #1 的 p999 取不到 / #2 达标 / #3 达标**；netem 六臂与安全阀"挡摘除"那一格在 §25 |
+| **S5** | 热重载 + 指标 + 面板六格 + 调试页 + `docker compose` 一键栈 + `tc netem` 现场 + 三个数字终判 | ✅ **八条全 DONE（S5-01…S5-08，2026-11-04 关门，S5 门禁的 push 已执行 `0f54343..c324a9c`）**；关门后追加的一条 **S5-09 也已 DONE**（`address` 只收 IPv4 字面量，ADR-28）；这一笔的 push **先问** | 三 preset 各 **383/383**（S5-09 之前 376/376）、非 gtest 警告各 **0 条**、`tsan` 直跑日志 `ThreadSanitizer` **0 次**（381 PASSED + 2 SKIPPED）、**十四条冒烟**逐条 rc=0 且 ✗ 计数 **0**（第 12/13/14 条读 `verdict.txt`：40 / 29 / 69 项 `fails=0`）；三个数字 **#1 未达标照记 / #1 的 p999 取不到 / #2 达标 / #3 达标**；netem 六臂与安全阀"挡摘除"那一格在 §25 |
 
 **逐条验收的读数不在这里。** 每条任务的可断言验收句与实测数字在 [TASKS.md](TASKS.md) 表格末列；压测与成本对照在 [docs/BENCHMARK.md](docs/BENCHMARK.md)（B-001…B-022，含未达标记录与**口径变更节**）；故障注入的预期 vs 实测在 [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md)（§1–§25，S5 的矩阵收口索引在 [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节）；阶段门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)。**同一份证据抄第二份，迟早会变成两份互相分叉的**——所以这一节只留结论与指针。
 
 <details>
-<summary><b>文档地图与 27 条 ADR</b>（点开）</summary>
+<summary><b>文档地图与 28 条 ADR</b>（点开）</summary>
 
 | 文档 | 内容 |
 |---|---|
@@ -428,13 +430,13 @@ scripts/fault/s5-06-netem.sh              # 网络层六臂（非特权 user+net
 | [TASKS.md](TASKS.md) | 唯一真相源：任务 ID / 可断言验收标准 / 状态 / 实测数字 / 已裁清单 |
 | [docs/SLO.md](docs/SLO.md) | 三个数字的目标与**写死的**测量条件、脚本索引 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 环境自检实测版本、唯一实质偏离（libmysqlclient）、sanitizer 阳性验证、perf 能否采样、Docker 与抓取通路、无头浏览器仪器 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **已实现的现状**（严格区分"已实现"与"已定但未实现"）：模块 1.1…1.38 + 第 5 节踩坑索引（格式固定「现象 / 根因 / 防复发的断言」，写不出第三条的明写"缺"） |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **已实现的现状**（严格区分"已实现"与"已定但未实现"）：模块 1.1…1.39 + 第 5 节踩坑索引（格式固定「现象 / 根因 / 防复发的断言」，写不出第三条的明写"缺"） |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测方法 + vs Nginx 流程 + 实测（含未达标照记与口径变更节） |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障矩阵预期 vs 实测 + 每轮阳性验证与仪器自错照记 |
 | [docs/INTERVIEW.md](docs/INTERVIEW.md) | 60 秒故事，以及"没有它会怎样"的实测版 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**、一键复现、遗留账目 |
 
-**每条 ADR 都写清"我放弃什么"**：01 HTTP/1.1 · 02 epoll ET + io_uring 挂起 · 03 多线程 Reactor · 04 网络层自研 · 05 Redis 只做分布式计数与降级 · 06 MySQL 配置与审计 · 07 不引 etcd/xDS/K8s · 08 不做响应缓存 · 09 WebSocket 只透传 · 10 热重载不是热重启 · 11 filter 链 · 12 摘除比例安全阀 · 13 应用层故障注入为主 · 14 连接所有权 · 15 per-worker 池 · 16 请求-响应配对 · 17 C100K 与 HDR 测量手段 · 18 路由 filter · 19 负载均衡与配置文件 · 20 MySQL 节点表 · 21 超时与限流 · 22 自产错误响应 · 23 connect 失败重试 · 24 指标暴露面 · 25 旁路 percentile exporter · 26 演示页的握手对端与取数仪器 · 27 compose 编排与运行时壳镜像
+**每条 ADR 都写清"我放弃什么"**：01 HTTP/1.1 · 02 epoll ET + io_uring 挂起 · 03 多线程 Reactor · 04 网络层自研 · 05 Redis 只做分布式计数与降级 · 06 MySQL 配置与审计 · 07 不引 etcd/xDS/K8s · 08 不做响应缓存 · 09 WebSocket 只透传 · 10 热重载不是热重启 · 11 filter 链 · 12 摘除比例安全阀 · 13 应用层故障注入为主 · 14 连接所有权 · 15 per-worker 池 · 16 请求-响应配对 · 17 C100K 与 HDR 测量手段 · 18 路由 filter · 19 负载均衡与配置文件 · 20 MySQL 节点表 · 21 超时与限流 · 22 自产错误响应 · 23 connect 失败重试 · 24 指标暴露面 · 25 旁路 percentile exporter · 26 演示页的握手对端与取数仪器 · 27 compose 编排与运行时壳镜像 · 28 地址校验前移到配置层
 
 </details>
 

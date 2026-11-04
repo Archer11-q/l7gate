@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "config/json.h"
+#include "net/socket.h"  // ADR-28：`is_ipv4_literal` 与连接支共用同一次 inet_pton
 
 namespace l7gate::config {
 namespace {
@@ -151,6 +152,15 @@ bool build_gateway_config(const JsonValue& document, GatewayConfig* out, std::st
       if (!need(member, "port", JsonValue::Kind::kInt, &port, error, mwhere)) return false;
       if (address->text.empty()) {
         *error = mwhere + " 的 address 是空串";
+        return false;
+      }
+      // ADR-28：地址只收 IPv4 字面量。理由不是"想加一条限制"，而是网关本来就只认字面量
+      // （消费它的是 `start_connect` 里那一次 `inet_pton`）；不挡在前面，这个值会一路走进
+      // 逐目标健康键 `health_t<i>_<address>_<port>_<metric>`，连字符在 Prometheus 名字法里非法，
+      // 后果是**整份 `/metrics` 抓失败**（S5-05 的退化 C1 实测，FAULT-INJECTION §24.1）。
+      if (!net::is_ipv4_literal(address->text)) {
+        *error = mwhere + " 的 address=\"" + address->text +
+                 "\" 不是 IPv4 字面量（网关按 inet_pton 解析，主机名不会生效）";
         return false;
       }
       if (port->number <= 0 || port->number > 65535) {

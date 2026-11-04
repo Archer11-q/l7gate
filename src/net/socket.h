@@ -65,8 +65,14 @@ SocketResult make_listen_socket(std::string_view ipv4_addr, std::uint16_t port, 
 
 AcceptOutcome accept_connection(int listen_fd) noexcept;
 
-// 非阻塞 connect。IPv4 字面量（inet_pton，不做 DNS——DNS 是 S3 路由层的事，
-// 而且它会在事件循环线程里阻塞）。
+// 非阻塞 connect。IPv4 字面量（inet_pton，不做 DNS——`src/net/reactor.cc` 的连接支在事件循环
+// 线程上，任何解析都可能把它钉住；ADR-27 因此把编排里被网关引用的地址全钉成静态 IPv4）。
 ConnectOutcome start_connect(std::string_view ipv4_addr, std::uint16_t port) noexcept;
+
+// 这个地址是不是**上面那两个入口真的能用的形状**（ADR-28）。配置校验层用它把"网关只认字面量"
+// 这件既有事实前移到装配期，而不是等到运行期变成 502 + 一条非法指标名。
+// 它**不在别处再写一份**：谓词就是把地址交给 `to_sockaddr`——也就是消费它的那同一次 `inet_pton`。
+// 两份"合法"的定义迟早会分叉，分叉之后一定由读配置的人付账。
+bool is_ipv4_literal(std::string_view ipv4_addr) noexcept;
 
 }  // namespace l7gate::net

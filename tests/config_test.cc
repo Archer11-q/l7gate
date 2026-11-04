@@ -19,6 +19,8 @@
 
 #include "config/gateway_config.h"
 #include "config/json.h"
+#include "metrics/metrics_render.h"  // S5-09：sanitize_metric_name——键名合法性这件事的裁判
+#include "net/socket.h"              // S5-09（ADR-28）：is_ipv4_literal 与 bind 那一侧的对照
 
 #ifndef L7GATE_SOURCE_DIR
 #define L7GATE_SOURCE_DIR "."
@@ -727,3 +729,123 @@ TEST(S4_03_ConfigRateLimit, RejectsBadSectionsAndParameters) {
   expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"header:"})"), "key");
   expect_rejected(with_rate_limit(R"({"rate":10,"burst":1,"key":"header:a b"})"), "key");
 }
+
+// ===========================================================================
+// S5-09（ADR-28）：`address` 只收 IPv4 字面量。
+//
+// 这条检查存在的原因不是"想限制配置"，而是那个值会被**原样拼进指标名**
+// （`health_t<i>_<address>_<port>_<metric>`），连字符在 Prometheus 名字法
+// `[a-zA-Z_:][a-zA-Z0-9_:]*` 里非法，后果是整份 `/metrics` 抓失败——
+// S5-05 的退化 C1 实测（FAULT-INJECTION §24.1）：那台网关 101 个键一起丢。
+// ===========================================================================
+
+namespace {
+
+// Prometheus 的名字法，手写检查（不引 <regex>：这里只判字符集合，正则反而把简单事弄复杂）。
+bool is_legal_metric_name(std::string_view name) {
+  if (name.empty()) return false;
+  const auto lead_ok = [](char c) {
+    return c == ':' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+  };
+  const auto tail_ok = [&lead_ok](char c) {
+    return lead_ok(c) || (c >= '0' && c <= '9');
+  };
+  if (!lead_ok(name[0])) return false;
+  for (char c : name.substr(1)) {
+    if (!tail_ok(c)) return false;
+  }
+  return true;
+}
+
+// 一份只有一个 target 的最小配置，地址是唯一变量。
+// 参数收的是**带引号的 JSON 值令牌**（拒绝用例要能把原样输入写出来，包括那对引号）。
+std::string one_target(std::string_view address_token) {
+  return groups_only(R"({"name":"api","balance":"round_robin","targets":[{"address":)" +
+                     std::string(address_token) + R"(,"port":18081}]})");
+}
+
+// 给裸地址套上 JSON 的那对引号（上面那个 one_target 收的是**带引号**的形状，
+// 因为拒绝用例要直接把原样输入写出来；这里手头是 std::string，别在两处各写一遍转义）。
+std::string quote(std::string_view bare) { return std::string("\"") + std::string(bare) + "\""; }
+
+}  // namespace
+
+// 上界：非字面量一律拒，而且话里要点到**实际读到的值**（不是"整个文件读不懂"）。
+TEST(S5_09_AddressLiteral, RejectsAnythingTheSocketLayerCannotParse) {
+  for (const char* bad : {R"("localhost")", R"("upstream-a")", R"("127.0.0.1:8081")",
+                          R"("::1")", R"("999.1.1.1")", R"("1.2.3")", R"("172.31.250.21 ")",
+                          R"("1.2.3.4.5")"}) {
+    // needle 用的是消息里的固定那半句；值本身在另一半。
+    expect_rejected(one_target(bad), "不是 IPv4 字面量");
+  }
+}
+
+// 下界：合法字面量必须照过——否则"恒拒载"这种退化会一路绿到线上。
+TEST(S5_09_AddressLiteral, AcceptsEveryLiteralShape) {
+  for (const char* good : {R"("127.0.0.1")", R"("0.0.0.0")", R"("172.31.250.21")",
+                            R"("255.255.255.255")"}) {
+    GatewayConfig config;
+    std::string error;
+    EXPECT_TRUE(build_from(one_target(good), &config, &error))
+        << "这条该被接受，却被拒了：" << good << " → " << error;
+  }
+}
+
+// 混合：一个合法一个非法 → **整份**拒，而且点名的必须是那一条非法的下标（不许半套）。
+TEST(S5_09_AddressLiteral, RejectsWholeDocumentWhenAnyTargetIsBad) {
+  expect_rejected(groups_only(R"({"name":"api","balance":"round_robin","targets":[)"
+                              R"({"address":"127.0.0.1","port":18081},)"
+                              R"({"address":"upstream-b","port":18082}]})"),
+                  "targets[1]");
+  // 反过来排（非法在前）也要红在同一件事上，而不是先撞别的检查。
+  expect_rejected(groups_only(R"({"name":"api","balance":"round_robin","targets":[)"
+                              R"({"address":"upstream-b","port":18081},)"
+                              R"({"address":"127.0.0.1","port":18082}]})"),
+                  "targets[0]");
+}
+
+// 谓词与消费者不许分叉：这里拿**监听那一侧**当对照（bind 端口 0，不碰网络），
+// 断的是"校验说合法的集合"与"socket 层真能用的集合"在这一批样本上一致。
+// bind 用得了的地址只有本机真有的那两个——`127.0.0.1` 与 `0.0.0.0`；
+// `172.31.250.21` 是编排子网里的地址，宿主上没有，把它放进这一臂会红在 bind 上，
+// 而红的仍是我的取数方式，不是被测方（上一发就是这么写的，照记）。
+TEST(S5_09_AddressLiteral, PredicateAgreesWithTheSocketLayerItGuards) {
+  for (const char* good : {"127.0.0.1", "0.0.0.0"}) {
+    EXPECT_TRUE(l7gate::net::is_ipv4_literal(good)) << good;
+    auto socket = l7gate::net::make_listen_socket(good, 0, 4);
+    EXPECT_TRUE(socket.ok()) << good << " 字面量过不了 bind，谓词就是在说谎";
+  }
+  // 谓词说合法、而 bind 用不了的那一类（本机没这个地址）不在这一臂里——它不是"不合法"。
+  EXPECT_TRUE(l7gate::net::is_ipv4_literal("172.31.250.21"));
+  for (const char* bad : {"localhost", "upstream-a", "127.0.0.1:8081", "::1", "999.1.1.1"}) {
+    EXPECT_FALSE(l7gate::net::is_ipv4_literal(bad)) << bad;
+  }
+}
+
+// C1 那件事的正身：**校验放过的地址，拼出来的键名必须合法**；而每一个被它拒掉的
+// "sanitize 管不到的字符"型地址，若真放过去，键名就会非法。两组同时成立才说明
+// **挡住它的是这道校验，不是渲染层那点运气**——摘掉 gateway_config.cc 那条检查，组 B 第一条就红。
+TEST(S5_09_AddressLiteral, WhateverPassesTheValidatorYieldsLegalPrometheusNames) {
+  for (const std::string address : {"127.0.0.1", "0.0.0.0", "172.31.250.21", "255.255.255.255"}) {
+    GatewayConfig config;
+    std::string error;
+    ASSERT_TRUE(build_from(one_target(quote(address)), &config, &error)) << error;
+    const std::string key =
+        "health_t0_" + l7gate::metrics::sanitize_metric_name(address + "_18081") + "_ejections";
+    EXPECT_TRUE(is_legal_metric_name(key)) << "校验放过了它，键名却是非法的：" << key;
+  }
+  // 组 B 只收**机械变换管不到的**字符：`.` 与 `:` 是 ADR-24 第五节已经换掉的两类，
+  // 把它们写进来会得到一条假红（我上一发拿 `localhost` 断这件事就是假红——它字母组成，
+  // 拼出来的键名本来就合法，这条用例当时断错了对象）。
+  for (const std::string address : {"upstream-a", "my host", "a%b"}) {
+    GatewayConfig config;
+    std::string error;
+    ASSERT_FALSE(build_from(one_target(quote(address)), &config, &error))
+        << "这个地址本该被拒（放过去会让整份 /metrics 非法）：" << address;
+    const std::string key =
+        "health_t0_" + l7gate::metrics::sanitize_metric_name(address + "_18081") + "_ejections";
+    EXPECT_FALSE(is_legal_metric_name(key))
+        << "它键名居然是合法的——那这一组样本选错了，挡住它的不是校验：" << key;
+  }
+}
+

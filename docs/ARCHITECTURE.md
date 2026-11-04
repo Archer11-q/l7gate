@@ -1604,8 +1604,44 @@ ADR-24 那套键名机械变换只处理了 `.` 与 `:`，而 `health_t<i>_<addr
 （网关整台变 down，101 个键一起丢）。配置校验只挡空串、不挡字符集，所以这条路是能走到的。
 它属 S5-01 那套暴露面的稳健性，不在 S5-05 的定义域里，也不许顺手改 `src/`——登记成一条待裁（见 TASKS「已知待决事项」）。
 
-五条退化 C1–C5 的名单与红数、本轮仪器侧我自己的五处错（两处是**同一个坑第二轮**：grep 匹配到注释里的字面串）在
+五条退化 C1–C5 的名单与红数、本轮仪器侧我自己的六处错（两处是**同一个坑第二轮**：grep 匹配到注释里的字面串）在
 FAULT-INJECTION **§24**；通路读数在 ENVIRONMENT **5.3**。
+
+**上面那段"不在本任务修"的缺陷已于 2026-11-04 由 S5-09 结案**（修法①，见 1.39）——
+`health_t<i>_<addr>_<port>_<metric>` 那一族的非法输入现在**进不到**渲染层。
+
+### 1.39 地址只收 IPv4 字面量（S5-09，ADR-28）：把一条运行期静默失败前移到装配期拒载
+
+**它管什么**：`upstreams[].targets[].address`（文件）与 MySQL 节点表的 `address` 列，必须是
+**IPv4 字面量**；不是就整份拒载 + 话里点名到"第几组第几个 target / 哪一行"与实际读到的值。
+文件那一支走既有那一类计数（`config_rejects_scope`，stderr 前缀"配置重载被拒（字段）"），
+节点表那一支仍是"整批拒载、保留上一份"（`nodes_reloads_failed`）。**一个键都不新增、一处键名口径都不动**：
+`sanitize_metric_name` 只换 `.` 与 `:` 这件事原样，ADR-24 第五节的形状没被改过。
+
+**为什么这不是一条新限制**：消费这个值的一直是 `inet_pton(AF_INET)`（`net/socket.cc` 的 `to_sockaddr`，
+`socket.h` 那两个入口的参数名本来就叫 `ipv4_addr`）。S5-05 实测过它的后果：同一份配置只把 `address`
+从 `127.0.0.1` 换成 `localhost`，就是 `HTTP 502` + `upstream_connect_failed=1` + `responses_completed=0`
+——**那个成员本来就连不上**，它只是顺手把整份 `/metrics` 也拖死了（非法指标名 → 101 个键一起丢，§24.1 的 C1）。
+本节的动作是把"我只认字面量"从**运行期静默失败**挪到**装配期拒载**，不是新增任何"能配什么"。
+
+**形状三件**：① 谓词 `net::is_ipv4_literal()` **不另写一份解析**，它就是把地址交给 `to_sockaddr`——
+两份"合法"迟早分叉，分叉之后由读配置的人付账；② 两个调用点都在既有"空串检查"之后
+（`config/gateway_config.cc`、`config/nodes_store.cc`）；③ 节点表那三段值域检查被抽成
+`validate_node_row()`，**行为与文案逐字不变**，抽它的唯一理由是 `fetch` 要真连接而那三条检查与 MySQL 无关
+——这样节点表那一支也有 ctest 可钉。
+
+**边界两条**：`--upstream` 命令行**不加新规矩**（它是部署事实；而且 `--config` 与 `--upstream` 互斥、
+逐目标族只在装了 `health` 段时才发，那一支结构上产不出那些键——它今天给主机名仍是 502，那条账归 S5-05）。
+`sanitize_metric_name` 不扩成"非 `[A-Za-z0-9_]` 一律转下划线"：那等于承认主机名是合法配置，
+把一个**早失败**改成一条**永远不可用的静默成员**，比整车失效更难查（ADR-28 第三节）。
+
+**一条可见的后果**：`scripts/smoke-s5-05.sh` 阶段 4 那条臂的形状变了——原来断"起得来、两条 502"，
+现在断"装配期就被拒（`rc=2` + 点名 + 观测端口根本没开）+ 下界那一台合法 IPv4 照常 200"。
+S5-05 当时那个实测没被推翻（那是修前的二进制），改的是今天再跑一次会看到什么。
+
+三处阳性验证（V1 摘检查 → 红 4 条、V2 只查第一个成员 → 只红混合那一格、V3 谓词退化 → 红 6 条而
+②"合法那一支"合法地不红）、本轮十处仪器侧自错（两处会把"没跑"读成"没红"：gtest 过滤器要用冒号、
+`cp -p` 还原让 make 不重编）在 FAULT-INJECTION **§27**。
 
 ## 2. 构建契约（这几条是有理由的，不是风格）
 
@@ -1769,6 +1805,7 @@ FAULT-INJECTION **§24**；通路读数在 ENVIRONMENT **5.3**。
 | `circuit_half_open_now` 全程 0，像"到期→半开那条路没走通" | 半开是**瞬时态**：我在同一个循环里"发一条业务请求 + 读一次 gauge"，那条请求把刚进半开的成员当场回摘（1.31 第三节"一次业务失败立即回摘"） | 阶段 4 改成"摘除后停止发业务、只读观测面"，并把跳变的起点与终点分别钉成 `e_pre=0` 与 `ejected_max≥1`、`halfopen_max≥1` |
 | 屏幕打 `SMOKE-S5-03 FAIL` 而 `echo $?` 读成 0（**这条坑是第四次踩**） | `exit "$FAILED"` 确实执行了（`TEMP-DEBUG` 落盘为证），但在这条通道 + 真容器 + 真子进程的形状下状态码传不出来；**11 组最小复现与 4 个截断版全部 rc=1，归因缺** | 判定改读 `build/smoke-s5-03/verdict.txt`（`PASS\|FAIL checks=<n> fails=<n>`），日志里的 ✗ 行数并行核对。**这一条的第三栏是"绕开"而不是"回不来的断言"，缺的那部分是"为什么 rc 传不出来"** |
 | 对称档里**被门判红那一发**的 timeout 条数与网关退出账永久没了，那笔账至今不能归因（S5-07 留下、S5-08 更正） | 两处取数顺序错：① `measure()` 里 `run_wrk` 一失败就 `return`，而"记下条数"的代码写在 `return` 之后——**丢条数的正是被判红那一发**；② `docker rm -f` 是硬杀，跑在取账之前就把 `[serve]` 那几十行全带走 | `record_wrk_errors` 现在跑在判作废**之前**，每臂必落 `<档>.errors.txt`；退场走 `docker logs → docker stop -t 25 → docker logs → docker rm -f`；`gateway.exit.keys.txt` 里任一键读不到就写"键不在退出账里"而**不是空串**（空串会让"读不到"与"没发生"在数上不可区分——§25.2 第 2 条那一族）。见 FAULT-INJECTION §26.4 第 2 条 + BENCHMARK B-022 追记第二节 |
+| 一个带连字符的地址（主机名）让**整份** `/metrics` 抓失败——Prometheus 报 `invalid metric type "a_18081_ejections counter"`，网关 101 个键一起丢，看起来像"观测面 down 了" | 键名机械变换（ADR-24 第五节）只换 `.` 与 `:`，而配置校验只挡空串；"什么地址算合法"这件事在系统里只有一处真——`net/socket.cc` 里那一次 `inet_pton(AF_INET)`，而校验层与它**各写各的** | S5-09（ADR-28）把校验前移，并把谓词做成 `net::is_ipv4_literal()`——**它就是 `to_sockaddr` 那一次调用**，不留两份定义。钉住它的断言：`S5_09_AddressLiteral.RejectsAnythingTheSocketLayerCannotParse` / `RejectsWholeDocumentWhenAnyTargetIsBad` / `WhateverPassesTheValidatorYieldsLegalPrometheusNames`（组 B 那三条是"放过去就会造出非法键名"的直接证据）+ `S5_09_Reloader.HostnameAddressIsRefusedByNameAndKeepsTheOldGeneration` + `S5_09_NodesRow.AddressMustBeAnIpv4Literal`；`smoke-s5-01` 那份键集合机械互证继续钉"没动键名口径"。V1/V2/V3 三处降级的红集合在 FAULT-INJECTION **§27.1** |
 
 ### 索引之外还欠的两类记录
 

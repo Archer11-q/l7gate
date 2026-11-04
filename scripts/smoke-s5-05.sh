@@ -261,8 +261,12 @@ else
   fail "redis_settles_ok 读不到或为 0：--redis-db 那一段其实是死的"
 fi
 
-# ---------- 阶段 4：句③ 的正身——服务名那一版必须连不上 ----------
-echo "-- 阶段 4：对照臂，同一张网络里把 address 写成服务名"
+# ---------- 阶段 4：句③ 的正身。**S5-09 把这一臂的形状改了**：服务名那一版现在在装配期就被拒，
+# 不再走到运行期 502。判据跟着改，而且它同时是 S5-09 的一条外部证据——拿**没有那条校验的实现**跑这一臂，
+# 红的是「对照容器居然起来了」那一格（不是"读不到 502"），所以这条判据有牙。
+# 上界配下界：同一份 JSON 只把 address 换成合法 IPv4 字面量，那一台必须正常服务，
+# 否则「恒拒载」那种退化在这里也会红。
+echo "-- 阶段 4：对照臂，服务名（上界，装配期拒载）+ 合法 IPv4（下界，照常服务）"
 cat > "$OUT/gw-byname.json" <<JSON
 {
   "upstreams": [ { "name": "api", "balance": "round_robin", "targets": [
@@ -270,34 +274,77 @@ cat > "$OUT/gw-byname.json" <<JSON
   "routes": [ { "match": "prefix", "pattern": "", "upstream": "api" } ]
 }
 JSON
-docker run -d --name "$CTRL" --network "$NET_NAME" \
-  -v "$REPO_ABS/$BIN:/app:ro" -v "$REPO_ABS/$OUT:/cfg:ro" \
-  --entrypoint "" "$RUNTIME_IMG" \
-  sh -c "/app/l7gate --serve --listen 0.0.0.0:$CTRL_BIZ --config /cfg/gw-byname.json --metrics-port $CTRL_MET > /tmp/ctrl.log 2>&1" \
-  > "$OUT/ctrl-run.log" 2>&1
+cat > "$OUT/gw-byip.json" <<JSON
+{
+  "upstreams": [ { "name": "api", "balance": "round_robin", "targets": [
+      { "address": "$U1_IP", "port": 18081 } ] } ],
+  "routes": [ { "match": "prefix", "pattern": "", "upstream": "api" } ]
+}
+JSON
+run_ctrl() { # 配置文件名 —— 不再把网关输出重定向到容器里的 /tmp：拒载那句话现在要从 docker logs 读
+  docker rm -f "$CTRL" >/dev/null 2>&1
+  docker run -d --name "$CTRL" --network "$NET_NAME" \
+    -v "$REPO_ABS/$BIN:/app:ro" -v "$REPO_ABS/$OUT:/cfg:ro" \
+    --entrypoint "" "$RUNTIME_IMG" \
+    sh -c "/app/l7gate --serve --listen 0.0.0.0:$CTRL_BIZ --config /cfg/$1 --metrics-port $CTRL_MET" \
+    > "$OUT/ctrl-run.log" 2>&1
+}
+run_ctrl gw-byname.json
+CTRL_RC=""
+for i in $(seq 1 40); do
+  CTRL_RC=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$CTRL" 2>/dev/null)
+  [[ "$CTRL_RC" == exited* ]] && break
+  sleep 1
+done
+docker logs "$CTRL" > "$OUT/ctrl.bye.log" 2>&1
+if [[ "$CTRL_RC" == exited* ]]; then
+  if [[ "$CTRL_RC" == *"2" ]] && grep -qF '不是 IPv4 字面量' "$OUT/ctrl.bye.log"; then
+    ok "服务名那一版在装配期就被拒：状态「$CTRL_RC」，话里点到 inet_pton 那条理由（旧实现到不了这一格）"
+  else
+    fail "服务名那一版退成「$CTRL_RC」或话里没点「不是 IPv4 字面量」——期望 rc=2 + 点名，原样读数在 $OUT/ctrl.bye.log"
+  fi
+  if grep -qF "\"$U1_NAME\"" "$OUT/ctrl.bye.log"; then
+    ok "点名点到实际读到的值（话里有 \"$U1_NAME\"），不是一句泛泛的配置错"
+  else
+    fail "拒载的话里没带实际读到的值 $U1_NAME：那条断言要的是「运维看得懂是哪个字段」"
+  fi
+  if tcp_open "$CTRL" "$CTRL_MET"; then
+    fail "拒载之后观测端口还开着：那不算拒载"
+  else
+    ok "端口根本没开（拒载发生在装配期，不是起了再来失败）"
+  fi
+else
+  fail "对照容器起来了（状态「${CTRL_RC:-读不到}」）：服务名那一版的 address 本该在装配期就被拒（S5-09）"
+fi
+docker rm -f "$CTRL" >/dev/null 2>&1
+
+run_ctrl gw-byip.json
 CTRL_UP=0
 for i in $(seq 1 40); do
   tcp_open "$CTRL" "$CTRL_MET" && { CTRL_UP=1; break; }
   sleep 1
 done
-if [[ "$CTRL_UP" == "1" ]]; then
-  S1=$(http_in_container "$CTRL" "$CTRL_BIZ" /byname)
-  S2=$(http_in_container "$CTRL" "$CTRL_BIZ" /byname)
-  CTRL_FAILED=$(docker exec "$CTRL" bash -c "exec 3<>/dev/tcp/127.0.0.1/$CTRL_MET || exit 1
-      printf 'GET /metrics HTTP/1.0\r\nHost: smoke\r\nConnection: close\r\n\r\n' >&3
-      while read -r line; do case \"\$line\" in upstream_connect_failed\\ *) echo \"\${line#upstream_connect_failed }\"; break;; esac; done <&3" 2>/dev/null | tr -d '\r' | head -1)
-  if [[ "$S1" == *"502"* && "$S2" == *"502"* ]]; then
-    ok "对照臂两条都是 502（服务名对网关不成立：地址走 inet_pton，src/net/socket.cc:16-35）"
+if (( CTRL_UP == 1 )); then
+  S=$(http_in_container "$CTRL" "$CTRL_BIZ" /byip)
+  if [[ "$S" == *"200"* ]]; then
+    ok "下界：同一份配置只把 address 换成合法字面量 $U1_IP 就正常服务（挡住「恒拒载」那种退化）"
   else
-    fail "对照臂的状态行是「$S1」与「$S2」——期望两条 502；这一条红的就是本轮那条实测本身"
+    fail "合法 IPv4 那一版的状态行是「$S」——期望 200：校验前移不该改变任何合法配置的行为"
   fi
-  if [[ -n "$CTRL_FAILED" ]] && (( CTRL_FAILED >= 1 )); then
-    ok "对照臂的观测面自报 upstream_connect_failed=$CTRL_FAILED（红在「连不上」这一格，不是超时也不是别的因）"
+  # **这一发是真打到上游去的**（旧那一臂走的是 502，一个字节都没到上游），所以阶段 8 那条
+  # "上游自报之和 == 我发的业务条数"的等式必须把它算进去。数从**对照那台网关自己的观测面**取，
+  # 不从我脑子里的"1"取——取不到就判红，不用空串冒充 0（§25.2 第 2 条那一族）。
+  CTRL_COMPLETED=$(docker exec "$CTRL" bash -c "exec 3<>/dev/tcp/127.0.0.1/$CTRL_MET || exit 1
+      printf 'GET /metrics HTTP/1.0\r\nHost: smoke\r\nConnection: close\r\n\r\n' >&3
+      while read -r line; do case \"\$line\" in responses_completed\\ *) echo \"\${line#responses_completed }\"; break;; esac; done <&3" 2>/dev/null | tr -d '\r' | head -1)
+  if [[ "$CTRL_COMPLETED" =~ ^[0-9]+$ ]]; then
+    ok "对照臂自报 responses_completed=$CTRL_COMPLETED（这一发要进阶段 8 那条等式，数从被测方取、不从我脑子里取）"
   else
-    fail "对照臂的 upstream_connect_failed 读不到或为 0：'${CTRL_FAILED:-空}'"
+    fail "对照臂的 responses_completed 读不到（'${CTRL_COMPLETED:-空}'）——阶段 8 的等式因此不可判，先修取数"
+    CTRL_COMPLETED=""
   fi
 else
-  fail "对照容器没起来，看 $OUT/ctrl-run.log"
+  fail "合法 IPv4 那一版起不来：$OUT/ctrl-run.log 与 docker logs"
 fi
 docker rm -f "$CTRL" >/dev/null 2>&1
 ok "对照容器按名清掉（$CTRL）"
@@ -391,10 +438,15 @@ A2=$(docker compose -f "$CF" logs "$U2_NAME" 2>/dev/null | grep -o '已服务请
 if [[ -n "$A1" && -n "$A2" ]]; then
   if (( A1 >= 1 && A2 >= 1 )); then ok "两台上游**各自**自报接走过请求：$U1_NAME=$A1、$U2_NAME=$A2（上界之外还要下界：不是只打到一台）"
   else fail "有一台一条都没接到：$U1_NAME=${A1:-空} $U2_NAME=${A2:-空}"; fi
-  if (( A1 + A2 == BUSINESS_CURLS )); then
-    ok "$A1 + $A2 == $BUSINESS_CURLS：上游自报之和 == 我发的业务条数 == 网关 requests_parsed 的增量（三方同轴）"
+  # 等式的右边 = 阶段 3 主路径发的 $BUSINESS_CURLS **加上** 阶段 4 那条下界臂的自报条数。
+  # 加这一项不是把等式放松：S5-09 之前那一臂是 502、一个字节都不到上游，所以旧等式成立；
+  # 现在它是一条真服务起来的请求，被测方自己报了数，就把它的数放进来。
+  if [[ -z "$CTRL_COMPLETED" ]]; then
+    fail "对照臂那一发的自报条数没取到（阶段 4 已判红）——这条等式因此不可判，不用 0 顶替"
+  elif (( A1 + A2 == BUSINESS_CURLS + CTRL_COMPLETED )); then
+    ok "$A1 + $A2 == $((BUSINESS_CURLS + CTRL_COMPLETED))（主路径 $BUSINESS_CURLS + 对照臂自报 $CTRL_COMPLETED）：上游自报之和 == 我发的条数 == 网关 requests_parsed 的增量（三方同轴）"
   else
-    fail "上游自报之和 $((A1 + A2)) != 我发的 $BUSINESS_CURLS"
+    fail "上游自报之和 $((A1 + A2)) != 主路径 $BUSINESS_CURLS + 对照臂 $CTRL_COMPLETED"
   fi
 else
   fail "读不到上游自报数（$U1_NAME='${A1:-空}' $U2_NAME='${A2:-空}'）"

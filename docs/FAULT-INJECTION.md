@@ -1644,3 +1644,75 @@ run4 = `PASS checks=50 fails=0`（加 `key_reads` 守卫之前），run5 = `PASS
 - 没有给 netem 加"按成员区分"的网络层注入、也没扫 loss/delay 阈值（§25.5 那两格原样欠着）。
 - 那笔 socket timeout 的**归因**没有在这里闭合，只闭合了它的**取数手段**；状态见 BENCHMARK B-022 追记。
 
+---
+
+## 27. S5-09 把那条"能整车失效"的输入挡在装配期，以及我自己在这条线上错的十处（2026-11-04，ADR-28）
+
+**这一节在问什么**：S5-05 的退化 C1 抓到一条被测方事实——配置里的 `address` 只挡空串、不挡字符集，
+而 `health_t<i>_<address>_<port>_<metric>` 那一族把值**原样拼进指标名**，带连字符的地址于是能造出
+Prometheus 名字法里非法的键名，后果不是那一格坏，是**整份 `/metrics` 抓失败**（实测
+`lastError = invalid metric type "a_18081_ejections counter"`，那台网关 101 个键一起丢）。
+S5-09 按项目所有人 2026-11-04 那句"按你的建议来"走**修法①**：`address` 只收 IPv4 字面量，
+拒载 + 点名（语义与代价在 **ADR-28**，任务行在 TASKS 的 S5-09）。
+
+### 27.1 三处阳性验证：红集合是分得开的，而且有两处与我的预期不一样
+
+点火手段：`/home/archer/s5-09-fire-v.sh`（改的是 `src/` 里的实现，用完 `cp` 还原 + `cmp` 逐字节核对 +
+`grep -rn 'TEMP-V' src/ tests/ scripts/` 为空）。用例集 `S5_09_*:S5_02_Reloader.*` = 18 条。
+
+| # | 退化打在哪 | 红掉的用例 | 与 ADR 第七节预期的差异 |
+|---|---|---|---|
+| 干净门 | 什么都不改 | **0 条**（18 条全绿） | — |
+| V1 | `gateway_config.cc` 那条 `if` 改成永假（校验摘掉） | **4 条**：`RejectsAnythingTheSocketLayerCannotParse`、`RejectsWholeDocumentWhenAnyTargetIsBad`、`WhateverPassesTheValidatorYieldsLegalPrometheusNames`、`S5_09_Reloader.HostnameAddressIsRefusedByNameAndKeepsTheOldGeneration` | 符合预期，而且**节点表那一臂与谓词对照臂没红**——这正是它们各自独立存在的理由：V1 只证明"文件那一支的检查有牙" |
+| V2 | 检查改成只查 `targets[0]` | **1 条**：`RejectsWholeDocumentWhenAnyTargetIsBad` | 比我写的"④ 红而 ① 红在另一格"**更干净**：① 的样本每个配置只有一个 target（下标 0），所以 V2 下它仍然绿——① 与 ④ 本来就是两格不同的东西，这一对红集合把"只查第一个"这种漏法单独照出来了 |
+| V3 | `is_ipv4_literal` 退化成"非空即合法" | **6 条**：V1 那四条 + `PredicateAgreesWithTheSocketLayerItGuards` + `S5_09_NodesRow.AddressMustBeAnIpv4Literal` | **与预期不符的一条**：我在 ADR 里写"V3 → ①②③ 全红"，实际 **② `AcceptsEveryLiteralShape` 不红**。这不是用例坏了，是它断的本来就不是"谓词严格"——② 断的是"合法那一支的行为没变"，宽松谓词不伤它。按纪律照记并就地更正 ADR 第七节那句预期（**不改用例凑红，也不改我的预期让它显得对**） |
+| 还原门 | 还原之后 | **0 条**（18 条全绿），`TEMP-V` 残留 0 处，两文件与备份 `cmp` 逐字节相同 | — |
+
+### 27.2 仪器侧本轮我自己错了 **10** 处（其中两处会把"没跑"读成"没红"）
+
+| # | 错在哪 | 症状 / 不抓会读成什么 | 处置 |
+|---|---|---|---|
+| 1 | gtest 的 `--gtest_filter` 正向模式之间是**冒号**，我写成逗号（`S5_09_*,S5_02_Reloader.*`） | 屏幕上是 `Running 0 tests from 0 test suites` + 我的脚本报"红 0 条"——**三次降级全被读成"退化打不红"** | `fire()` 里加一条 `ran>0` 守卫：一条用例都没跑到就判这一跑**作废**，不交一份空数（D3 那一族的第二次，这次撞在我自己的点火脚本上） |
+| 2 | 还原用 `cp -p`：备份的旧 mtime 比降级时编出的 `.o` **更旧**，make 判定"不用重编" | 三次降级的红集合**一模一样**（都是上一轮残留的那颗退化谓词），看起来像"三条退化等价" | 还原改不带 `-p` 的 `cp` + 每次点火前先跑一次**干净门**（还原态不绿就没资格点火）+ `rebuild()` 里把"这一跑真重编了哪个 .o"打出来 |
+| 3 | 我自己脚本里"红 N 条"那格读 `grep '[  FAILED  ] N tests'`，而 gtest **单数时打 `1 test`** | V2 明明红 1 条，汇总那格印成"红 0 条"——与 §24.2 第 6 条（把清单行与汇总行一起数）同源：**读汇总行要先看单复数** | 结论一律以 FAILED **清单行**为准，汇总行只当旁证；这一格原样记在表里 |
+| 4 | 用例夹具 `one_target` 的模板里多带了一个引号（`{"address":"` + 已带引号的值） | 三条新用例红在"这条该被接受，却被拒了：偏移 76 对象里期望逗号或右花括号"——红的是我的字符串拼接，不是被测方 | 模板改成 `{"address":`（值令牌由调用方带引号），并加一个 `quote()`；失败信息里的**偏移**是把我说清楚的第一手证据 |
+| 5 | `for (const std::string& address : {"127.0.0.1", …})` 触发 `-Wrange-loop-construct` **2 条警告** | 门禁第 2 条"非 gtest 警告各 0 条"当场被弄脏（我自己的改动弄脏的） | 循环变量改成按值；还原后的构建日志 `warning:` 计数 **0** |
+| 6 | 第一版把 `localhost` 放进"键名应当非法"那组样本 | 那条断言会**假绿反了方向**：`health_t0_localhost_18081_ejections` 本来就合法（纯字母），红了的是我的判据 | 组 B 只收**机械变换管不到**的字符（连字符 / 空格 / `%`），`.` 与 `:` 明确写出"不在这一组，因为 ADR-24 第五节已经换掉了"；这一处错就地写进用例注释 |
+| 7 | bind 对照臂里放了 `172.31.250.21`（编排子网里的地址，本机没有） | 红在 `make_listen_socket(...).ok()`，看起来像"谓词在说谎" | 这一臂只留本机真有的 `127.0.0.1` / `0.0.0.0`，`172.31.250.21` 改判"谓词说合法但不等于本机有它"——**两件事分开断** |
+| 8 | 探针（nginx 加 perf 层那一发）第一版 `docker commit -c "--entrypoint …"` | `-c` 要的是 **Dockerfile 指令**，写成命令行开关就静默不产出镜像；后面每一步都报 `unknown: failed to resolve reference` 去远端拉那个不存在的 tag | 改成不带 `-c` 的 commit + 运行期 `--entrypoint`，并加一条 `docker images -q` 的存在性断言：commit 仍失败就**当场收手**，不交一份空探针 |
+| 9 | 同一发探针里 `l7gate_bench_upstream --port`（真旋钮是 `--listen`）且没做存活检查 | 对端根本没起，后面全空——与 §26.4 第 3/4 条**同一族的第三次**（旋钮名猜的 + 对端没起不报错） | 参数按 `--help` 原文写；起完立刻 `kill -0 $pid`，没起就判这一档作废 |
+| 10 | **我新增的那条下界臂把另一条等式顶偏了**：`smoke-s5-05` 阶段 4 原来的那一臂是 502、一个字节都不到上游，我把它换成"合法 IPv4 真服务一条"之后，阶段 8 那条"上游自报之和 == 我发的业务条数"当场少 1 条 | 门禁首跑第 14 条 `rc=1`、`✗ 1`：`上游自报之和 13 != 我发的 12`。红的是**我的改动没结算自己的账**，不是被测方 | 等式右边改成 `主路径 12 + 对照臂自报 responses_completed`，而那个数**从对照那台网关自己的观测面取**（取不到就判红，**不许拿空串冒充 0**）。修完复跑 `PASS checks=69 fails=0` |
+
+### 27.3 门禁面（2026-11-04 本会话实测，判定全部读落盘）
+
+- `cmake --build build/debug -j 16` 全目标 **rc=0**、`warning:` 计数 **0**（`s5-09-buildall.log`）；
+  `ctest --test-dir build/debug` **383/383**（376 → 383，+7 条全在 S5-09 那三组里；`s5-09-ctest3.log`）。
+- `bash scripts/verify-all-presets.sh` **rc=0**：三 preset 各 **383/383**、非 gtest 警告各 **0** 条
+  （每行都是 `build exit=0 warning_total=0 非gtest警告=0`；`s5-09-presets.log`）。
+- **tsan 直跑** `build/tsan/tests/l7gate_tests` rc=0：**381 PASSED + 2 SKIPPED**、日志里
+  `ThreadSanitizer` 出现 **0 次**（`s5-09-tsan.log`；跳过的两条仍是 `S2_07_MemoryComposition` 那两格）。
+- **十四条冒烟**：首跑十三条 `rc=0` 且 ✗ 行 0；**第 14 条 `smoke-s5-05` 首跑 `rc=1`、✗ 1 条**——
+  就是我上面第 10 处自错。修正后复跑：`build/smoke-s5-05/verdict.txt` = **`PASS checks=69 fails=0`**
+  （66 → 69 是这条臂多出来的三条判定：装配期被拒、点名到实际读到的值、端口根本没开），
+  阶段 4 那四条与阶段 8 的等式一起绿。`s5-03` = `PASS checks=40 fails=0`、`s5-04` = `PASS checks=29 fails=0`。
+- 清场：`l7gate-` 前缀容器残留 **0** 条、同机 `rgbt-*`/`knowstack-*`/`tinrpc-*` 与开工前同为 **6** 条、
+  宿主回环 `qdisc noqueue 0: root refcnt 2`。
+- 阳性验证那一轮的还原门：还原后 18 条用例 **0 红**、`TEMP-V` 残留 0 处、两文件与备份 `cmp` 逐字节相同。
+
+### 27.4 本轮没做与没量的（写在纸上）
+
+- **真 MySQL 那一臂没验**：节点表的降级只落在 ctest 的纯函数臂（`S5_09_NodesRow`）上；
+  `scripts/smoke-s3-04.sh` 没有加"往节点表插一行主机名"这一格。要加就得动那条冒烟的夹具，
+  代价与形状记在这儿，不当成已完成。
+- **`--upstream` 命令行那一支的行为没改、也没重验**：ADR-28 第四节给了它结构上产不出那些键的理由
+  （`--config` 与 `--upstream` 互斥、逐目标族只在装了 `health` 段时才发）。它今天给主机名仍是 502 +
+  `upstream_connect_failed`，那条账归 S5-05（ENVIRONMENT 5.3），本任务没碰。
+- **旧那条 502 判据的形状被这条任务改了**：`scripts/smoke-s5-05.sh` 阶段 4 原来断"起得来、两条 502、
+  自报 `upstream_connect_failed≥1`"，现在断"装配期就被拒（`rc=2` + 话里点到实际读到的值 + 观测端口根本没开）+
+  下界那一台合法 IPv4 照常 200"。**S5-05 当时那个实测本身没被推翻**（那是修前的二进制），被改的是
+  今天再跑一次会看到什么——所以这条臂同时也是 S5-09 的一条外部证据：拿修前的实现跑它，红的是
+  "对照容器居然起来了"那一格。
+- 没有跑任何性能读数：这条改动只在装配/重载那一拍加一次 `inet_pton`，每请求路径一个字节都没动，
+  所以 B-019/B-020/B-021 那几格既不需要重跑、也不许被我这句话升格成"没成本"——它的成本本来就不在那条线上。
+
+

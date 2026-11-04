@@ -25,6 +25,16 @@ struct NodesDbParams {
   std::int64_t timeout_ms = 2000;  // 连接/读/写共用一个预算；挂死的 mysqld 不能变成僵尸 reload
 };
 
+// ADR-28：一行的值域校验（address 非空且必须是 **IPv4 字面量**、port 落在 1..65535、
+// health_path 以 / 开头）。它从 `NodesStore::fetch` 的循环里抽出来，只有一个理由：
+// **节点表那一支也要能被 ctest 钉住**——`fetch` 要真连接，而这四条检查跟 MySQL 无关。
+// 抽出前后行为逐字相同：同样的错误话（带组名与读到的值）、同样"任何一行不合格就整批失败"。
+// 地址那一格之所以管：节点表的 address 也进 `target_names`，非字面量会造出 Prometheus
+// 非法指标名、整份 `/metrics` 抓失败（S5-05 退化 C1 实测的形状）。
+bool validate_node_row(std::string_view group, std::string_view address,
+                       std::string_view port_text, std::string_view health_path,
+                       std::uint16_t* port, std::string* error);
+
 class NodesStore {
  public:
   explicit NodesStore(NodesDbParams params) noexcept : params_(std::move(params)) {}
