@@ -268,6 +268,42 @@ S5-03 留给 S5-05 的那笔账——**容器之间能不能按服务名解析**
 `smoke-s5-05.sh` 阶段 0 逐端口探活，被占就 `die`。B-017 那格在编排层的落点：`cpuset: "15"` 只给 redis 一段，
 前提 `docker info` 的 `NCPU=16` 由阶段 0 断住。
 
+### 5.4 `tc netem` 的可用性与作用域（2026-11-04 实测，S5-06 / ADR-13 那条"仅作交叉验证"的落地）
+
+契约 9.3 与 S5 拆解都留着一条"WSL2 内核不一定支持 netem"的悬念。**本轮量完了，结论是「通」**，
+但**通的地方不是宿主回环**——把四条路分开记，因为最容易犯的是把"加不上"读成"内核不支持"。
+
+| 路 | 读数 | 结论 |
+|---|---|---|
+| A. 宿主原生回环（uid=1000） | `tc qdisc add dev lo root netem delay 10ms` → `RTNETLINK answers: Operation not permitted`；`modprobe sch_netem` → `could not insert: Operation not permitted`；`sudo -n` → 要交互认证 | **加不上，但这是权限墙不是内核墙**。缺的是 `CAP_NET_ADMIN`，不是模块 |
+| A′. 同一个内核里的模块本体 | `/lib/modules/…/kernel/net/sched/sch_netem.ko` 的 `vermagic` = `6.18.40.1-microsoft-standard-WSL2 SMP preempt mod_unload modversions`，与 `uname -r` **逐字相同** | 根来了就能加载；而且 C/D 两路证明 netem 在这颗内核里**真能生效** |
+| B. 非特权 netns（第一发，**不算数**） | `unshare -Un`（**漏了 `--map-root-user`**）→ ns 内 `uid=65534`、`CapEff=000000000000000`、加 qdisc 与建 veth 全 EPERM | **这是我的仪器错**：没映射 uid 就等于没有 caps，把"我用错了参数"读成"userns 这条路不通"就错了 |
+| C. 非特权 user+netns + uid 映射 | `unshare -Un --map-root-user` → `uid=0`、`CapEff=00001ffffffffff`、`tc qdisc add dev lo root netem delay 10ms` **加上**，读回 `qdisc netem … limit 1000 delay 10ms` | **这是 S5-06 的执行场所**：不需要 root、不碰宿主、每臂一个全新 ns、可复跑 |
+| D. 容器（`--cap-add=NET_ADMIN`） | 容器自己的 `eth0` 上加 netem 成功（`qdisc netem 8001: root … delay 10ms`）；对照不带 `NET_ADMIN` → EPERM | 另一条通路；且 `docker run ubuntu:26.04 uname -r` 报的**也是** `6.18.40.1-microsoft-standard-WSL2`，与 WSL 同一颗内核串 |
+
+**生效的毫秒数（带对照臂，各自全新的 ns，回环上的一问一答）**：对照臂 `qdisc noqueue` →
+`connect 0.07–0.18 ms`、单向回包 **0.01 ms**；注入臂 `delay 10ms` → `connect **20.14–20.27 ms**`、
+单向回包 **10.05–10.25 ms**。**握手为什么是 20 ms 而不是 10 ms**：一次往返在回环上走**两个方向的各一次出向**，
+所以按机制读成 2×delay；这一格不是"量歪了"，是横轴的单位（见 FAULT-INJECTION §25.1 那条被实测改写的判据）。
+`delay 20ms 5ms loss 25%` 同样加得上；UDP 发 200 收 137（观测 31.5%，配置 25%），
+qdisc 自己数 `Sent 200 pkt (dropped 63, overlimits 0 requeues 0)`——两处互证同一个数，
+差 6.5 个百分点属伯努利抽样方差（n=200、p=0.25 时 σ≈3.1%），不是 netem 不准。
+
+**两条要记住的作用域事实**：**① 注入的作用域是那一个 netns 的 `lo`**，宿主回环从头到尾是
+`qdisc noqueue 0: root refcnt 2`（脚本开工前与收尾各核一次，逐字相同才判过）；
+**② 观测面不在注入的作用域之外**——Prometheus 也好、冒烟的 curl 也好，取数走的都是同一条被注入的回环，
+所以 loss 臂会出现"抓取偶发超时"（实测 14 次采样空读 1 次）。这一条既是坑也是产出：
+**观察者的超时必须比注入的往返长**，否则"没读到"会被读成"没发生"（S5-06 的退化 D2 就是打在这一格上，
+它同时把 `p50=1013 ms` 这种"看着像有延迟"的读数判了死——下界按机制给才有牙）。
+
+**工具版本原样记录**（契约 9.2 的姿势）：`tc utility, iproute2-6.19.0, libbpf 1.6.3`；
+`uname -r = 6.18.40.1-microsoft-standard-WSL2`。
+**就地更正两处旧读数**：TASKS 的 S5-06 行与交接段一直写 `6.18.33.1-microsoft-standard-WSL2`，
+本轮实测是 `6.18.40.1`（`docs/ENVIRONMENT.md` 第 3 节与第 7 节的 perf 那一行早就是 40.1，
+是这两处没跟着改）。`tc` 不在契约 9.1 的锁定表里，但契约 9.3 **本来就点名了 `tc netem`**
+（"仅作交叉验证，WSL2 内核不一定支持"），所以它不是新增依赖，是契约里预期过的手段；
+版本按上面那行记录，判定一律以 `tc qdisc show` 读回的**内核回执**为准，不以"命令存在"为准。
+
 ## 6. 文件系统位置（会影响数据的一条）
 
 仓库与全部构建、压测都在 WSL 原生 ext4 内。当前仓库位置是 `/home/archer/workspace/l7gate`（2026-10-26 从 `/home/archer/l7gate` 平移进来，同发行版同文件系统，所以契约 9.4 的条件与全部历史数字继续成立；搬家的代价与复跑记录见 TASKS 交接段的「搬家」一条）。Windows 侧只能经 UNC 通道（`\\wsl.localhost\<distro>\<home>\workspace\l7gate` 形式）查看和编辑同一批文件。
