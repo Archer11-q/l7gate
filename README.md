@@ -239,7 +239,7 @@ client ──epoll ET──▶ acceptor ──round-robin（跨线程只传裸 f
 
 ## 可观测面与调试界面
 
-三个数字要能被**看见**。四件已落地：运行期指标面（S5-01）、配置热重载（S5-02）、Prometheus + Grafana（S5-03）、WebSocket 调试页（S5-04）。
+三个数字要能被**看见**。这一层落了六件：运行期指标面（S5-01）、配置热重载（S5-02）、Prometheus + Grafana 六格（S5-03）、WebSocket 调试页（S5-04）、`docker compose` 一键起全套（S5-05）、`tc netem` 现场六臂（S5-06）；再加上三个数字的终判（S5-07）——判定读的仍是 `scripts/bench/` 的落盘摘要，**不是面板**（ADR-25 第六节：那一格只把已归档的读数搬到眼睛前面）。
 
 ### 运行期指标面 `--metrics-port PORT`
 
