@@ -74,7 +74,7 @@
 | **Prometheus 抓取 + Grafana「网关总览」六格** + 一个只读落盘摘要的旁路 percentile exporter | S5-03 | [ADR-25](docs/adr/ADR-25-bench-percentile-exporter.md)；面板那 20 条表达式是唯一真相，冒烟 grep 同一串；`429` 静置臂 **34==34**、扰动臂 **49==49** |
 | **WebSocket 调试页**：地址栏 + 消息流 + 输入框，限流时显示 `429 rate limited`，取数证据是 **DOM 断言**不是人眼 | S5-04 | [ADR-26](docs/adr/ADR-26-ws-echo-upstream-and-headless-dom.md)；`文案 7 == 哨兵 7 == Δrate_limit_rejected 7`；`closed code=1005` 两侧配对归零 |
 
-**还没落地的**：`docker compose` 一键起全套（S5-05）、`tc netem` 现场验证（S5-06）、三个数字终稿与 vs Nginx 归因报告（S5-07）、S5 门禁收尾（S5-08）。
+**还没落地的**：三个数字终稿与 vs Nginx 归因报告（S5-07）、S5 门禁收尾（S5-08）。`docker compose` 一键起全套（S5-05）**与** `tc netem` 现场验证（S5-06）都已 DONE——前者的形状与读数见上面「可观测面与调试界面」里 S5-05 那一小节与 [ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)，后者的六臂对照与被实测改写的那条机制句见 [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) §25 与 [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) 5.4。
 
 ---
 
