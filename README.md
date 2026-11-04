@@ -73,8 +73,12 @@
 | 运行期指标面 `/metrics`：Prometheus text 0.0.4 **纯自实现**、独立 `--metrics-port`、默认关闭；键名与退出账**逐字相同** | S5-01 | [ADR-24](docs/adr/ADR-24-metrics-exposition.md)、B-019；主档四臂 `7,199,900 / 1,800,000 = 3.999944` **同一个整数** |
 | **Prometheus 抓取 + Grafana「网关总览」六格** + 一个只读落盘摘要的旁路 percentile exporter | S5-03 | [ADR-25](docs/adr/ADR-25-bench-percentile-exporter.md)；面板那 20 条表达式是唯一真相，冒烟 grep 同一串；`429` 静置臂 **34==34**、扰动臂 **49==49** |
 | **WebSocket 调试页**：地址栏 + 消息流 + 输入框，限流时显示 `429 rate limited`，取数证据是 **DOM 断言**不是人眼 | S5-04 | [ADR-26](docs/adr/ADR-26-ws-echo-upstream-and-headless-dom.md)；`文案 7 == 哨兵 7 == Δrate_limit_rejected 7`；`closed code=1005` 两侧配对归零 |
+| **`docker compose` 一键起全套**（八个服务一条 `up -d`；壳镜像**不 COPY 产物**、被网关引用的地址走显式静态 IPAM） | S5-05 | [ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)；十四条冒烟第 14 条十一个阶段 **66 项判定**读 `verdict.txt`；容器之间按服务名解析通，**但网关不做名字解析**（`inet_pton`，服务名那一版实测 502 + `upstream_connect_failed`） |
+| **`tc netem` 现场六臂**（执行场所＝非特权 user+netns 的回环；宿主回环开工前后各核一次，全程 `noqueue`） | S5-06 | [FAULT-INJECTION §25](docs/FAULT-INJECTION.md) 与 [ENVIRONMENT 5.4](docs/ENVIRONMENT.md)：**网络层一次探活 ≈4×delay**，慢与死的分界线在 `probe_timeout/4`（不是 300 ms）；三台一起超时造出应用层从来没有的一格——**安全阀在挡摘除**（`blocked_by_valve` 155→410 而 `ejected_now` 峰值只有 1） |
+| **三个数字终稿 + vs Nginx 差值归因**（终判档＝两侧都进容器、同一种 `-p` 发布） | S5-07 | [B-021](docs/BENCHMARK.md) / [B-022](docs/BENCHMARK.md) 与上面「三个数字」那四行；脚本 `scripts/bench/s5-07-qps-symmetric.sh`、`s5-07-flamegraph.sh`。**归因两边不对称这件事明写**：网关侧有用户态 self 榜，nginx 侧同法火焰图在这台机器上取不到（三条实测在 [ENVIRONMENT 4.2](docs/ENVIRONMENT.md)），"nginx 慢在哪一层"那句今天没有证据 |
+| **S5 门禁收尾**（四件套与另加三样逐项指路、§25.3 欠的两条阳性验证补打、三笔待决逐笔给状态） | S5-08 | [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节 + [FAULT-INJECTION §26](docs/FAULT-INJECTION.md)：D4 谎报注入红 **3** 条、D5 清场失灵红 **3** 条，还原后与备份 `cmp` 逐字节相同、复跑 `PASS checks=22 fails=0` |
 
-**还没落地的**：三个数字终稿与 vs Nginx 归因报告（S5-07）、S5 门禁收尾（S5-08）。`docker compose` 一键起全套（S5-05）**与** `tc netem` 现场验证（S5-06）都已 DONE——前者的形状与读数见上面「可观测面与调试界面」里 S5-05 那一小节与 [ADR-27](docs/adr/ADR-27-compose-one-command-stack.md)，后者的六臂对照与被实测改写的那条机制句见 [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) §25 与 [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) 5.4。
+**这一阶段没有"还没落地"那一行了**——S5-01…S5-08 八条全 DONE（2026-11-04 关门，门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节）。剩下的都不是功能缺口，而是**排期与裁决**，原样列在 [TASKS.md](TASKS.md)「已知待决事项」与 ROADMAP 的 S5 债表里：nginx 基线镜像加 perf 层（禁令三／契约 9.1，归项目所有人）、`l7gate_c100k` 观察者多线程（`tools/` 的测量手段 + 一条 ADR，按 ADR-17 先例）、带连字符的 `address` 会造出 Prometheus 非法指标名那条**没修**的暴露面缺陷，另有七格"写在纸上没测"的账与三条候补。**没有一笔被读成已闭合。**
 
 ---
 
@@ -349,9 +353,11 @@ docker ps -a --filter name=l7gate-          # 停栈后这一条必须是空的
 
 **成本读数要带着分辨率读**：`p50/QPS 无可分辨`**不等于"免费"**——B-018 那一档的分辨率是一个 HDR 桶 ≈128 µs/请求，比 B-008 那把 8.7 µs 的尺大一个数量级以上，"无可分辨"只排除"掉进 µs 级的悬崖"、**不排除个位数 µs**。B-020 更直接：每请求那一格**读不出方向**（off 臂自己跨轮漂了 24%），所以"arm 便宜"这句我不说，而同一轮的常驻那一格 **+19.1 MiB** 无歧义（两臂组内极差 <0.3 MiB）。**两句分开写，不拿后者的"读不出"去洗前者。**
 
-**"干净"都带反证**：ASan / LSan / UBSan / TSan 我全部用故意写坏的样本验过**能红**；阳性验证必须真打红，第一版打不红的逐条弄清为什么（**不改用例凑红**）。也留着一份不体面的清单——每一轮"仪器侧我自己错了哪几处"都在 [FAULT-INJECTION](docs/FAULT-INJECTION.md) 的 §20.1 / §21.2 / §22.2 / §23.2 里逐条列着，其中相当一部分**如果没被抓住，会被读成比事实更强的结论**。还有一次"拆了也不红"的诚实记录：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条。
+**"干净"都带反证**：ASan / LSan / UBSan / TSan 我全部用故意写坏的样本验过**能红**；阳性验证必须真打红，第一版打不红的逐条弄清为什么（**不改用例凑红**）。也留着一份不体面的清单——每一轮"仪器侧我自己错了哪几处"都在 [FAULT-INJECTION](docs/FAULT-INJECTION.md) 的 §20.1 / §21.2 / §22.2 / §23.2 / §24.2 / §25.2 与 [BENCHMARK B-022](docs/BENCHMARK.md) 末逐条列着，其中相当一部分**如果没被抓住，会被读成比事实更强的结论**。还有一次"拆了也不红"的诚实记录：把隧道收尾从 `kFlushThenClose` 换成 `kDiscardOutbound` 全绿，因为 4096 字节的回显早被内核套接字缓冲吸收了——那条判据因此归 S1-04 的既有用例，不归这条。
 
 **一条至今没能归因的事实**：真脚本在全跑形状（真容器 / 真子进程 + 真浏览器）下会打 FAIL 而 `echo $?` 读成 0，而 11 组最小复现与 4 个截断版全是 rc=1——我没找到具体那一句。处置不是解释而是绕开：**判定写进 `verdict.txt`，门禁读盘**。
+
+**S5-08 关门时另外这几笔没闭合的账也照记在这里**：① 对称容器档的 `sym3-w16-r2` 等三发报过 wrk `Socket errors: timeout`，条数与非 2xx 逐数相等——**重跑两发没复现**（0 条 timeout、0 条非 2xx，退出账三格超时与自产 5xx 全 0），而历史三发的退出账已被一次硬杀永久带走，所以这一格是**未证**，不是已修；更糟的是它连条数都被我记错过一次（"16/48"其实是两发不三发，nginx 臂也报过）——见 [B-022 追记](docs/BENCHMARK.md)。② 干净发里网关有 `requests_parsed − responses_completed = 647 / 456`，而**上游夹具在同一批里留下同量级的 `requests − responses_written`（653 / 486）**：这只排除"网关单边丢账"一种读法，收尾瞬间两侧计数点各停在什么位置我没取同轴的账，**不猜机制**。③ 顺带一条关于工具的：`wrk 4.1.0` 在"accept 后永不回字节"的假对端上**根本不产 `Socket errors: timeout` 计数**（四条档全 `0 requests`），所以那一格的触发条件我用手边手段测不到（[ENVIRONMENT 2.3](docs/ENVIRONMENT.md)）。
 
 ---
 
@@ -377,19 +383,24 @@ docker ps -a --filter name=l7gate-          # 停栈后这一条必须是空的
 ```bash
 bash scripts/verify-all-presets.sh        # 三 preset 构建 + ctest + 我方警告计数，一次拿全
 for s in smoke-s1-04 smoke-s1-06 smoke-s1-07 smoke-s2-05 smoke-s3-02 smoke-s3-04 \
-         smoke-s4-04 smoke-s4-05 smoke-s4-06 smoke-s5-01 smoke-s5-02 smoke-s5-03 smoke-s5-04; do
-  PRESET=debug bash scripts/$s.sh         # 十三条冒烟。需要 Docker 的两条是 s3-04（MySQL 8.0.36）与 s4-04（redis:7.2.5）：
-                                          #   容器不在位时脚本在阶段 0 自己拒跑，不换一个顶上去
-                                          # s5-03 / s5-04 的判定读 build/smoke-*/verdict.txt，不信退出码
+         smoke-s4-04 smoke-s4-05 smoke-s4-06 smoke-s5-01 smoke-s5-02 smoke-s5-03 smoke-s5-04 smoke-s5-05; do
+  PRESET=debug bash scripts/$s.sh         # 十四条冒烟。需要 Docker 的三条是 s3-04（MySQL 8.0.36）、s4-04（redis:7.2.5）
+                                          #   与 s5-05（整栈 compose）：容器不在位时脚本在阶段 0 自己拒跑，不换一个顶上去
+                                          # s5-03 / s5-04 / s5-05 的判定读 build/smoke-*/verdict.txt，不信退出码
+                                          #   （真容器/真子进程形状下 `exit "$FAILED"` 传不出 rc，见「诚实的边界」末段）
                                           # s5-04 还要一条工具依赖：Windows 侧 chrome.exe 无头取 DOM，
                                           #   不在位同样拒跑（登记在 ADR-26 第四节与 ENVIRONMENT 5.2）
+                                          # 跑冒烟之前必须先 `cmake --build build/debug -j 16`（**全目标**，不是只编 l7gate_tests）
 done
 
 scripts/bench/s1-p99.sh                   # SLO #1 标准口径（canonic 由参数自己判，非标那轮不进文档）
 scripts/bench/s1-p999.sh                  # SLO #1 的 p999 半边：每臂自报观察者 CPU；1000 并发那档目前判"取不到"
 scripts/bench/c100k.sh                    # SLO #2：多目标地址长连接稳态 + 每连接对内存 + HDR 分位
-scripts/bench/s2-qps-vs-nginx.sh          # SLO #3 五档：nginx 三档 + 网关 + 直连天花板
+scripts/bench/s5-07-qps-symmetric.sh      # **SLO #3 的终判档**：两侧都进容器、同一种 -p 发布、打同一个上游
+scripts/bench/s2-qps-vs-nginx.sh          # 旧形状（裸进程网关 vs 容器 nginx）——自 S5-07 起**只作对照**，无宣判资格
+scripts/bench/s5-07-flamegraph.sh         # 火焰图，按 ENVIRONMENT 4.1 那一种已验证形态取（perf 直接拉起被测进程）
 scripts/fault/s3-05-matrix.sh             # 故障注入第一轮五类；第二轮叠加五类见 s4-07-matrix.sh
+scripts/fault/s5-06-netem.sh              # 网络层六臂（非特权 user+netns 里的回环），与应用层读数对照并归因
 ```
 
 非标准口径与排水档这类"怎么把旋钮拧对"的写法，写在上面每个脚本自己的 `--help` 与 [docs/SLO.md](docs/SLO.md) 的脚本索引里，README 不抄第二份。「ASan 干净」这句话不该靠我手敲，所以有一条命令能复现它——**同理每个数字都能一键重跑**，这是契约第 7 节对这几份文档的完成判据；**长跑判定只认落盘输出**。
@@ -404,12 +415,12 @@ scripts/fault/s3-05-matrix.sh             # 故障注入第一轮五类；第二
 | **S2** | 多 Reactor + 连接池 + 跨线程销毁 | ✅ 八条全 DONE，已 push `47bca67..dcccca5` | **TSan 零 data race**；#2 达标、#1 未达标但第一次测到多 Reactor 有效（33 ms → 4–6 ms 带）、100k 负载下排水 **0.947 s** |
 | **S3** | 路由 + 负载均衡 + 健康检查 + 安全阀 | ✅ 六条全 DONE，已 push `e54ae61..17b9234` | 摘除 **202 ms**、误摘 **0/3480**、安全阀 10 台全死停在 **1/10**、五类故障矩阵全过 |
 | **S4** | 限流 + 熔断 + 超时与重试防放大 | ✅ 九条全 DONE，已 push `17b9234..0f54343` | 429 生效、熔断恢复时间线、Redis 三段降级、重试放大 **1.50 / 2.00** 实测、配对账两处退化 |
-| **S5** | 热重载 + 指标 + 面板 + 调试页 + 终判 | **进行中**：S5-01…S5-04 DONE；剩 S5-05（compose）、S5-06（netem）、S5-07（终判）、S5-08（收尾） | 三 preset 各 **376/376**、非 gtest 警告各 **0 条**、`tsan` 日志 `ThreadSanitizer` **0 次**（374 PASSED + 2 SKIPPED）、**十三条冒烟**逐条 ✗ 计数 **0** |
+| **S5** | 热重载 + 指标 + 面板六格 + 调试页 + `docker compose` 一键栈 + `tc netem` 现场 + 三个数字终判 | ✅ **八条全 DONE（S5-01…S5-08，2026-11-04 关门）**；`push` 按契约 8.3 先问 | 三 preset 各 **376/376**、非 gtest 警告各 **0 条**、`tsan` 直跑日志 `ThreadSanitizer` **0 次**（374 PASSED + 2 SKIPPED）、**十四条冒烟**逐条 rc=0 且 ✗ 计数 **0**（第 12/13/14 条读 `verdict.txt`：40 / 29 / 66 项 `fails=0`）；三个数字 **#1 未达标照记 / #1 的 p999 取不到 / #2 达标 / #3 达标**；netem 六臂与安全阀"挡摘除"那一格在 §25 |
 
-**逐条验收的读数不在这里。** 每条任务的可断言验收句与实测数字在 [TASKS.md](TASKS.md) 表格末列；压测与成本对照在 [docs/BENCHMARK.md](docs/BENCHMARK.md)（B-001…B-020，含未达标记录与**口径变更节**）；故障注入的预期 vs 实测在 [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md)（§1–§23）；阶段门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)。**同一份证据抄第二份，迟早会变成两份互相分叉的**——所以这一节只留结论与指针。
+**逐条验收的读数不在这里。** 每条任务的可断言验收句与实测数字在 [TASKS.md](TASKS.md) 表格末列；压测与成本对照在 [docs/BENCHMARK.md](docs/BENCHMARK.md)（B-001…B-022，含未达标记录与**口径变更节**）；故障注入的预期 vs 实测在 [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md)（§1–§25，S5 的矩阵收口索引在 [docs/ROADMAP.md](docs/ROADMAP.md)「## S5」节）；阶段门禁对账在 [docs/ROADMAP.md](docs/ROADMAP.md)。**同一份证据抄第二份，迟早会变成两份互相分叉的**——所以这一节只留结论与指针。
 
 <details>
-<summary><b>文档地图与 26 条 ADR</b>（点开）</summary>
+<summary><b>文档地图与 27 条 ADR</b>（点开）</summary>
 
 | 文档 | 内容 |
 |---|---|
@@ -417,13 +428,13 @@ scripts/fault/s3-05-matrix.sh             # 故障注入第一轮五类；第二
 | [TASKS.md](TASKS.md) | 唯一真相源：任务 ID / 可断言验收标准 / 状态 / 实测数字 / 已裁清单 |
 | [docs/SLO.md](docs/SLO.md) | 三个数字的目标与**写死的**测量条件、脚本索引 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 环境自检实测版本、唯一实质偏离（libmysqlclient）、sanitizer 阳性验证、perf 能否采样、Docker 与抓取通路、无头浏览器仪器 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **已实现的现状**（严格区分"已实现"与"已定但未实现"）：模块 1.1…1.37 + 第 5 节踩坑索引（格式固定「现象 / 根因 / 防复发的断言」，写不出第三条的明写"缺"） |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **已实现的现状**（严格区分"已实现"与"已定但未实现"）：模块 1.1…1.38 + 第 5 节踩坑索引（格式固定「现象 / 根因 / 防复发的断言」，写不出第三条的明写"缺"） |
 | [docs/BENCHMARK.md](docs/BENCHMARK.md) | 压测方法 + vs Nginx 流程 + 实测（含未达标照记与口径变更节） |
 | [docs/FAULT-INJECTION.md](docs/FAULT-INJECTION.md) | 故障矩阵预期 vs 实测 + 每轮阳性验证与仪器自错照记 |
 | [docs/INTERVIEW.md](docs/INTERVIEW.md) | 60 秒故事，以及"没有它会怎样"的实测版 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 五阶段与每阶段**门禁结果**、一键复现、遗留账目 |
 
-**每条 ADR 都写清"我放弃什么"**：01 HTTP/1.1 · 02 epoll ET + io_uring 挂起 · 03 多线程 Reactor · 04 网络层自研 · 05 Redis 只做分布式计数与降级 · 06 MySQL 配置与审计 · 07 不引 etcd/xDS/K8s · 08 不做响应缓存 · 09 WebSocket 只透传 · 10 热重载不是热重启 · 11 filter 链 · 12 摘除比例安全阀 · 13 应用层故障注入为主 · 14 连接所有权 · 15 per-worker 池 · 16 请求-响应配对 · 17 C100K 与 HDR 测量手段 · 18 路由 filter · 19 负载均衡与配置文件 · 20 MySQL 节点表 · 21 超时与限流 · 22 自产错误响应 · 23 connect 失败重试 · 24 指标暴露面 · 25 旁路 percentile exporter · 26 演示页的握手对端与取数仪器
+**每条 ADR 都写清"我放弃什么"**：01 HTTP/1.1 · 02 epoll ET + io_uring 挂起 · 03 多线程 Reactor · 04 网络层自研 · 05 Redis 只做分布式计数与降级 · 06 MySQL 配置与审计 · 07 不引 etcd/xDS/K8s · 08 不做响应缓存 · 09 WebSocket 只透传 · 10 热重载不是热重启 · 11 filter 链 · 12 摘除比例安全阀 · 13 应用层故障注入为主 · 14 连接所有权 · 15 per-worker 池 · 16 请求-响应配对 · 17 C100K 与 HDR 测量手段 · 18 路由 filter · 19 负载均衡与配置文件 · 20 MySQL 节点表 · 21 超时与限流 · 22 自产错误响应 · 23 connect 失败重试 · 24 指标暴露面 · 25 旁路 percentile exporter · 26 演示页的握手对端与取数仪器 · 27 compose 编排与运行时壳镜像
 
 </details>
 

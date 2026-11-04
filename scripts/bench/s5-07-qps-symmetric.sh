@@ -179,6 +179,58 @@ run_wrk() { # 标签 url —— QPS 到 stdout；失败 return 1（fatal 在命�
   echo "$qps"
 }
 
+# ---------- 归因取数：wrk 的 socket 超时与非 2xx 各自落一行 ----------
+# 为什么加这一格（S5-08）：链 G/H 那几发里有三发 gw 臂报过 `timeout` 与非 2xx，而当时的
+# summary 只留了「QPS=?」，条数与「有没有到达网关」这件事一起丢了，于是那笔账至今没归因
+# （TASKS「已知待决事项」第三条 ①）。这里只**多记一行读数**，负载参数一字不动，
+# 所以与已入表的那五发仍然同轴。
+# 约定（§25.2 第 2 条那一族：读回空与"确实没发生"在数上不可区分）：
+#   wrk 只在**有条数**时才打 `Socket errors:` / `Non-2xx` 这两行，所以"行不在"记 0；
+#   而"文件根本是空的"（那一臂没跑到终局）记 `?`，绝不冒充 0。
+wrk_count() { # 文件 行首样式 sed 脚本 → 一个数，或 0 / ?
+  local f=$1 expr=$2 line v
+  [[ -s "$f" ]] || { printf '?'; return; }
+  line=$(grep -m1 -E 'Socket errors:|Non-2xx or 3xx responses:' "$f" 2>/dev/null)
+  v=$(sed -n "$expr" "$f" | head -1)
+  if [[ -n "$v" ]]; then
+    printf '%s' "$v"
+  elif [[ -n "$line" ]]; then
+    printf '?'          # 有相关行但版式变了：这是取数失灵，不是"没发生"
+  else
+    printf '0'          # 两类行都不在 = wrk 一条都没报
+  fi
+}
+
+record_wrk_errors() { # 标签 —— 把 warmup 与正式档各自的 timeout / non-2xx 写成一行一键
+  local tag=$1 f w_t w_n r_t r_n r_req
+  for f in "$OUT/$tag.warmup.txt" "$OUT/$tag.wrk.txt"; do [[ -e "$f" ]] || : > "$f"; done
+  w_t=$(wrk_count "$OUT/$tag.warmup.txt" 's/.*timeout \([0-9]*\).*/\1/p')
+  w_n=$(wrk_count "$OUT/$tag.warmup.txt" 's/.*Non-2xx or 3xx responses: \([0-9]*\).*/\1/p')
+  r_t=$(wrk_count "$OUT/$tag.wrk.txt" 's/.*timeout \([0-9]*\).*/\1/p')
+  r_n=$(wrk_count "$OUT/$tag.wrk.txt" 's/.*Non-2xx or 3xx responses: \([0-9]*\).*/\1/p')
+  r_req=$(sed -n 's/^[[:space:]]*\([0-9]*\) requests in .*/\1/p' "$OUT/$tag.wrk.txt" | head -1)
+  {
+    echo "arm=$tag"
+    echo "warmup_socket_timeout=$w_t"
+    echo "warmup_non2xx=$w_n"
+    echo "run_socket_timeout=$r_t"
+    echo "run_non2xx=$r_n"
+    echo "run_requests=${r_req:-?}"
+  } > "$OUT/$tag.errors.txt"
+}
+
+gw_exit_keys() { # 退出账文件 → 把归因要用的那几个键原样抄成一行一键（键名先核过存在于 src/net/stats.h）
+  local f=$OUT/gateway.exit.log k v
+  [[ -s "$f" ]] || { echo "gateway_exit_log=EMPTY"; return; }
+  for k in requests_parsed responses_completed upstream_head_timeout upstream_connect_timeout \
+           upstream_body_idle_timeout gateway_replies_sent gateway_replies_connect_failed \
+           gateway_replies_all_ejected gateway_replies_over_capacity \
+           downstream_rejected_over_capacity live_connections connections_constructed connections_destructed; do
+    v=$(sed -n "s/.*\[serve\] $k=\([0-9-]*\).*/\1/p" "$f" | head -1)
+    echo "${k}=${v:-键不在退出账里}"
+  done
+}
+
 p99_ms() {
   awk '
     /^[ \t]*Latency Distribution[ \t]*$/ { inblock = 1; next }
@@ -295,9 +347,13 @@ stop_container_with_final_log() { # 容器名 落盘名 —— 退场**之前**�
 
 QPS_gw=""; P99_gw=""; QPS_ngx=""; P99_ngx=""
 measure() { # 标签 url
-  local tag=$1 url=$2 qps p99
+  local tag=$1 url=$2 qps p99 wrk_rc=0
   check_workload "$tag" "$url" || { die "[$tag] 负载形状核对没过：不取它的 QPS"; return 1; }
-  qps=$(run_wrk "$tag" "$url") || { die "[$tag] wrk 这一臂没跑到终局：比值不成立"; return 1; }
+  qps=$(run_wrk "$tag" "$url") || wrk_rc=$?
+  # **先记条数再判作废**：这一档最需要的正是"被判红那发到底报了多少条 timeout / 非 2xx"，
+  # 反过来写就会把要归因的那一发丢掉（链 G/H 那三发就是这么丢的）。
+  record_wrk_errors "$tag"
+  (( wrk_rc == 0 )) || { die "[$tag] wrk 这一臂没跑到终局：比值不成立"; return 1; }
   p99=$(p99_ms "$OUT/$tag.wrk.txt")
   # 动态变量名必须走 printf -v / declare：写成 `QPS_$tag="$qps"` 会被 bash 当成一条命令执行，
   # 自验那一跑就在屏幕上打出 `QPS_ngx=10263.85: command not found`——数取到了但进不了表，
@@ -372,7 +428,24 @@ REPORT="$OUT/summary.txt"
     echo "比值：**无法计算**（某一臂的 QPS 没取到）——绝不写 0.00，0 在这个语境里等于「达标」"
   fi
   echo "上游终局: requests=${UP_REQUESTS:-?} refused_over_capacity=${UP_REFUSED:-?} refused_addfail=${UP_ADDFAIL:-?}"
-  echo "原始输出: <档>.warmup.txt / <档>.wrk.txt / probe-<档>.bin / gateway.container.log / upstream.log / topology-<档>.{mode.txt,ports.txt}"
+  echo
+  echo "每臂 wrk 条数（wrk 只在有条数时打那两行；? = 取数失灵，不是没发生）："
+  printf '%-8s %10s %10s %10s %10s %14s\n' 臂 warmup_timeout warmup_non2xx run_timeout run_non2xx run_requests
+  for e in gw ngx; do
+    [[ -s "$OUT/$e.errors.txt" ]] || { printf '%-8s %10s\n' "$e" "没跑到取数这一格"; continue; }
+    printf '%-8s %10s %10s %10s %10s %14s\n' "$e" \
+      "$(sed -n 's/^warmup_socket_timeout=//p' "$OUT/$e.errors.txt")" \
+      "$(sed -n 's/^warmup_non2xx=//p' "$OUT/$e.errors.txt")" \
+      "$(sed -n 's/^run_socket_timeout=//p' "$OUT/$e.errors.txt")" \
+      "$(sed -n 's/^run_non2xx=//p' "$OUT/$e.errors.txt")" \
+      "$(sed -n 's/^run_requests=//p' "$OUT/$e.errors.txt")"
+  done
+  echo
+  echo "网关退出账（stop 之前取过一次、排水之后再取一次；键名逐个来自 src/net/stats.h 的 put(...)）："
+  gw_exit_keys > "$OUT/gateway.exit.keys.txt" 2>/dev/null
+  sed 's/^/  /' "$OUT/gateway.exit.keys.txt"
+  echo
+  echo "原始输出: <档>.warmup.txt / <档>.wrk.txt / <档>.errors.txt / probe-<档>.bin / gateway.container.log / gateway.pre-stop.log / gateway.exit.log / gateway.exit.keys.txt / upstream.log / topology-<档>.{mode.txt,ports.txt}"
 } > "$REPORT"
 cat "$REPORT"
 

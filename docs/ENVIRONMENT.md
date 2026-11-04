@@ -104,6 +104,21 @@ SUMMARY: AddressSanitizer: heap-use-after-free (/tmp/sym+0x118071) (BuildId: 663
 
 **开工前置条件状态：满足。** Clang 21.1.8（≥14 ✅）+ 三个 sanitizer 阳性验证通过 + wrk 4.1.0 + hey 0.1.4 就位，S1 代码自 `S1-01` 起启动。Docker 仍不可用，属 S3 之前的阻塞项，不影响 S1。
 
+### 2.3 wrk 的 `Socket errors: … timeout` 那一格，在这台机器上测不到触发条件（2026-11-04 实测，S5-08）
+
+B-022 追记那笔未归因的 socket timeout 需要一个"它到底由什么触发"的答案，所以拿一台
+`accept()` 之后**永不回字节**的 python 对端（`/home/archer/s5-08-wrk-timeout-probe.sh`，4 条连接）量了一次：
+
+| 档 | wrk 的输出 | 读法 |
+|---|---|---|
+| `-t1 -c4 -d4s` / `-d8s` / `-d13s`（不带 `--timeout`） | `0 requests in …`，**整份输出里没有 `Socket errors` 那一行** | 对端不回字节的形状**根本不进那条计数** |
+| `-t1 -c4 -d4s --timeout 2` | 同样 `0 requests`、同样没有 `Socket errors` 行 | 显式把超时压到 2 s 也不报 → 不是我推测的"缺省 10 s"那回事 |
+
+**结论只有一句，而且是一句关于仪器的话**：`wrk 4.1.0-4build3` 在"连接建好、请求发出、对端永不回字"这台
+假对端上**不产 timeout 计数**，所以我无法用它复现或证伪"那 48 条 timeout = 客户端等响应超时"这个读法。
+这条记在这里，是给下一个碰那笔账的人挡路的：**别拿 `Socket errors: timeout` 当"客户端等了 N 秒"的仪器**——
+它真正的触发条件在本机这台仪器上取不到。（B-022 追记第四节有同一组数。）
+
 ## 3. 唯一实质偏离：libmysqlclient
 
 契约原本锁 `libmysqlclient 8.0.x`，但 Ubuntu 26.04 的 apt 源里只有 8.4.11，8.0 既无源、在 Oracle 侧也已停止支持。我按 26.04 的现实把锁定值改为 8.4.x，理由和边界都写在这里，不装作它没发生：
