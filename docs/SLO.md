@@ -185,6 +185,8 @@
 写成 `<档>.errors.txt`，网关退出账抽进 `gateway.exit.keys.txt`，且 `measure()` 改成"先记条数再判作废"），
 理由与那笔未归因的账一起记在 BENCHMARK 的 **B-022 追记** |
 | `s5-07-flamegraph.sh` | #3 差值的**归因证据**（不是第四个数字） | 由 perf **直接拉起**被测进程（ENVIRONMENT 4.1 那一种形态，`cpu-clock -F 99 -g`，paranoid 保持 2）在 wrk 满负荷 60 s 下采样，产 `perf.data` / `perf.report.txt`（带调用图）/ `perf.self-rank.txt`（自占比榜）/ `folded.txt` / 自渲的 `flame.svg` | ✅ 本轮创建并跑过（网关侧三发：workers=16 两发各 3,991 / 3,903 采样、workers=1 一发 833 采样、内核帧 0）。**`ARM=nginx` 那一分支取不到**，理由三条实测在 ENVIRONMENT **4.2**；要它只能给锁定的基线镜像加 perf 层，属禁令三 → **2026-11-05 已裁：不加**（已裁 ⑪，裁的是代价不是能力），所以这一分支永久是"拒跑"而不是"等裁决" |
+| `s5-11-disarmed-walk.sh` | **观测面那一格 O(n) 遍历的成本**（不是第五个数字） | 同一拓扑、同一参数、只差 `--metrics-port` 的两臂（`off` / `on`），在连接对达标后的静置窗内取 `/proc/<pid>/stat` 的 utime+stime 差；逐线程差值表落盘，`PERF=1` 时按 ENVIRONMENT 4.1 那一形态由 perf 直接拉起网关做符号归因 | 读数在 BENCHMARK **B-023**（本轮新增）；它**不产 SLO 判定**——SLO #2 的空闲 CPU 那一句仍按缺省（未开指标面）那一档引用 |
+| `s5-11-walk-matrix.sh` + `s5-11-walk-report.sh` | 上面那条的矩阵驱动与判定 | 驱动只跑臂并把每臂的 `summary.txt`/`verdict.txt` 摘要追加进 `table.tsv`；判定脚本只读落盘，算 off/on 差、每档极差、n 扫描的单调性门与「至少一档 Δtick>0」的下界门 | 两批同时跑会抢端口与 CPU → **必须串行** |
 
 **每个数字都能一键复跑**是契约第 7 节矩阵对 SLO.md 的完成判据。脚本里写死参数与采样方式，不接受「手动调一下参数」；口径变更必须在 BENCHMARK.md 留一条记录，说明改了哪条、为什么改、前后是否可比。
 
