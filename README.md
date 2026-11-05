@@ -91,7 +91,7 @@
 | 能力 | 关键读数 |
 |---|---|
 | **`docker compose` 一键起全套**：网关 + 两台上游 + exporter + Redis + MySQL + Prometheus + Grafana，八件一条 `up -d` | 十四条冒烟 **66 项判定**读 `verdict.txt` · [ADR-27](docs/adr/ADR-27-compose-one-command-stack.md) |
-| **`tc netem` 网络层故障注入六臂**（非特权 user+netns 的回环） | 慢与死的分界线在 `probe_timeout/4`；实测**安全阀在挡摘除** · [FAULT-INJECTION §25](docs/FAULT-INJECTION.md) |
+| **`tc netem` 网络层故障注入六臂**（非特权 user+netns 的回环） | 慢与死的分界线在 `probe_timeout/4`——S5-12 把它扫到 5 ms：**阶跃在「一次探活过不过期」那一层，界 ∈ (70, 75] ms**；「摘不摘」是它的二次函数，75/80 属带内翻动区（**§29**）；实测**安全阀在挡摘除** · [FAULT-INJECTION §25](docs/FAULT-INJECTION.md) |
 | **十四个冒烟脚本 + 全部压测一键复跑**：判定读落盘摘要，不信退出码 | 见[复现与验证](#复现与验证) |
 
 <details>
