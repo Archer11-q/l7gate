@@ -196,12 +196,12 @@ S5-07 本轮把它当判据量了（探针 `/home/archer/s5-07-perf-probe.sh`，
 | `nginx:1.25.4` 镜像里有没有 perf | `docker run --rm --entrypoint sh nginx:1.25.4 -c 'command -v perf'` → **`NO_PERF_IN_IMAGE`**（同一发里 `curl=/usr/bin/curl`、`wget=无`） | 基线镜像自带不了 perf，"同法"不能靠镜像本身 |
 | 宿主 perf + 它的依赖库挂进 `ubuntu:26.04`（与宿主 glibc 同代） | 带 `--cap-add=CAP_PERFMON --security-opt seccomp=unconfined`：record **能跑、能落盘**（只警告 `kptr_restrict` 限制了内核符号）；**不带 cap**：`Failure to open any events for recording` | 容器里 `perf_event_open` 的开关是 **caps**，不是内核；glibc 同代是第二个必要条件 |
 | 宿主 perf 挂进 `nginx:1.25.4`（Debian 12 / glibc 2.36） | `/probe/perf: symbol lookup error: /probe/perflib/libc.so.6: undefined symbol: __tunable_is_initialized, version GLIBC_PRIVATE` | **ADR-27 第一节那条"挂一半 glibc 比不挂更糟"在同一批镜像上原样复现**——这条路直接堵死 |
-| `nginx:1.25.4` 里 apt 装 perf | 未执行：那要给**基线镜像加层**，属契约 9.1 的镜像内容变更 + 禁令三，归项目所有人裁 | 唯一剩下的"同法"路径，我没自己走 |
+| `nginx:1.25.4` 里 apt 装 perf | **2026-11-05 已裁：不加**（项目所有人那句"按你建议的顺序完成即可"＝逐条按我给的推荐，推荐是不加）。这条路要给**基线镜像加层**，属契约 9.1 的镜像内容变更 + 禁令三 | 唯一剩下的"同法"路径，**裁的是代价不是能力**：2026-11-04 那发探针已证明加得上、出得来图（`linux-perf` 装得上、由 perf 直接拉起 nginx 有 3K 样本 / 62 条 `ngx_` 符号，读数在 TASKS「已知待决事项」第一笔），但分母身份一变，B-005/B-022 那些比值从此不同轴 |
 
 **所以对 #3 差值归因的诚实口径是**：网关侧的用户态火焰图有（上面第一行），
 **nginx 侧的用户态火焰图在这台机器上取不到**，原因是两条实测（镜像里没有 perf；宿主 perf 挂进去因
-glibc 不同代而 `symbol lookup error`），而不是"没做"。要么动基线镜像（归他裁），要么这一格的 nginx 侧
-只能用**结构对照**代替——本轮用的就是它：`worker_processes auto`（16）对 `--workers 16`、
+glibc 不同代而 `symbol lookup error`），而不是"没做"。要么动基线镜像（**2026-11-05 已裁：不加**，代价与理由在
+TASKS 已裁清单第 ⑪ 条），所以这一格的 nginx 侧**永久**只能用**结构对照**代替——终判档用的就是它：`worker_processes auto`（16）对 `--workers 16`、
 关 `access_log` 那一档、单 worker 那一档、以及每请求 `epoll_ctl` 的整数等式（B-013/B-016/B-018/B-019）。
 这条限制进 BENCHMARK 的 #3 归因段，不进火焰图那一格冒充已取到。
 **2026-11-02 项目所有人裁定：不抬，保持 `paranoid=2`**，S5 的火焰图就按上面那一种形态取
